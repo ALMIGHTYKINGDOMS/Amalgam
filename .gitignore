@@ -1,0 +1,87 @@
+# build outputs
+cpp/build/
+cpp/build-*/
+dist/
+**/build/
+
+# local config (contains secrets)
+cpp/build/launcher.json
+launcher.json
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+
+# gradle
+.gradle/
+**/.gradle/
+
+# java
+*.class
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# windows
+Thumbs.db
+Desktop.ini
+
+# misc
+mods/
+natives/
+*.hprof
+*.dmp
+*.log
+installer.log
+**/launcher.json
+**/downloads.json
+**/amalgam-dependencies.json
+**/imgui.ini
+
+# Supabase CLI local state can contain database connection details
+supabase/.temp/
+sqlite diagnostic databases
+*.sqlite3/
+
+# Java runtimes & downloaded toolchains (restored by the launcher/tests)
+/java/
+/java-*/
+/java_bridge_test/
+
+# Vendored upstream AI runtime sources (upstream clones, restorable)
+/third_party/
+
+# AI model weights & runtime caches (manifests/knowledge stay tracked)
+ai/models/
+
+# QA & session debris (never part of the source tree)
+/artifacts/
+/tmp/
+/tmp-*
+/Temp*/
+/$work/
+/.agents/
+/.freebuff/
+/.*-*
+/.adv-*
+/.behavior-*
+/.account-*
+/.auth-*
+/_installer_log.txt
+/probe-log.txt
+/rebuild-*
+/deploy-v7-live.sh
+/build-*.bat
+/build-*.log
+/*.png
+/*.jar
+/*.exe
+/*.dll

@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amalgam Servers — Branding Collection</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --brand: #9b30ff;
+    --brand-glow: #b84dff;
+    --text: #e8e8f0;
+    --muted: #8888a0;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Animated background particles */
+  .particles {
+    position: fixed; top:0; left:0; width:100%; height:100%;
+    pointer-events: none; z-index:0;
+  }
+  .particle {
+    position: absolute;
+    background: var(--brand);
+    border-radius: 2px;
+    animation: floatUp 6s linear infinite;
+    opacity: 0;
+    box-shadow: 0 0 6px var(--brand-glow);
+  }
+  @keyframes floatUp {
+    0% { transform: translateY(100vh) scale(0); opacity:0; }
+    10% { opacity:0.6; }
+    90% { opacity:0.3; }
+    100% { transform: translateY(-10vh) scale(1.5); opacity:0; }
+  }
+
+  /* Header */
+  header {
+    position: relative; z-index:1;
+    text-align: center; padding: 60px 20px 40px;
+  }
+  header h1 {
+    font-size: clamp(2rem, 6vw, 4rem);
+    font-weight: 900;
+    background: linear-gradient(135deg, #c0c0d0, #e8e8f0, var(--brand-glow));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-shadow: none;
+    letter-spacing: -0.02em;
+  }
+  header p {
+    color: var(--muted); font-size: 1.1rem; margin-top: 8px;
+  }
+  .badge-row {
+    display: flex; gap: 10px; justify-content: center; margin-top: 16px; flex-wrap: wrap;
+  }
+  .badge {
+    padding: 5px 14px; border-radius: 20px; font-size: 0.8rem;
+    border: 1px solid rgba(155,48,255,0.3); color: var(--brand-glow);
+    background: rgba(155,48,255,0.08);
+  }
+
+  /* Gallery */
+  .gallery {
+    position: relative; z-index:1;
+    max-width: 1400px; margin: 0 auto; padding: 0 20px 80px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 24px;
+  }
+
+  .card {
+    position: relative;
+    border-radius: 16px;
+    overflow: hidden;
+    background: var(--surface);
+    border: 1px solid rgba(255,255,255,0.06);
+    transition: transform 0.35s cubic-bezier(0.25, 0.46, 0.45, 0.94),
+                box-shadow 0.35s ease,
+                border-color 0.35s ease;
+    cursor: pointer;
+  }
+  .card:hover {
+    transform: translateY(-6px);
+    box-shadow: 0 20px 50px rgba(155,48,255,0.2), 0 0 0 1px rgba(155,48,255,0.3);
+    border-color: rgba(155,48,255,0.4);
+  }
+  .card:active { transform: scale(0.98); }
+
+  .card-img {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    display: block;
+    transition: filter 0.3s;
+  }
+  .card:hover .card-img { filter: brightness(1.1); }
+
+  .card-overlay {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    padding: 20px;
+    background: linear-gradient(transparent, rgba(10,10,15,0.95) 40%);
+    transform: translateY(0);
+    transition: transform 0.3s;
+  }
+  .card-label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--brand-glow); margin-bottom: 4px;
+  }
+  .card-title {
+    font-size: 1rem; font-weight: 700; line-height: 1.3;
+  }
+  .card-sub {
+    font-size: 0.8rem; color: var(--muted); margin-top: 2px;
+  }
+  .card-tags {
+    display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;
+  }
+  .tag {
+    font-size: 0.65rem; padding: 2px 8px; border-radius: 10px;
+    background: rgba(155,48,255,0.12); color: var(--brand-glow);
+  }
+
+  /* Lightbox */
+  .lightbox {
+    position: fixed; inset:0; z-index:100;
+    background: rgba(0,0,0,0.92);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.3s;
+  }
+  .lightbox.active { opacity: 1; pointer-events: all; }
+  .lightbox img {
+    max-width: 90vw; max-height: 85vh;
+    border-radius: 12px;
+    box-shadow: 0 0 60px rgba(155,48,255,0.25);
+    transform: scale(0.9);
+    transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  }
+  .lightbox.active img { transform: scale(1); }
+  .lightbox-close {
+    position: absolute; top: 24px; right: 32px;
+    font-size: 2rem; color: #fff; cursor: pointer;
+    width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
+    border-radius: 50%; background: rgba(255,255,255,0.08);
+    transition: background 0.2s;
+  }
+  .lightbox-close:hover { background: rgba(255,255,255,0.18); }
+  .lightbox-info {
+    position: absolute; bottom: 32px; left: 50%; transform: translateX(-50%);
+    text-align: center;
+  }
+  .lightbox-info .title { font-size: 1.2rem; font-weight: 700; }
+  .lightbox-info .sub { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+
+  /* Nav arrows */
+  .lightbox-nav {
+    position: absolute; top:50%; transform: translateY(-50%);
+    font-size: 2.5rem; color: #fff; cursor: pointer;
+    width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;
+    border-radius: 50%; background: rgba(255,255,255,0.06);
+    transition: background 0.2s;
+    user-select: none;
+  }
+  .lightbox-nav:hover { background: rgba(255,255,255,0.15); }
+  .lightbox-nav.prev { left: 24px; }
+  .lightbox-nav.next { right: 24px; }
+
+  /* Footer */
+  footer {
+    position: relative; z-index:1;
+    text-align: center; padding: 40px 20px;
+    color: var(--muted); font-size: 0.8rem;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+</style>
+</head>
+<body>
+
+<div class="particles" id="particles"></div>
+
+<header>
+  <h1>Amalgam Servers</h1>
+  <p>Official Branding Collection — 8 Premium Designs</p>
+  <div class="badge-row">
+    <span class="badge">Local Hosting</span>
+    <span class="badge">Cloud Hosting</span>
+    <span class="badge">Minecraft</span>
+    <span class="badge">Gaming</span>
+  </div>
+</header>
+
+<div class="gallery" id="gallery"></div>
+
+<div class="lightbox" id="lightbox">
+  <div class="lightbox-close" onclick="closeLightbox()">&#x2715;</div>
+  <div class="lightbox-nav prev" onclick="navLightbox(-1)">&#x2039;</div>
+  <div class="lightbox-nav next" onclick="navLightbox(1)">&#x203A;</div>
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-info">
+    <div class="title" id="lightboxTitle"></div>
+    <div class="sub" id="lightboxSub"></div>
+  </div>
+</div>
+
+<footer>
+  Amalgam 1.0.0 — Server Branding Collection — Generated August 2026
+</footer>
+
+<script>
+  const images = [
+    {
+      file: "01-amalgam-servers-dragon-portal.png",
+      title: "Dragon & Portal",
+      sub: "Epic Ender Dragon with Nether portal and floating castles",
+      tags: ["Dragon","Portal","Fantasy","Castle"]
+    },
+    {
+      file: "02-amalgam-local-cloud-hosting.png",
+      title: "Local & Cloud Hosting",
+      sub: "Clean logo with LOCAL & CLOUD HOSTING subtitle banner",
+      tags: ["Logo","Clean","Hosting","Dual"]
+    },
+    {
+      file: "03-amalgam-servers-local-cloud-together.png",
+      title: "Local · Cloud · Together",
+      sub: "Three-mode design with pickaxes and unified branding",
+      tags: ["Together","Local","Cloud","Tri-mode"]
+    },
+    {
+      file: "04-amalgam-servers-feature-cards.png",
+      title: "Feature Cards",
+      sub: "Side-by-side LOCAL HOSTING and CLOUD HOSTING feature panels",
+      tags: ["Features","Cards","Compare","Panels"]
+    },
+    {
+      file: "05-amalgam-server-hosting-terminal.png",
+      title: "Server Terminal",
+      sub: "Live terminal display with TPS, RAM, and player count",
+      tags: ["Terminal","Live","Metrics","Status"]
+    },
+    {
+      file: "06-amalgam-servers-local-cloud-split.png",
+      title: "Local · Cloud Split",
+      sub: "Server log panel vs feature list, flanking the main logo",
+      tags: ["Split","Logs","Features","Dual-panel"]
+    },
+    {
+      file: "07-amalgam-servers-feature-lists.png",
+      title: "Full Feature Lists",
+      sub: "Local hosting checklist vs cloud hosting advantages",
+      tags: ["Lists","Checklist","Hosting","Advantages"]
+    },
+    {
+      file: "08-amalgam-servers-hosting-buttons.png",
+      title: "Hosting Buttons",
+      sub: "YOUR SERVER · YOUR PC vs ANYTIME · ANYWHERE CTA buttons",
+      tags: ["Buttons","CTA","Actions","Promo"]
+    }
+  ];
+
+  let currentIdx = -1;
+
+  function buildGallery() {
+    const g = document.getElementById('gallery');
+    images.forEach((img, i) => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.onclick = () => openLightbox(i);
+      card.innerHTML = `
+        <img class="card-img" src="server-branding/${img.file}" alt="${img.title}" loading="lazy">
+        <div class="card-overlay">
+          <div class="card-label">Design ${String(i+1).padStart(2,'0')}</div>
+          <div class="card-title">${img.title}</div>
+          <div class="card-sub">${img.sub}</div>
+          <div class="card-tags">${img.tags.map(t => `<span class="tag">${t}</span>`).join('')}</div>
+        </div>
+      `;
+      g.appendChild(card);
+    });
+  }
+
+  function openLightbox(idx) {
+    currentIdx = idx;
+    const img = images[idx];
+    document.getElementById('lightboxImg').src = `server-branding/${img.file}`;
+    document.getElementById('lightboxTitle').textContent = img.title;
+    document.getElementById('lightboxSub').textContent = img.sub;
+    document.getElementById('lightbox').classList.add('active');
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeLightbox() {
+    document.getElementById('lightbox').classList.remove('active');
+    document.body.style.overflow = '';
+    currentIdx = -1;
+  }
+
+  function navLightbox(dir) {
+    let next = currentIdx + dir;
+    if (next < 0) next = images.length - 1;
+    if (next >= images.length) next = 0;
+    openLightbox(next);
+  }
+
+  // Keyboard nav
+  document.addEventListener('keydown', e => {
+    if (currentIdx >= 0) {
+      if (e.key === 'Escape') closeLightbox();
+      if (e.key === 'ArrowLeft') navLightbox(-1);
+      if (e.key === 'ArrowRight') navLightbox(1);
+    }
+  });
+
+  // Click outside lightbox
+  document.getElementById('lightbox').addEventListener('click', e => {
+    if (e.target === document.getElementById('lightbox')) closeLightbox();
+  });
+
+  // Particles
+  function createParticles() {
+    const container = document.getElementById('particles');
+    for (let i = 0; i < 40; i++) {
+      const p = document.createElement('div');
+      p.className = 'particle';
+      const size = Math.random() * 4 + 2;
+      p.style.cssText = `
+        left: ${Math.random()*100}%;
+        width: ${size}px; height: ${size}px;
+        animation-delay: ${Math.random()*6}s;
+        animation-duration: ${Math.random()*4+4}s;
+      `;
+      container.appendChild(p);
+    }
+  }
+
+  buildGallery();
+  createParticles();
+</script>
+</body>
+</html>

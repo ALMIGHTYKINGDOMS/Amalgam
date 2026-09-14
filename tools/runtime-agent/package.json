@@ -1,0 +1,22 @@
+{
+  "name": "amalgam-runtime-agent",
+  "version": "0.2.0",
+  "description": "Amalgam runtime node agent — hosts Minecraft servers and communicates with the Supabase control plane",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "amalgam-runtime": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test src/**/*.test.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": true
+}

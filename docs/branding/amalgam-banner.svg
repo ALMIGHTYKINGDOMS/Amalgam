@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 500" role="img" aria-labelledby="title desc">
+  <title id="title">Amalgam Launcher</title>
+  <desc id="desc">Neon violet Amalgam launcher branding over a fantasy Minecraft-inspired night scene.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#05030d"/>
+      <stop offset=".55" stop-color="#16052c"/>
+      <stop offset="1" stop-color="#45106e"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".2" stop-color="#e6b4ff"/>
+      <stop offset=".55" stop-color="#9a35ff"/>
+      <stop offset="1" stop-color="#4810bb"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#240c48"/>
+      <stop offset="1" stop-color="#07040e"/>
+    </linearGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="16"/></filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1600" height="500" fill="url(#sky)"/>
+  <circle cx="240" cy="84" r="120" fill="#b933ff" fill-opacity=".18" filter="url(#soft)"/>
+  <circle cx="1330" cy="86" r="170" fill="#8031ff" fill-opacity=".18" filter="url(#soft)"/>
+  <g fill="#ffffff" fill-opacity=".7">
+    <circle cx="112" cy="80" r="2"/><circle cx="310" cy="56" r="2"/><circle cx="470" cy="102" r="1.5"/>
+    <circle cx="1180" cy="48" r="2"/><circle cx="1460" cy="128" r="1.5"/><circle cx="1530" cy="54" r="2"/>
+  </g>
+  <path d="M0 370 160 304 270 348 400 278 530 346 690 290 820 350 980 270 1120 334 1280 244 1440 330 1600 270V500H0Z" fill="#0a0617"/>
+  <path d="M0 414 250 360 450 402 650 338 850 412 1090 342 1300 394 1600 322V500H0Z" fill="url(#water)"/>
+  <g fill="#150c2c" stroke="#7830ad" stroke-width="3">
+    <path d="M1300 360V180l32-34 32 34v180Z"/><path d="M1280 230h104l-18-24h-68Z"/>
+    <path d="M1360 360V120l38-42 38 42v240Z"/><path d="M1330 172h136l-22-28h-92Z"/>
+    <path d="M1418 360V210l26-28 26 28v150Z"/>
+  </g>
+  <g stroke="#ff54ff" stroke-width="5" filter="url(#glow)"><path d="M1330 214v34"/><path d="M1398 154v42"/><path d="M1444 244v28"/></g>
+  <g transform="translate(620 20) scale(.40)">
+    <rect width="1024" height="1024" rx="170" fill="#05030d" fill-opacity=".32"/>
+    <path d="M220 790 512 128 804 790 686 748 512 344 338 748Z" fill="url(#violet)" stroke="#ff4dff" stroke-width="12"/>
+    <path d="M180 640C290 790 726 770 838 472C894 324 750 188 593 228C426 270 318 470 200 592" fill="none" stroke="#7b26ee" stroke-width="28"/>
+    <path d="M512 440 568 512 512 584 456 512Z" fill="url(#violet)" stroke="#ff61ff" stroke-width="8"/>
+  </g>
+  <text x="800" y="385" fill="#ffffff" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="76" font-weight="700" letter-spacing="16">AMALGAM</text>
+  <text x="800" y="430" fill="#e6b4ff" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="22" letter-spacing="12">LAUNCHER</text>
+</svg>

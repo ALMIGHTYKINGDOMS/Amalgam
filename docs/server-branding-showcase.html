@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Amalgam Servers - Branding Showcase</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            background: linear-gradient(135deg, #0a0a0f 0%, #1a1025 50%, #0a0a0f 100%);
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+        }
+        .header {
+            text-align: center;
+            padding: 40px 20px;
+            background: linear-gradient(180deg, rgba(139, 92, 246, 0.2) 0%, transparent 100%);
+        }
+        .header h1 {
+            font-size: 3rem;
+            background: linear-gradient(135deg, #a855f7, #8b5cf6, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+        }
+        .header p {
+            color: #a78bfa;
+            font-size: 1.2rem;
+        }
+        .gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 30px;
+            padding: 40px;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+        .card {
+            background: rgba(30, 20, 50, 0.8);
+            border-radius: 20px;
+            overflow: hidden;
+            border: 2px solid rgba(139, 92, 246, 0.3);
+            transition: all 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-10px);
+            border-color: #8b5cf6;
+            box-shadow: 0 20px 40px rgba(139, 92, 246, 0.3);
+        }
+        .card img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .card-info {
+            padding: 20px;
+            background: linear-gradient(180deg, rgba(139, 92, 246, 0.1) 0%, transparent 100%);
+        }
+        .card-info h3 {
+            color: #c4b5fd;
+            font-size: 1.3rem;
+            margin-bottom: 8px;
+        }
+        .card-info p {
+            color: #9ca3af;
+            font-size: 0.95rem;
+            line-height: 1.5;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin-top: 10px;
+        }
+        .footer {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+            border-top: 1px solid rgba(139, 92, 246, 0.2);
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AMALGAM SERVERS</h1>
+        <p>Premium Server Branding Collection</p>
+    </div>
+    
+    <div class="gallery">
+        <div class="card">
+            <img src="server-branding/server-emblem-main.png" alt="Main Server Emblem">
+            <div class="card-info">
+                <h3>Main Server Emblem</h3>
+                <p>Primary branding with Local & Cloud Hosting, featuring HOST - MANAGE - PLAY tagline</p>
+                <span class="badge">Primary</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-cloud.png" alt="Cloud Hosting">
+            <div class="card-info">
+                <h3>Cloud Hosting Emblem</h3>
+                <p>Server rack design with purple glow and cloud infrastructure</p>
+                <span class="badge">Cloud</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-together.png" alt="Together">
+            <div class="card-info">
+                <h3>Together Emblem</h3>
+                <p>LOCAL - CLOUD - TOGETHER with diamond pickaxes</p>
+                <span class="badge">Unified</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-features.png" alt="Features">
+            <div class="card-info">
+                <h3>Features Emblem</h3>
+                <p>Local vs Cloud comparison with YOUR WORLD. ANYWHERE. tagline</p>
+                <span class="badge">Comparison</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-hosting.png" alt="Hosting">
+            <div class="card-info">
+                <h3>Server Hosting Emblem</h3>
+                <p>YOUR WORLD. YOUR SERVER. ANYWHERE. with server stats display</p>
+                <span class="badge">Hosting</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-anywhere.png" alt="Anywhere">
+            <div class="card-info">
+                <h3>Anywhere Emblem</h3>
+                <p>YOUR WORLD ANYWHERE with feature list and server management</p>
+                <span class="badge">Features</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-local.png" alt="Local">
+            <div class="card-info">
+                <h3>Local Hosting Emblem</h3>
+                <p>YOUR SERVER - YOUR PC + ANYTIME - ANYWHERE</p>
+                <span class="badge">Local</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <img src="server-branding/server-emblem-management.png" alt="Management">
+            <div class="card-info">
+                <h3>Management Emblem</h3>
+                <p>Create, Manage, Mods, Console, Backups feature showcase</p>
+                <span class="badge">Management</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="footer">
+        <p>Amalgam 1.0.0 - Premium Minecraft Server Hosting</p>
+    </div>
+</body>
+</html>

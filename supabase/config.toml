@@ -1,0 +1,73 @@
+project_id = "nnrrmvaxnoknthpwvttt"
+
+[functions.get-turn-credentials]
+verify_jwt = true
+
+[functions.curseforge-catalog]
+verify_jwt = true
+
+[functions.get_friends]
+verify_jwt = true
+
+[functions.get_friend_requests]
+verify_jwt = true
+
+[functions.send_friend_request]
+verify_jwt = true
+
+[functions.accept_friend_request]
+verify_jwt = true
+
+[functions.reject_friend_request]
+verify_jwt = true
+
+[functions.remove_friend]
+verify_jwt = true
+
+[functions.search_users]
+verify_jwt = true
+
+[functions.get_conversations]
+verify_jwt = true
+
+[functions.get_messages]
+verify_jwt = true
+
+[functions.send_message]
+verify_jwt = true
+
+[functions.mark_messages_read]
+verify_jwt = true
+
+[functions.get_or_create_conversation]
+verify_jwt = true
+
+[functions.get_parties]
+verify_jwt = true
+
+[functions.create_party]
+verify_jwt = true
+
+[functions.join_party]
+verify_jwt = true
+
+[functions.leave_party]
+verify_jwt = true
+
+[functions.disband_party]
+verify_jwt = true
+
+[functions.get_party_members]
+verify_jwt = true
+
+[functions.update_presence]
+verify_jwt = true
+
+[functions.get_user_presence]
+verify_jwt = true
+
+[functions.get_friends_presence]
+verify_jwt = true
+
+[functions.whop-webhook]
+verify_jwt = false

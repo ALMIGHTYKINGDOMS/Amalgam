@@ -1,0 +1,38 @@
+#include <windows.h>
+
+// App icon: multi-size ICO (16–256 px) generated from branding/amalgam-logo.png
+#define AML_ICON 1
+#define AML_ICON_NAME "amalgam.ico"
+1 ICON AML_ICON_NAME
+
+#define AML_FILE_VERSION 1,0,0,0
+#define AML_FILE_VERSION_STRING "1.0.0.0\0"
+#define AML_PRODUCT_VERSION_STRING "1.0.0\0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION AML_FILE_VERSION
+ PRODUCTVERSION AML_FILE_VERSION
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Amalgam\0"
+            VALUE "FileDescription", "Amalgam Launcher\0"
+            VALUE "FileVersion", AML_PRODUCT_VERSION_STRING
+            VALUE "InternalName", "amalgam_launcher.exe\0"
+            VALUE "OriginalFilename", "amalgam_launcher.exe\0"
+            VALUE "ProductName", "Amalgam\0"
+            VALUE "ProductVersion", AML_PRODUCT_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

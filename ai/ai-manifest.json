@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "ai_package": "1.0.0",
+  "min_launcher": "1.0.0",
+  "runtime_version": "1.0.0",
+  "supported_architectures": [
+    "x64"
+  ],
+  "brain_file": "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+  "brain_sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2",
+  "brain_repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+  "brain_size_bytes": 5027784800,
+  "brain_quant": "Q4_K_M",
+  "vision_file": "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+  "vision_sha256": "c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd",
+  "vision_repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+  "vision_size_bytes": 752289728,
+  "vision_quant": "Q8_0",
+  "art_file": "flux-2-klein-4b-Q4_0.gguf",
+  "art_sha256": "d1023499ef3f2f82ff7c50e6778495195c1b6cc34835741778868428111f9ff4",
+  "art_repo": "leejet/FLUX.2-klein-4B-GGUF",
+  "art_size_bytes": 2460378560,
+  "art_quant": "Q4_0",
+  "art_encoder_file": "Qwen3-4B-Q4_K_M.gguf",
+  "art_encoder_sha256": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a",
+  "art_encoder_repo": "unsloth/Qwen3-4B-GGUF",
+  "art_encoder_size_bytes": 2497281312,
+  "art_encoder_quant": "Q4_K_M",
+  "decoder_file": "full_encoder_small_decoder.safetensors",
+  "decoder_sha256": "ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62",
+  "decoder_repo": "black-forest-labs/FLUX.2-small-decoder",
+  "decoder_size_bytes": 249519092,
+  "licenses": [
+    "Qwen3-VL: Apache-2.0",
+    "FLUX.2: FLUX.2-dev Non-Commercial License",
+    "llama.cpp: MIT",
+    "stable-diffusion.cpp: MIT",
+    "GGML: MIT"
+  ]
+}

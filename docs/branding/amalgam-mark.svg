@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Amalgam mark</title>
+  <desc id="desc">A neon violet geometric A with an orbit and central diamond.</desc>
+  <defs>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".18" stop-color="#e6b4ff"/>
+      <stop offset=".52" stop-color="#9a35ff"/>
+      <stop offset="1" stop-color="#4810bb"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#6415df"/>
+      <stop offset=".5" stop-color="#ff4dff"/>
+      <stop offset="1" stop-color="#8d34ff"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="16" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="170" fill="#05030d"/>
+  <path d="M220 790 512 128 804 790 682 746 512 350 342 746Z" fill="#0d0b1c" stroke="#24154b" stroke-width="18"/>
+  <path d="M220 790 512 128 804 790 686 748 512 344 338 748Z" fill="url(#violet)" stroke="url(#edge)" stroke-width="12"/>
+  <path d="M383 596 512 322 641 596 588 576 512 430 436 576Z" fill="#0a0714" stroke="#171326" stroke-width="16"/>
+  <path d="M180 640C290 790 726 770 838 472C894 324 750 188 593 228C426 270 318 470 200 592" fill="none" stroke="#7b26ee" stroke-opacity=".42" stroke-width="52" filter="url(#glow)"/>
+  <path d="M180 640C290 790 726 770 838 472C894 324 750 188 593 228C426 270 318 470 200 592" fill="none" stroke="url(#edge)" stroke-width="28"/>
+  <path d="M512 440 568 512 512 584 456 512Z" fill="url(#violet)" stroke="#ff61ff" stroke-width="8" filter="url(#glow)"/>
+  <path d="M512 462v100M474 512h76" stroke="#ffffff" stroke-opacity=".55" stroke-width="5"/>
+</svg>

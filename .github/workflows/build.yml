@@ -1,0 +1,170 @@
+name: Amalgam Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amalgam-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.5.0'
+      - name: Configure native build
+        shell: pwsh
+        run: cmake -S cpp -B cpp/build -G Ninja -DBUILD_TESTING=ON -DAMALGAM_BUILD_LAUNCHER=ON -DAMALGAM_STRICT_HARDENING=ON
+      - name: Build native targets
+        shell: pwsh
+        run: cmake --build cpp/build
+      - name: Run native tests
+        shell: pwsh
+        run: ctest --test-dir cpp/build --output-on-failure
+      - name: Run runtime agent tests
+        shell: pwsh
+        run: |
+          npm ci --prefix tools/runtime-agent
+          npm test --prefix tools/runtime-agent
+      - name: Run schema and release-tooling verifiers
+        shell: pwsh
+        run: |
+          node tools/verify-production-schema.mjs
+          node tools/verify-supabase.mjs
+          node --test tools/update-manifest.test.mjs tools/ratelimit-matrix.test.mjs tools/turn-accounting.test.mjs
+      - name: Build Fabric bridges
+        shell: pwsh
+        run: gradle.bat -p java build --no-daemon --max-workers=1
+      - name: Build NeoForge bridges
+        shell: pwsh
+        run: gradle.bat -p java-neoforge build --no-daemon --max-workers=1
+      - name: Select JDK 17 for Forge bridges
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build Forge 1.20.1 bridge
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "gradle-8.8-bin.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "gradle-8.8"
+          Invoke-WebRequest https://services.gradle.org/distributions/gradle-8.8-bin.zip -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          & (Join-Path $dir "gradle-8.8\bin\gradle.bat") -p java-forge build --no-daemon --max-workers=1
+      - name: Build Forge 1.18.2/1.19.2 bridges
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "gradle-7.6.4-bin.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "gradle-7.6.4"
+          Invoke-WebRequest https://services.gradle.org/distributions/gradle-7.6.4-bin.zip -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          & (Join-Path $dir "gradle-7.6.4\bin\gradle.bat") -p java-forge-legacy build --no-daemon --max-workers=1
+      - name: Build Forge 1.12.2 bridge
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+      - name: Build Forge 1.12.2 bridge with Gradle 4.10.3
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "gradle-4.10.3-bin.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "gradle-4.10.3"
+          Invoke-WebRequest https://services.gradle.org/distributions/gradle-4.10.3-bin.zip -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          & (Join-Path $dir "gradle-4.10.3\bin\gradle.bat") -p java-forge-1.12.2 build --no-daemon --max-workers=1
+      - name: Stage runtime bridges
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path cpp/build/bridges -Force | Out-Null
+          $patterns = @(
+            'java/fabric-1.18.2/build/libs/amalgam-fabric-1.18.2.jar',
+            'java/fabric-1.19.2/build/libs/amalgam-fabric-1.19.2.jar',
+            'java/fabric-1.20.1/build/libs/amalgam-fabric-1.20.1.jar',
+            'java/fabric-1.21.1/build/libs/amalgam-fabric-1.21.1.jar',
+            'java/fabric-1.21.4/build/libs/amalgam-fabric-1.21.4.jar',
+            'java/fabric-1.21.5/build/libs/amalgam-fabric-1.21.5.jar',
+            'java/fabric-1.21.6/build/libs/amalgam-fabric-1.21.6.jar',
+            'java/fabric-1.21.8/build/libs/amalgam-fabric-1.21.8.jar',
+            'java/fabric-1.21.11/build/libs/amalgam-fabric-1.21.11.jar',
+            'java-neoforge/neoforge-1.21.1/build/libs/amalgam-neoforge-1.21.1.jar',
+            'java-neoforge/neoforge-1.21.4/build/libs/amalgam-neoforge-1.21.4.jar',
+            'java-neoforge/neoforge-1.21.5/build/libs/amalgam-neoforge-1.21.5.jar',
+            'java-neoforge/neoforge-1.21.6/build/libs/amalgam-neoforge-1.21.6.jar',
+            'java-neoforge/neoforge-1.21.8/build/libs/amalgam-neoforge-1.21.8.jar',
+            'java-neoforge/neoforge-1.21.11/build/libs/amalgam-neoforge-1.21.11.jar',
+            'java-forge/build/libs/amalgam-forge-1.20.1.jar',
+            'java-forge-legacy/forge-1.18.2/build/libs/amalgam-forge-1.18.2.jar',
+            'java-forge-legacy/forge-1.19.2/build/libs/amalgam-forge-1.19.2.jar',
+            'java-forge-1.12.2/build/libs/amalgam-forge-1.12.2.jar'
+          )
+          foreach ($path in $patterns) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing runtime bridge: $path" }
+            Copy-Item -LiteralPath $path -Destination cpp/build/bridges -Force
+          }
+          if (@(Get-ChildItem cpp/build/bridges -Filter '*.jar').Count -ne 19) { throw 'Expected exactly 19 runtime bridges' }
+      - name: Package clean archive
+        shell: pwsh
+        env:
+          AMALGAM_MICROSOFT_CLIENT_ID: ${{ vars.AMALGAM_MICROSOFT_CLIENT_ID }}
+          AMALGAM_SUPABASE_URL: ${{ vars.AMALGAM_SUPABASE_URL }}
+          AMALGAM_SUPABASE_PUBLISHABLE_KEY: ${{ vars.AMALGAM_SUPABASE_PUBLISHABLE_KEY }}
+          AMALGAM_WEBSITE_URL: ${{ vars.AMALGAM_WEBSITE_URL }}
+          AMALGAM_API_URL: ${{ vars.AMALGAM_API_URL }}
+        run: |
+          $official = '${{ startsWith(github.ref, 'refs/tags/v') }}' -eq 'true'
+          ./tools/package-release.ps1 -Version $env:GITHUB_SHA `
+            -MicrosoftClientId $env:AMALGAM_MICROSOFT_CLIENT_ID `
+            -RequireOnlineConfig:$official
+      - name: Validate clean archive
+        shell: pwsh
+        run: |
+          $official = '${{ startsWith(github.ref, 'refs/tags/v') }}' -eq 'true'
+          ./tools/validate-package.ps1 -Package "dist/amalgam-$env:GITHUB_SHA.zip" `
+            -RequireOnlineConfig:$official
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
+          if (-not (Test-Path -LiteralPath $iscc)) { throw 'ISCC.exe was not installed' }
+          # Beta release: the installer shows "Amalgam V3 Beta" and carries
+          # numeric 3.0.0.x version resources (Windows requires 4 numeric
+          # parts); the launcher itself reports 3.0.0-beta.2.
+          $version = "3.0.0.1"
+          if ($env:AMALGAM_INSTALLER_VERSION) { $version = $env:AMALGAM_INSTALLER_VERSION }
+          & $iscc "/DSourceDir=$PWD\dist\amalgam-$env:GITHUB_SHA" "/DMyAppVersion=$version" installer\AmalgamLauncher.iss
+      - name: Verify unsigned release state
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist/installer -Filter 'AmalgamLauncher-*-Setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer produced' }
+          ./tools/verify-signing.ps1 -PackageDir "dist/amalgam-$env:GITHUB_SHA" -InstallerPath $installer.FullName
+      - name: Require signatures for public release tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist/installer -Filter 'AmalgamLauncher-*-Setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer produced' }
+          ./tools/verify-signing.ps1 -PackageDir "dist/amalgam-$env:GITHUB_SHA" -InstallerPath $installer.FullName -RequireSigned
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amalgam-${{ github.sha }}
+          path: |
+            dist/amalgam-${{ github.sha }}.zip
+            dist/installer/*-Setup.exe

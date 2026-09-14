@@ -1,0 +1,54 @@
+PRE-INSTALLATION INFORMATION
+============================
+
+Welcome to Amalgam Launcher 1.0.0 — the unified Minecraft launcher
+with built-in local AI for coding, vision, and art generation.
+
+WHAT AMALGAM INSTALLS
+---------------------
+* Amalgam Launcher (required)
+* Native support library
+* Java bridges for supported Minecraft versions
+* Bedrock client package
+* Branding assets and release manifests
+* Legal documents (Terms, Privacy, AI Terms, Third-Party Notices)
+
+AMALGAM AI (optional, downloads after setup)
+---------------------------------------------
+AI models are not downloaded by the installer. After setup, install them
+from Settings > AI when you choose:
+
+  AI Brain (Qwen3-VL-8B):   ~4.7 GiB
+  AI Vision (mmproj):       ~0.7 GiB
+  AI Art (FLUX.2):          ~2.3 GiB
+  AI Art Encoder (Qwen3):   ~2.3 GiB
+  AI Decoder:                ~0.2 GiB
+
+  Total download:           ~10.2 GiB
+  Installed size:            ~10.2 GiB
+
+Amalgam AI runs locally. No cloud API or external software is required.
+
+MINIMUM REQUIREMENTS
+--------------------
+  Windows 10/11 (64-bit)
+  Vulkan-compatible GPU (recommended for AI)
+  16 GB RAM (32 GB recommended for full AI)
+  4 GB VRAM (8+ GB recommended for AI art)
+  25 GB free disk space (with AI)
+
+THIRD-PARTY LICENSES
+--------------------
+Amalgam includes/bundles software under the following licenses:
+  * Apache-2.0 (Qwen models)
+  * FLUX.2-dev Non-Commercial License (FLUX models)
+  * MIT (llama.cpp, stable-diffusion.cpp, GGML)
+See installed legal directory for full notices.
+
+UNINSTALLING
+------------
+The uninstaller removes the application files by default. It then asks
+whether to also permanently remove Amalgam AI models, profiles, modpacks,
+worlds, servers, backups, and downloaded content for this Windows account.
+Choose No to keep that user data for a later reinstall.
+

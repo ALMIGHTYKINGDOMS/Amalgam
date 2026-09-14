@@ -1,0 +1,61 @@
+AMALGAM THIRD-PARTY NOTICES
+============================
+Amalgam 1.0.0 — bundled and downloadable components
+
+Amalgam includes or downloads third-party components. Each component is
+governed by its own license. The full license texts are installed with the
+product under <install>\licenses\ where available, or may be obtained
+from the component's official source.
+
+============================================================
+AI MODELS
+============================================================
+
+Qwen3-VL-8B-Instruct
+- Source: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF
+- License: Apache-2.0
+- Use: Amalgam AI brain and vision reasoning
+
+Qwen3-4B
+- Source: https://huggingface.co/unsloth/Qwen3-4B-GGUF
+- License: Apache-2.0 (verify upstream)
+- Use: art text encoder
+
+FLUX.2 Klein 4B
+- Source: https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF
+- License: FLUX.2-dev Non-Commercial License
+- Use: art generation
+
+FLUX.2 Small Decoder
+- Source: https://huggingface.co/black-forest-labs/FLUX.2-small-decoder
+- License: FLUX.2-dev Non-Commercial License
+- Use: art decoding
+
+============================================================
+AI RUNTIMES
+============================================================
+
+llama.cpp (GGML)
+- Source: https://github.com/ggml-org/llama.cpp
+- License: MIT
+
+stable-diffusion.cpp
+- Source: https://github.com/leejet/stable-diffusion.cpp
+- License: MIT
+
+============================================================
+THIRD-PARTY COMPONENTS IN THE LAUNCHER
+============================================================
+
+The launcher bundles native libraries and Java bridges. See the packaged
+SBOM (sbom.cdx.json) and component manifest (component-manifest.json)
+installed with the product for the complete dependency list and licenses.
+
+============================================================
+NOTICE
+============================================================
+This product includes software developed by third parties. Where the
+applicable license requires it, the complete license text is provided
+in the licenses directory or at the source links above.
+
+--- END OF NOTICES ---

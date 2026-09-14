@@ -1,0 +1,74 @@
+AMALGAM TERMS OF USE — RELEASE-READY DRAFT
+===========================================
+Status: DRAFT — OWNER/LEGAL REVIEW REQUIRED BEFORE PUBLIC RELEASE
+
+Version 1.0.0 — Amalgam Launcher
+
+This document is a release-ready draft of the terms governing your use of
+Amalgam ("the Software"). It has NOT been reviewed or approved by legal
+counsel. Distribution or public release requires owner/legal review and
+approval of this text.
+
+1. ACCEPTANCE OF TERMS
+   By installing or using Amalgam, you agree to these Terms of Use. If you
+   do not agree, do not install or use the Software.
+
+2. LICENSE GRANT
+   Subject to these Terms, Amalgam grants you a personal, non-exclusive,
+   non-transferable, revocable license to install and use the Software on
+   devices you own or control, for personal, non-commercial use unless a
+   separate commercial license has been granted in writing.
+
+3. MINECRAFT AND PROVIDER COMPLIANCE
+   Amalgam is a launcher and management tool. It is not affiliated with
+   Mojang Studios, Microsoft, or any content provider unless stated
+   otherwise. You are solely responsible for:
+   - owning a valid Minecraft account and complying with its terms,
+   - complying with the terms of every mod, modpack, server, and content
+     provider you use,
+   - ensuring your use of downloaded content is authorized.
+
+4. AI FEATURES
+   Amalgam includes local AI capabilities. AI output may be incorrect,
+   incomplete, or unsuitable. You are responsible for reviewing
+   AI-generated code, content, and configuration before use, especially
+   for important projects. When Agent Mode is enabled, AI may modify files
+   inside your approved AI Profile workspaces. Checkpoints and undo are
+   provided; use them before large changes.
+
+5. PROHIBITED USE
+   You may not:
+   - reverse engineer, decompile, or disassemble the Software,
+   - redistribute or resell the Software or its components,
+   - use the Software to violate any law or third-party right,
+   - circumvent provider access restrictions or download controls.
+
+6. DISCLAIMER OF WARRANTIES
+   The Software is provided "AS IS" and "AS AVAILABLE", without warranty of
+   any kind, express or implied, including merchantability, fitness for a
+   particular purpose, and non-infringement. Amalgam does not warrant that
+   the Software will be uninterrupted, error-free, or secure.
+
+7. LIMITATION OF LIABILITY
+   To the maximum extent permitted by law, Amalgam shall not be liable for
+   any indirect, incidental, special, consequential, or punitive damages,
+   including loss of data, worlds, profiles, or profits, arising from use
+   of the Software.
+
+8. TERMINATION
+   Amalgam may terminate or suspend your access if you violate these Terms.
+   Upon termination, you must stop using and, where applicable, uninstall
+   the Software.
+
+9. CHANGES
+   Amalgam may update these Terms from time to time. Continued use after
+   changes constitutes acceptance.
+
+10. GOVERNING LAW
+    These Terms are governed by applicable law in your jurisdiction,
+    excluding conflict-of-law rules.
+
+11. CONTACT
+    For questions about these Terms, contact Amalgam support.
+
+--- END OF DRAFT ---

@@ -1,0 +1,73 @@
+AMALGAM PRIVACY POLICY — RELEASE-READY DRAFT
+=============================================
+Status: DRAFT — OWNER/LEGAL REVIEW REQUIRED BEFORE PUBLIC RELEASE
+
+Version 1.0.0 — Amalgam Launcher
+
+This document is a release-ready draft of the Amalgam privacy policy. It
+has NOT been reviewed or approved by legal counsel. Distribution or public
+release requires owner/legal review and approval of this text.
+
+1. OVERVIEW
+   Amalgam processes two distinct categories of data:
+   - LOCAL AI PROCESSING — performed on your own computer.
+   - ONLINE FEATURES — features that communicate with remote services.
+
+   This distinction matters. Local AI never leaves your PC; online features
+   transmit data to the services you use.
+
+2. LOCAL AI PROCESSING
+   Amalgam's built-in AI (chat, coding, reasoning, vision, and art) runs
+   locally on your device using on-device models. Conversations, project
+   files, screenshots, and generated content used by the local AI are
+   processed on your machine and are not transmitted to Amalgam servers.
+   Model downloads during installation come from the sources described in
+   the installer; the downloaded models themselves are not uploaded.
+
+3. ONLINE FEATURES
+   The following features communicate over the network and may transmit
+   data to third parties:
+   - Microsoft account authentication and Minecraft entitlement checks
+   - Supabase-backed services (Essentials: friends, presence, invites,
+     sessions)
+   - Mod and content providers (e.g., Modrinth, CurseForge)
+   - Software updates and AI component downloads
+   - Cloud hosting features, where available
+   - Diagnostics you explicitly choose to send
+
+   Data sent to these services is governed by their respective policies and
+   by the specific feature you are using. Amalgam never claims that these
+   features are local-only.
+
+4. DATA WE STORE LOCALLY
+   Amalgam stores local data on your device, including:
+   - profiles, worlds, servers, and backups,
+   - settings and configuration,
+   - AI conversations and checkpoints,
+   - cached content and logs.
+
+   This data stays in your user profile unless you remove it.
+
+5. CREDENTIALS
+   Microsoft sign-in uses Microsoft's secure device-code flow. Amalgam
+   never asks for or stores your Microsoft password. Saved tokens are
+   protected for the current Windows account using DPAPI. Provider and AI
+   credentials are kept on your device.
+
+6. ANALYTICS AND DIAGNOSTICS
+   Optional diagnostics remain local unless you explicitly opt in to send
+   them. We do not sell your personal data.
+
+7. CHILDREN
+   Amalgam is not directed at children. If you are under the age of
+   majority in your jurisdiction, use Amalgam only with a parent or
+   guardian's involvement.
+
+8. CHANGES
+   We may update this policy. Continued use after changes constitutes
+   acceptance of the updated policy.
+
+9. CONTACT
+   For privacy questions, contact Amalgam support.
+
+--- END OF DRAFT ---

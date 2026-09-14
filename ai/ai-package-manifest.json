@@ -1,0 +1,135 @@
+{
+  "schema_version": 2,
+  "ai_package": "1.0.0",
+  "min_launcher": "1.0.0",
+  "runtime_version": "1.0.0",
+  "supported_architectures": [
+    "x64"
+  ],
+  "components": {
+    "brain": {
+      "id": "brain",
+      "name": "Amalgam AI Brain",
+      "model": "Qwen3-VL-8B-Instruct",
+      "quant": "Q4_K_M",
+      "filename": "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+      "hf_repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+      "hf_file": "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+      "size_bytes": 5027784800,
+      "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2",
+      "pinned": true,
+      "required": true,
+      "license": "Apache-2.0",
+      "destination": "brain",
+      "purpose": "chat, reasoning, coding, project analysis, vision reasoning"
+    },
+    "vision": {
+      "id": "vision",
+      "name": "Amalgam AI Vision",
+      "model": "Qwen3-VL-8B-Instruct mmproj",
+      "quant": "Q8_0",
+      "filename": "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+      "download_url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+      "hf_repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+      "hf_file": "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+      "size_bytes": 752289728,
+      "sha256": "c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd",
+      "pinned": true,
+      "required": true,
+      "license": "Apache-2.0",
+      "destination": "brain",
+      "purpose": "live Minecraft vision, GUI inspection, texture inspection"
+    },
+    "art_model": {
+      "id": "art_model",
+      "name": "Amalgam AI Art",
+      "model": "FLUX.2 Klein 4B",
+      "quant": "Q4_0",
+      "filename": "flux-2-klein-4b-Q4_0.gguf",
+      "download_url": "https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF/resolve/main/flux-2-klein-4b-Q4_0.gguf",
+      "hf_repo": "leejet/FLUX.2-klein-4B-GGUF",
+      "hf_file": "flux-2-klein-4b-Q4_0.gguf",
+      "size_bytes": 2460378560,
+      "sha256": "d1023499ef3f2f82ff7c50e6778495195c1b6cc34835741778868428111f9ff4",
+      "pinned": true,
+      "required": true,
+      "license": "FLUX.2-dev Non-Commercial License",
+      "destination": "art",
+      "purpose": "art generation, FancyMenu, item/weapon/block concepts, image editing"
+    },
+    "art_encoder": {
+      "id": "art_encoder",
+      "name": "Amalgam AI Art Encoder",
+      "model": "Qwen3-4B",
+      "quant": "Q4_K_M",
+      "filename": "Qwen3-4B-Q4_K_M.gguf",
+      "download_url": "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+      "hf_repo": "unsloth/Qwen3-4B-GGUF",
+      "hf_file": "Qwen3-4B-Q4_K_M.gguf",
+      "size_bytes": 2497281312,
+      "sha256": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a",
+      "pinned": true,
+      "required": true,
+      "license": "Apache-2.0",
+      "destination": "art",
+      "purpose": "art text encoder"
+    },
+    "decoder": {
+      "id": "decoder",
+      "name": "Amalgam AI Decoder",
+      "model": "FLUX.2 small decoder",
+      "filename": "full_encoder_small_decoder.safetensors",
+      "download_url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors",
+      "hf_repo": "black-forest-labs/FLUX.2-small-decoder",
+      "hf_file": "full_encoder_small_decoder.safetensors",
+      "size_bytes": 249519092,
+      "sha256": "ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62",
+      "pinned": true,
+      "required": true,
+      "license": "FLUX.2-dev Non-Commercial License",
+      "destination": "art",
+      "purpose": "FLUX decoder"
+    },
+    "knowledge": {
+      "id": "knowledge",
+      "name": "Amalgam AI Knowledge",
+      "filename": "knowledge",
+      "size_bytes": 10000,
+      "sha256": "",
+      "pinned": false,
+      "required": false,
+      "license": "Amalgam",
+      "destination": "knowledge",
+      "purpose": "architecture, KubeJS, datapack, FancyMenu reference guides"
+    }
+  },
+  "runtime": {
+    "brain_runtime": {
+      "id": "brain_runtime",
+      "name": "llama.cpp + libmtmd",
+      "version": "pinned-release",
+      "license": "MIT",
+      "source": "https://github.com/ggml-org/llama.cpp"
+    },
+    "art_runtime": {
+      "id": "art_runtime",
+      "name": "stable-diffusion.cpp",
+      "version": "pinned-release",
+      "license": "MIT",
+      "source": "https://github.com/leejet/stable-diffusion.cpp"
+    }
+  },
+  "licenses": [
+    "Qwen3-VL: Apache-2.0",
+    "FLUX.2: FLUX.2-dev Non-Commercial License",
+    "llama.cpp: MIT",
+    "stable-diffusion.cpp: MIT",
+    "GGML: MIT"
+  ],
+  "total_download_bytes": 10987253492,
+  "total_installed_bytes": 10987253492,
+  "estimated_gpu_ram_min_mb": 6144,
+  "estimated_system_ram_min_mb": 16384,
+  "estimated_disk_free_min_bytes": 25000000000
+}

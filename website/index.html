@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amalgam — Minecraft Launcher with Built-in AI</title>
+<meta name="description" content="Amalgam is a premium Minecraft launcher with built-in AI, modpack studio, server management, and Essentials multiplayer.">
+<style>
+:root{--bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a25;--brand:#9b30ff;--glow:#b84dff;--text:#e8e8f0;--muted:#8888a0;--green:#4ade80;--yellow:#facc15;--red:#f87171}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;text-align:center;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 20px}
+h1{font-size:clamp(2.5rem,8vw,5rem);font-weight:900;background:linear-gradient(135deg,#c0c0d0,var(--text),var(--glow));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
+.sub{font-size:1.2rem;color:var(--muted);margin-bottom:32px}
+.section-title{font-size:1.5rem;font-weight:700;color:var(--text);margin:40px 0 20px}
+.features{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;margin-bottom:40px;max-width:960px}
+.feat{background:var(--surface);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:20px 24px;text-align:left;flex:1;min-width:200px;max-width:280px}
+.feat h3{color:var(--glow);margin-bottom:6px;font-size:1rem}
+.feat p{color:var(--muted);font-size:.85rem;line-height:1.5}
+.stats{display:flex;gap:32px;justify-content:center;margin:24px 0;flex-wrap:wrap}
+.stat{text-align:center}
+.stat .num{font-size:2rem;font-weight:900;color:var(--glow)}
+.stat .label{font-size:.8rem;color:var(--muted)}
+.dl-btn{display:inline-block;padding:16px 48px;background:linear-gradient(135deg,var(--brand),var(--glow));color:#fff;border-radius:12px;font-size:1.1rem;font-weight:700;text-decoration:none;transition:transform .2s,box-shadow .2s;box-shadow:0 4px 20px rgba(155,48,255,.3)}
+.dl-btn:hover{transform:translateY(-2px);box-shadow:0 6px 30px rgba(155,48,255,.5)}
+.info{margin-top:16px;color:var(--muted);font-size:.8rem}
+.ai-note{margin-top:24px;padding:20px 28px;background:var(--surface);border-radius:12px;border:1px solid rgba(155,48,255,.15);max-width:700px;text-align:left}
+.ai-note h3{color:var(--glow);margin-bottom:8px}
+.ai-note p{color:var(--muted);font-size:.85rem;line-height:1.6}
+.ai-note ul{color:var(--muted);font-size:.85rem;line-height:1.6;margin:8px 0 0 20px}
+.requirements{margin-top:40px;padding:20px 28px;background:var(--surface);border-radius:12px;max-width:700px;text-align:left}
+.requirements h3{color:var(--text);margin-bottom:12px}
+.requirements table{width:100%;border-collapse:collapse}
+.requirements td{padding:6px 12px;color:var(--muted);font-size:.85rem;border-bottom:1px solid rgba(255,255,255,.04)}
+.requirements td:first-child{color:var(--text);font-weight:600;width:120px}
+footer{margin-top:60px;padding:20px;color:var(--muted);font-size:.75rem;border-top:1px solid rgba(255,255,255,.04);width:100%;max-width:960px}
+</style>
+</head>
+<body>
+<h1>AMALGAM</h1>
+<p class="sub">Minecraft Launcher · Modpacks · Servers · Built-in AI</p>
+
+<div class="stats">
+  <div class="stat"><div class="num">6</div><div class="label">Loaders Supported</div></div>
+  <div class="stat"><div class="num">8</div><div class="label">Server Types</div></div>
+  <div class="stat"><div class="num">5</div><div class="label">AI Models Built-in</div></div>
+  <div class="stat"><div class="num">76</div><div class="label">MB Installer</div></div>
+</div>
+
+<div class="features">
+  <div class="feat">
+    <h3>Java & Bedrock</h3>
+    <p>One launcher for every edition. Vanilla, Fabric, Forge, NeoForge, Quilt. Managed Java runtimes — no manual setup.</p>
+  </div>
+  <div class="feat">
+    <h3>Modpack Studio</h3>
+    <p>Discover, install, and build modpacks from Modrinth and CurseForge. KubeJS, datapacks, resource packs.</p>
+  </div>
+  <div class="feat">
+    <h3>Local Servers</h3>
+    <p>Vanilla, Paper, Purpur, Fabric, Forge, NeoForge — one-click server creation with console and player management.</p>
+  </div>
+  <div class="feat">
+    <h3>Built-in AI</h3>
+    <p>Local AI brain for coding, live Minecraft vision, and art generation. No cloud API. Works offline.</p>
+  </div>
+  <div class="feat">
+    <h3>Essentials</h3>
+    <p>Friends, invites, sessions, messages, parties. Host worlds or join friends with direct P2P and TURN relay.</p>
+  </div>
+  <div class="feat">
+    <h3>Instant Startup</h3>
+    <p>Optimized rendering, deferred CJK loading, LTO build. Window appears in under a second.</p>
+  </div>
+  <div class="feat">
+    <h3>Profile Management</h3>
+    <p>Create, import, duplicate, and manage profiles. Each profile is isolated — mods never cross-contaminate.</p>
+  </div>
+  <div class="feat">
+    <h3>Download Manager</h3>
+    <p>Track progress, speed, and status. Pause, resume, and cancel downloads. Background updates.</p>
+  </div>
+  <div class="feat">
+    <h3>Diagnostics</h3>
+    <p>Built-in health checks for Java, backend, AI models, providers, and disk space. One-click system report.</p>
+  </div>
+</div>
+
+<a class="dl-btn" href="https://amalgam-mc.com/download">Download Amalgam 1.0.0</a>
+<p class="info">Windows 10/11 · 76 MB installer · AI models (~11.6 GB) download during setup</p>
+
+<div class="ai-note">
+  <h3>Built-in Local AI</h3>
+  <p>Amalgam ships with a complete local AI stack that runs entirely on your PC:</p>
+  <ul>
+    <li><strong>Brain:</strong> Qwen3-VL 8B for chat, coding, and reasoning</li>
+    <li><strong>Vision:</strong> Live screen analysis — AI describes your Minecraft world in real-time</li>
+    <li><strong>Art:</strong> FLUX 2 Klein 4B for generating textures, logos, and artwork</li>
+    <li><strong>Build Mode:</strong> Generate KubeJS scripts, datapacks, and resource packs with one click</li>
+    <li><strong>Checkpoints:</strong> Every AI change is reversible — undo instantly</li>
+  </ul>
+  <p style="margin-top:12px">No Ollama, LM Studio, ComfyUI, or cloud API required. Everything is built in.</p>
+</div>
+
+<div class="requirements">
+  <h3>System Requirements</h3>
+  <table>
+    <tr><td>OS</td><td>Windows 10/11 (64-bit)</td></tr>
+    <tr><td>RAM</td><td>4 GB minimum · 8 GB for AI</td></tr>
+    <tr><td>Storage</td><td>2 GB launcher · 15 GB with AI models</td></tr>
+    <tr><td>GPU</td><td>Any — CPU fallback available for AI</td></tr>
+    <tr><td>Java</td><td>Managed by Amalgam (not required)</td></tr>
+    <tr><td>Network</td><td>Required for downloads · AI works offline after install</td></tr>
+  </table>
+</div>
+
+<footer>
+  Amalgam 1.0.0 · Not affiliated with Mojang or Microsoft ·
+  <a href="https://amalgam-mc.com/privacy" style="color:var(--glow);text-decoration:none">Privacy</a> ·
+  <a href="https://amalgam-mc.com/terms" style="color:var(--glow);text-decoration:none">Terms</a> ·
+  <a href="https://discord.gg/amalgam" style="color:var(--glow);text-decoration:none">Discord</a>
+</footer>
+</body>
+</html>

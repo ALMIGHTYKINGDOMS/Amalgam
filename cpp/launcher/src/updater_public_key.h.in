@@ -1,0 +1,11 @@
+// Generated at CMake configure time from updater_public_key.h.in.
+// Contains the update-manifest verification public key when the release
+// build is configured with AMALGAM_UPDATER_PUBLIC_KEY_FILE; otherwise the
+// key is empty and signed manifests fail closed, as documented in updater.h.
+#pragma once
+
+namespace aml::updater::detail {
+
+inline constexpr char kUpdaterPublicKeyPem[] = R"AMALGAM_PEM(@AMALGAM_UPDATER_PUBLIC_KEY_PEM@)AMALGAM_PEM";
+
+}  // namespace aml::updater::detail

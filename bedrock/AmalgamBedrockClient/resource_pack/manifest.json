@@ -1,0 +1,30 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "Amalgam Bedrock Resource Pack",
+    "description": "Amalgam purple space-fantasy branding and supported UI assets.",
+    "uuid": "5c1f0c38-6a62-43bb-b7c6-8d835d50a202",
+    "version": [
+      1,
+      0,
+      0
+    ],
+    "min_engine_version": [
+      1,
+      21,
+      0
+    ]
+  },
+  "modules": [
+    {
+      "description": "Amalgam Bedrock Client resources",
+      "type": "resources",
+      "uuid": "b42b0210-9d20-4d59-a95e-6a8bbf1d1204",
+      "version": [
+        1,
+        0,
+        0
+      ]
+    }
+  ]
+}
