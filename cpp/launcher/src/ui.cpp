@@ -7361,8 +7361,7 @@ void draw_settings_tab(UiState& st) {
     const bool sign_in_configured = auth::valid_client_id(c.microsoft_client_id);
     if (!sign_in_configured) {
         ImGui::TextColored(k.yellow,
-                           "Microsoft sign-in needs the launcher's Application (client) ID before it can open.");
-        if (ghost_button("Open sign-in setup", ImVec2(ui_px(170.0f), ui_px(32.0f)))) st.settings_section = 3;
+                           "Microsoft sign-in is unavailable in this build.");
     }
     if (st.auth_working) {
         ImGui::SameLine();
@@ -7756,29 +7755,6 @@ void draw_settings_tab(UiState& st) {
                 st.settings_dirty = true;
             }
             ImGui::TextColored(k.muted, "Announce tab changes and important state updates for assistive technology.");
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::PushFont(f_bold);
-            ImGui::TextUnformatted("Microsoft account connection");
-            ImGui::PopFont();
-            ImGui::TextColored(k.muted,
-                               "Enter the public Application (client) ID used for Minecraft sign-in. Admin access is not required.");
-            ImGui::SetNextItemWidth(auto_item_width(460.0f, 220.0f));
-            if (input_text_hint("##settings_microsoft_client_id",
-                                "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-                                &c.microsoft_client_id)) {
-                st.settings_dirty = true;
-            }
-            ImGui::SameLine();
-            ImGui::TextColored(auth::valid_client_id(c.microsoft_client_id) ? k.green : k.yellow,
-                               auth::valid_client_id(c.microsoft_client_id) ? "ready" : "needs setup");
-            if (ghost_button("Open Microsoft setup guide", ImVec2(ui_px(206.0f), ui_px(32.0f)))) {
-                ShellExecuteW(st.hwnd, L"open",
-                              L"https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app",
-                              nullptr, nullptr, SW_SHOWNORMAL);
-            }
-            ImGui::SameLine();
             if (ghost_button("Send feedback", ImVec2(ui_px(150.0f), ui_px(32.0f))))
                 st.feedback_open = true;
         } else if (st.settings_section == 4) {
