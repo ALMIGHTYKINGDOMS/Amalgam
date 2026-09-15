@@ -168,7 +168,6 @@ bool SyncManager::initialize() {
 void SyncManager::shutdown() {
     // Stop sync timer
     stop_sync_timer();
-    stop_reconnection_monitoring();
 
     // Unsubscribe from updates
     unsubscribe_from_updates();
@@ -208,8 +207,10 @@ void SyncManager::start_sync_timer() {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 
             if (!sync_timer_active_) break;
-            
-            // Perform periodic sync
+
+            // The periodic sync is the only owner of online state: it marks the
+            // manager offline on failure and recovers on the first sync that
+            // succeeds and passes its connection probe.
             perform_sync(SyncType::Periodic);
         }
     });
@@ -772,77 +773,6 @@ bool SyncManager::request_sync(const SyncDataType type) {
     }
     
     return true;
-}
-
-// ---------------------------------------------------------------------------
-// Connection Management
-// ---------------------------------------------------------------------------
-
-void SyncManager::handle_connection_lost() {
-    // Mark as offline
-    std::lock_guard<std::mutex> lock(state_mu_);
-    sync_state_.is_online = false;
-    sync_state_.last_connection_loss = std::time(nullptr);
-
-    // Keep last-known-good server/node caches and local profiles available for
-    // offline use. There is no stale-cache API here, and clearing them would
-    // make an outage look like confirmed remote deletions.
-}
-
-void SyncManager::handle_connection_restored() {
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    if (!supabase.is_authenticated()) return;
-
-    // Apply offline writes before listing remote state. Otherwise a successful
-    // listing could treat a locally-created, still-pending profile as deleted.
-    if (!process_pending_operations()) {
-        std::lock_guard<std::mutex> lock(state_mu_);
-        sync_state_.is_online = false;
-        sync_state_.last_error = "Pending synchronization operations failed";
-        return;
-    }
-
-    // Authentication alone is not a connection probe. A full sync performs a
-    // complete read and marks the state online only when that sync and the
-    // final reachability probe succeed.
-    if (!perform_sync(SyncType::Full)) return;
-
-    std::lock_guard<std::mutex> lock(state_mu_);
-    sync_state_.is_online = true;
-    sync_state_.last_connection_restore = std::time(nullptr);
-}
-
-// ---------------------------------------------------------------------------
-// Reconnection Logic
-// ---------------------------------------------------------------------------
-
-void SyncManager::start_reconnection_monitoring() {
-    if (reconnection_monitoring_) {
-        return;
-    }
-    
-    reconnection_monitoring_ = true;
-    reconnection_thread_ = std::thread([this]() {
-        while (reconnection_monitoring_) {
-            for (int i = 0; i < 5 && reconnection_monitoring_; ++i)
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            
-            if (!is_online()) {
-                // Try to reconnect
-                auto& supabase = aml::supabase::SupabaseManager::instance();
-                if (supabase.is_authenticated()) {
-                    handle_connection_restored();
-                }
-            }
-        }
-    });
-}
-
-void SyncManager::stop_reconnection_monitoring() {
-    reconnection_monitoring_ = false;
-    if (reconnection_thread_.joinable()) {
-        reconnection_thread_.join();
-    }
 }
 
 // ---------------------------------------------------------------------------

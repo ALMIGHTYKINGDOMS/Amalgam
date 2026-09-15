@@ -44,6 +44,11 @@ the product a public CurseForge-quality release.
   integrity, runtime validation, installer inputs, the cached launch matrix,
   launcher smoke, the Node suites, the secret scan, the embedded-updater-key
   check, and Authenticode status in one command with an honest summary.
+- The gate fails closed when the package would ship without its public backend
+  and sign-in configuration (`AMALGAM_MICROSOFT_CLIENT_ID`,
+  `AMALGAM_SUPABASE_URL`, `AMALGAM_SUPABASE_PUBLISHABLE_KEY`). Pass
+  `-AllowInertConfig` only for local test packages; the summary then reports
+  the result as NOT RELEASABLE.
 - Update signing is end-to-end verified: the signed feed manifest and payload
   validate against the public key embedded in the shipped launcher, and a CLI
   regression test keeps kebab-case flags from silently producing unsigned

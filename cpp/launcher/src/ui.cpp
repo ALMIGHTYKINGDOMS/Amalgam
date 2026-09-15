@@ -8045,7 +8045,13 @@ void draw_settings_tab(UiState& st) {
                          logo_pos, logo_size, c32(k.brand), ui_model::ImageFit::Contain);
         ImGui::Dummy(logo_size);
 
-        ImGui::SameLine(ui_px(72.0f));
+        // Group the brand text so every line stays in the title's column instead
+        // of falling back to the card's left edge under the logo.  The cursor is
+        // positioned from the drawn logo because ImGui measures SameLine offsets
+        // from the window rather than from the image.
+        ImGui::SetCursorScreenPos(
+            ImVec2(logo_pos.x + logo_size.x + ui_px(16.0f), logo_pos.y));
+        ImGui::BeginGroup();
         ImGui::PushFont(f_h2);
         ImGui::TextColored(k.brand, "AMALGAM LAUNCHER");
         ImGui::PopFont();
@@ -8055,12 +8061,20 @@ void draw_settings_tab(UiState& st) {
         ImGui::TextColored(k.muted, "The ultimate Minecraft launcher.");
         ImGui::TextColored(k.muted, "Play. Create. Host. Together.");
         ImGui::Spacing();
-        ImGui::TextColored(k.muted, "Copyright 2024 Amalgam. All rights reserved.");
+        const std::time_t brand_time = std::time(nullptr);
+        std::tm brand_date{};
+        localtime_s(&brand_date, &brand_time);
+        ImGui::TextColored(k.muted, "Copyright %d Amalgam. All rights reserved.",
+                           brand_date.tm_year + 1900);
+        ImGui::EndGroup();
         ImGui::Spacing();
 
         float link_w = ui_px(120.0f);
         if (ghost_button("Website", ImVec2(link_w, ui_px(28.0f)))) {
-            ShellExecuteW(st.hwnd, L"open", L"https://amalgam-net.com",
+            // The public site is configuration, so a packaged build cannot send
+            // players to a stale or unregistered domain.
+            ShellExecuteW(st.hwnd, L"open",
+                          aml::net::to_wide(aml::online::config().page_url("")).c_str(),
                           nullptr, nullptr, SW_SHOWNORMAL);
         }
         ImGui::SameLine(0, ui_px(8.0f));

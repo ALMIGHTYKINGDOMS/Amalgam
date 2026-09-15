@@ -2,13 +2,17 @@ param(
     [string]$Version = "1.0.0",
     [string]$BuildDir = "",
     [switch]$RequireSigned,
-    [switch]$StrictPublicConfig,
+    [switch]$AllowInertConfig,
     [switch]$SkipBuild
 )
 
 # One-command official release gate. Chains every locally runnable check in
 # release order and stops at the first failure. External gates (code-signing
 # certificate, clean-machine matrix, live services) are reported at the end.
+#
+# The gate fails closed when the package would ship without its public backend
+# and sign-in configuration. -AllowInertConfig produces a local test package and
+# marks the result NOT RELEASABLE.
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $BuildDir) { $BuildDir = Join-Path $root "cpp\build-release" }
@@ -49,12 +53,16 @@ try {
 
     # 4. Package release (runs CTest as a hard gate; honors public config).
     Step "package"
+    # An official package must carry the public backend and sign-in configuration.
+    # Without it the shipped launcher is inert, so the gate fails closed unless a
+    # developer explicitly asks for a configuration-free test package.
+    $requirePublicConfig = -not $AllowInertConfig
     $pkgArgs = @{
         BuildDir  = $BuildDir
         OutputDir = (Join-Path $root "dist")
         Version   = $Version
     }
-    if ($StrictPublicConfig) { $pkgArgs.RequireOnlineConfig = $true }
+    if ($requirePublicConfig) { $pkgArgs.RequireOnlineConfig = $true }
     & (Join-Path $root "tools\package-release.ps1") @pkgArgs
     if ($LASTEXITCODE -ne 0) { throw "packaging failed" }
     Pass "release package (CTest included)"
@@ -67,7 +75,7 @@ try {
 
     # 6. Package integrity (hashes, manifest, SBOM).
     Step "package-validation"
-    & (Join-Path $root "tools\validate-package.ps1") -Package $zipPath
+    & (Join-Path $root "tools\validate-package.ps1") -Package $zipPath -RequireOnlineConfig:$requirePublicConfig
     if ($LASTEXITCODE -ne 0) { throw "package validation failed" }
     Pass "package integrity"
 
@@ -143,6 +151,11 @@ if ($failed) {
 }
 Write-Output "RESULT: ALL LOCAL GATES PASSED for Amalgam $Version"
 Write-Output ""
+if ($AllowInertConfig) {
+    Write-Output "NOT RELEASABLE: package was built without a required public configuration"
+    Write-Output "  (rerun without -AllowInertConfig and with AMALGAM_MICROSOFT_CLIENT_ID,"
+    Write-Output "   AMALGAM_SUPABASE_URL, and AMALGAM_SUPABASE_PUBLISHABLE_KEY set)"
+}
 Write-Output "External gates that remain (cannot be verified in this tree):"
 Write-Output "  - Authenticode certificate for launcher, DLL, and installer"
 if (-not $RequireSigned) { Write-Output "    (rerun with -RequireSigned once binaries are signed)" }

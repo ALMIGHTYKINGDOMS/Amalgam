@@ -65,8 +65,6 @@ struct SyncState {
     int sync_interval = 30; // seconds
     std::string last_error;
     int consecutive_failures = 0;
-    int64_t last_connection_loss = 0;
-    int64_t last_connection_restore = 0;
     int total_syncs = 0;
     int successful_syncs = 0;
     int failed_syncs = 0;
@@ -181,14 +179,6 @@ public:
     // On-demand Sync
     bool request_sync(SyncDataType type);
     
-    // Connection Management
-    void handle_connection_lost();
-    void handle_connection_restored();
-    
-    // Reconnection Logic
-    void start_reconnection_monitoring();
-    void stop_reconnection_monitoring();
-    
     // Sync State
     SyncState get_sync_state() const;
     bool is_online() const;
@@ -233,9 +223,6 @@ private:
     // Threads
     std::atomic<bool> sync_timer_active_{false};
     std::thread sync_timer_thread_;
-    
-    std::atomic<bool> reconnection_monitoring_{false};
-    std::thread reconnection_thread_;
 };
 
 }  // namespace aml::sync
