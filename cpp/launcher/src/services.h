@@ -681,4 +681,11 @@ private:
     ServiceManager& operator=(const ServiceManager&) = delete;
 };
 
+// The launcher's single local server supervisor. ServiceManager::servers()
+// returns null until something initializes it, and a null manager turns every
+// local server action (start, stop, console, backups) into a silent no-op, so
+// consumers ask for the manager through here instead of racing to construct it.
+// Called from the UI thread before the Servers page resolves any run state.
+ServerManager* local_server_manager();
+
 }  // namespace aml::services

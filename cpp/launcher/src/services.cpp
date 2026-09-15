@@ -2681,6 +2681,18 @@ void ServiceManager::configure_servers(const ServiceConfig& config) {
     server_manager_ = std::make_unique<ServerManager>(config);
 }
 
+ServerManager* local_server_manager() {
+    auto& services = ServiceManager::instance();
+    if (!services.servers()) {
+        // The local supervisor talks to a process it starts itself, so it needs
+        // no endpoint or credentials; only this service is initialized because
+        // it is the one service in this layer the launcher actually runs.
+        services.initialize(
+            {{ServiceType::ServerManagement, ServiceConfig{}}});
+    }
+    return services.servers();
+}
+
 void ServiceManager::configure_nodes(const ServiceConfig& config) {
     node_service_ = std::make_unique<NodeService>(config);
 }

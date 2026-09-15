@@ -2463,6 +2463,10 @@ void set_fixture_server_detail(int server_index, int tab) {
 
 void draw_server_manager(UiState& st) {
     auto& s = state();
+    // This page is the only consumer of the server service layer. Without a
+    // supervisor every action here is null-guarded into a silent no-op, so ask
+    // for it before deciding what is running.
+    aml::services::local_server_manager();
     if (!s.loaded) {
         // In fixture mode the visual seed already populated st.servers.
         if (!st.fixture_mode || st.servers.empty()) {

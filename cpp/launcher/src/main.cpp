@@ -781,10 +781,16 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
     if (root.empty() || java_path.empty()) return 1;
     SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", root.c_str());
 
-    aml::services::ServiceConfig config;
-    aml::services::ServerManager manager(config);
+    // Use the same accessor the Servers page uses, so this probe also proves
+    // the launcher actually constructs the supervisor it drives.
+    aml::services::ServerManager* manager = aml::services::local_server_manager();
+    if (!manager) {
+        SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
+        std::printf("server transport start failed: no local server supervisor\n");
+        return 2;
+    }
     std::string error;
-    if (!manager.start_local_server("probe", aml::net::to_utf8(java_path), 512, &error)) {
+    if (!manager->start_local_server("probe", aml::net::to_utf8(java_path), 512, &error)) {
         SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
         std::printf("server transport start failed: %s\n", error.c_str());
         return 2;
@@ -792,22 +798,22 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
 
     // The supervisor owns local run state: the server reads as running exactly
     // while its process is alive, and as stopped once the stop is clean.
-    const bool running_while_up = manager.is_local_server_running("probe");
+    const bool running_while_up = manager->is_local_server_running("probe");
 
     const std::vector<uint8_t> file_payload = {'o', 'k'};
     std::string file_error;
     std::vector<uint8_t> roundtrip;
-    const bool safe_upload = manager.upload_server_file("probe", "safe.txt",
+    const bool safe_upload = manager->upload_server_file("probe", "safe.txt",
                                                         file_payload, &file_error);
-    const bool traversal_upload = manager.upload_server_file("probe", "../escaped.txt",
+    const bool traversal_upload = manager->upload_server_file("probe", "../escaped.txt",
                                                               file_payload, &file_error);
-    const bool safe_download = manager.download_server_file("probe", "safe.txt",
+    const bool safe_download = manager->download_server_file("probe", "safe.txt",
                                                             &roundtrip, &file_error);
-    const bool safe_delete = manager.delete_server_file("probe", "safe.txt", &file_error);
+    const bool safe_delete = manager->delete_server_file("probe", "safe.txt", &file_error);
     const std::filesystem::path escaped = std::filesystem::path(root) / L"escaped.txt";
     if (!safe_upload || traversal_upload || !safe_download || roundtrip != file_payload ||
         !safe_delete || std::filesystem::exists(escaped)) {
-        manager.stop_local_server("probe", nullptr);
+        manager->stop_local_server("probe", nullptr);
         SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
         std::printf("server file boundary verification failed: upload=%s traversal=%s download=%s delete=%s\n",
                     safe_upload ? "yes" : "no", traversal_upload ? "accepted" : "rejected",
@@ -816,8 +822,8 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
     }
 
     std::string response;
-    if (!manager.send_command("probe", "status", &response, &error)) {
-        manager.stop_local_server("probe", nullptr);
+    if (!manager->send_command("probe", "status", &response, &error)) {
+        manager->stop_local_server("probe", nullptr);
         SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
         std::printf("server transport command failed: %s\n", error.c_str());
         return 4;
@@ -825,7 +831,7 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
 
     bool observed = false;
     for (int attempt = 0; attempt < 100 && !observed; ++attempt) {
-        const auto logs = manager.get_console_logs("probe", 100, nullptr);
+        const auto logs = manager->get_console_logs("probe", 100, nullptr);
         for (const auto& entry : logs) {
             if (entry.message.find("ECHO:status") != std::string::npos) {
                 observed = true;
@@ -834,8 +840,8 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
         }
         if (!observed) Sleep(20);
     }
-    const bool stopped = manager.stop_local_server("probe", &error);
-    const bool running_after_stop = manager.is_local_server_running("probe");
+    const bool stopped = manager->stop_local_server("probe", &error);
+    const bool running_after_stop = manager->is_local_server_running("probe");
     SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
     if (!observed || !stopped || !running_while_up || running_after_stop) {
         std::printf("server transport verification failed: observed=%s stopped=%s up=%s after_stop=%s %s\n",
