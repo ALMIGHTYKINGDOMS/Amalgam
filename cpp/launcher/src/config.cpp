@@ -123,6 +123,9 @@ bool load(const std::wstring& path, Config& out) {
     out.loader = j.get("loader").as_str("auto");
     out.performance_profile = j.get("performance_profile").as_str("auto");
     out.extra_jvm = j.get("extra_jvm").as_str();
+    out.launch_mode = j.get("launch_mode").as_str("official_launcher");
+    if (out.launch_mode != "microsoft" && out.launch_mode != "official_launcher")
+        out.launch_mode = "official_launcher";
     out.auto_translate_project_text = j.get("auto_translate_project_text").as_bool(false);
     out.translation_target_language = j.get("translation_target_language").as_str("English");
     if (out.translation_target_language.empty()) out.translation_target_language = "English";
@@ -215,6 +218,7 @@ bool save(const std::wstring& path, const Config& c) {
     j.set("loader", Json::str(c.loader));
     j.set("performance_profile", Json::str(c.performance_profile));
     j.set("extra_jvm", Json::str(c.extra_jvm));
+    j.set("launch_mode", Json::str(c.launch_mode));
     j.set("auto_translate_project_text", Json::boolean(c.auto_translate_project_text));
     j.set("translation_target_language", Json::str(c.translation_target_language));
     j.set("microsoft_client_id", Json::str(c.microsoft_client_id));

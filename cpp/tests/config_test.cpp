@@ -48,6 +48,7 @@ int main() {
     aml::config::Config original;
     original.base_dir = L"C:\\Profiles";
     original.microsoft_client_id = "8a5f9e26-7d6a-4b18-8a77-e47be79a1439";
+    original.launch_mode = "microsoft";
     original.auto_translate_project_text = true;
     original.translation_target_language = "Spanish";
     original.modrinth_token = modrinth_secret;
@@ -77,6 +78,7 @@ int main() {
          restored.admin_verifier != original.admin_verifier ||
          restored.admin_iterations != original.admin_iterations ||
          restored.microsoft_client_id != original.microsoft_client_id ||
+        restored.launch_mode != original.launch_mode ||
         !restored.auto_translate_project_text ||
         restored.translation_target_language != original.translation_target_language ||
         !restored.ai_providers.empty()) {

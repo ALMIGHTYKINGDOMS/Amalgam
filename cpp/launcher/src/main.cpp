@@ -660,6 +660,10 @@ int cli_ui_snapshot(int argc, wchar_t** argv) {
         options.fixture_tab = 4;
         options.fixture_sidebar = 12;
         options.fixture_settings_section = 3;
+    } else if (route == "settings0") {
+        options.fixture_tab = 4;
+        options.fixture_sidebar = 12;
+        options.fixture_settings_section = 0;
     } else if (route == "admin") {
         options.fixture_tab = 4;
         options.fixture_sidebar = 12;

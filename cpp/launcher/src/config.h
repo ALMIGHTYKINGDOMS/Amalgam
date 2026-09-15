@@ -42,6 +42,12 @@ struct Config {
     std::string loader = "auto";
     std::string performance_profile = "auto";
     std::string extra_jvm;
+    // How Play starts the game.  "official_launcher" (the default) prepares
+    // the profile, loader, and client bridge, then hands off to the official
+    // Minecraft Launcher, which signs the player in with its own Microsoft
+    // account.  "microsoft" signs the player in through Amalgam (device
+    // code) and launches the game directly.
+    std::string launch_mode = "official_launcher";
     // Project pages can optionally translate public provider descriptions with
     // an AI provider configured by the player. Disabled by default so content
     // is never sent to a provider without an explicit choice.

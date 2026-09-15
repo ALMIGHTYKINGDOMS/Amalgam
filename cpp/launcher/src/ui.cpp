@@ -2369,10 +2369,19 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
         } else {
             log_line(st, L"[client] profile data synchronized");
         }
-    }    // Always inject the profile into the official Minecraft Launcher and
-    // open it.  The Minecraft Launcher handles Microsoft account authentication
-    // natively — Amalgam never needs to manage sign-in itself.
-    if (!dry_run && loaded_profile) {
+    }    // Launch routing.  "official_launcher" prepares the profile, loader,
+    // and client bridge, then hands off to the official Minecraft Launcher,
+    // which signs the player in with its own Microsoft account.  "microsoft"
+    // uses the player's Amalgam-connected Microsoft account and starts the
+    // game directly.  The handoff is also the fallback whenever no Microsoft
+    // account is connected, so Play always has a working path.
+    auth::Account launch_account;
+    const bool microsoft_signed_in = !dry_run && auth::load(launch_account, nullptr) &&
+                                     auth::valid_client_id(launch_account.microsoft_client_id) &&
+                                     launch_account.expires_at > std::time(nullptr);
+    const bool handoff = !dry_run && loaded_profile &&
+        (snapshot.launch_mode != "microsoft" || !microsoft_signed_in);
+    if (handoff) {
         if (!official_launcher::IsOfficialLauncherInstalled()) {
             if (loading.is_visible()) loading.hide();
             st.running = false;
@@ -2468,6 +2477,27 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
     }
 
     if (loading.is_visible()) loading.advance_step("Building classpath");
+
+    // Microsoft mode launches with the player's connected account.  Refresh
+    // if needed (ensure_valid handles the device-account token lifecycle) so
+    // a session that outlived the access token still plays.
+    if (!dry_run && snapshot.launch_mode == "microsoft") {
+        std::string account_error;
+        if (!auth::ensure_valid(launch_account, [&](const std::wstring& s) { log_line(st, s); },
+                                &account_error)) {
+            if (loading.is_visible()) loading.hide();
+            st.running = false;
+            push_notice(st, ui_model::NoticeLevel::Warning, "Microsoft sign-in needed",
+                        account_error.empty()
+                            ? "Connect a Microsoft account to play in Amalgam mode."
+                            : account_error,
+                        "Sign in", "open_signin");
+            return;
+        }
+        opt.auth_access_token = launch_account.access_token;
+        opt.auth_uuid = launch_account.uuid;
+        opt.auth_user_type = "msa";
+    }
 
     std::string err;
     launch::Result res;
@@ -7392,6 +7422,35 @@ void draw_settings_tab(UiState& st) {
         }
     }
     } // has_account
+    card_end();
+
+    ImGui::Spacing();
+    card_begin("##launchmode", ImVec2(-1, 0));
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("How Play starts the game");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted,
+                       "Choose whether Amalgam launches Minecraft itself or hands the\n"
+                       "prepared profile to the official Minecraft Launcher.");
+    const bool microsoft_available = sign_in_configured && auth::valid_client_id(c.microsoft_client_id);
+    int mode_index = c.launch_mode == "microsoft" ? 0 : 1;
+    if (ImGui::RadioButton("Amalgam (sign in with Microsoft here)", &mode_index, 0)) {
+        c.launch_mode = "microsoft";
+        st.settings_dirty = true;
+    }
+    if (!microsoft_available) {
+        ImGui::SameLine();
+        ImGui::TextColored(k.yellow, "unavailable in this build");
+    }
+    if (ImGui::RadioButton("Official Minecraft Launcher (use its Microsoft sign-in)", &mode_index, 1)) {
+        c.launch_mode = "official_launcher";
+        st.settings_dirty = true;
+    }
+    ImGui::TextColored(k.muted,
+                       c.launch_mode == "microsoft"
+                           ? "Play opens the game directly with your connected account."
+                           : "Play prepares the profile, then opens the Minecraft Launcher.\n"
+                             "Select the Amalgam profile there and press Play.");
     card_end();
 
     ImGui::Spacing();
@@ -12672,6 +12731,10 @@ void draw_notice_center(UiState& st) {
                             st.active_tab = 6;
                         } else if (notice.action_id == "open_mc_launcher") {
                             official_launcher::OpenOfficialLauncher();
+                        } else if (notice.action_id == "open_signin") {
+                            st.sidebar_item = 9;
+                            st.active_tab = 9;
+                            st.settings_section = 0;
                         }
                     }
                     ImGui::SameLine();
