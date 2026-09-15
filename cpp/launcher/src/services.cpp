@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <objbase.h>
 #include <wincrypt.h>
 #include <algorithm>
@@ -38,6 +39,27 @@ bool valid_server_identifier(const std::string& value) {
         if (c < 32 || c == '/' || c == '\\' || c == ':') return false;
     }
     return true;
+}
+
+// True when a process on this machine already listens on the port. Binding is
+// the server's first act, so a conflict otherwise kills it right after a start
+// that already reported success.
+bool port_answers_locally(int port) {
+    ULONG size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) !=
+        ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+    std::vector<uint8_t> storage(size);
+    auto* table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(storage.data());
+    if (GetExtendedTcpTable(table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) !=
+        NO_ERROR) {
+        return false;
+    }
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        if (ntohs(static_cast<u_short>(table->table[i].dwLocalPort)) == port) return true;
+    }
+    return false;
 }
 
 bool resolve_server_relative_path(const std::filesystem::path& root,
@@ -2025,6 +2047,14 @@ bool ServerManager::start_local_server(const std::string& server_id, const std::
         if (error) *error = "server.jar not found at " + net::to_utf8(jar_path);
         return false;
     }
+
+    // A port another process answers on makes the server exit as soon as it
+    // binds, which used to look like a successful start that silently stopped.
+    // Refuse here so the caller gets the reason instead of a dead process.
+    if (info.port > 0 && port_answers_locally(info.port)) {
+        if (error) *error = "port " + std::to_string(info.port) + " is already in use";
+        return false;
+    }
     
     std::wstring wjava;
     if (!java_path.empty()) {
@@ -2699,10 +2729,10 @@ ServerManager* local_server_manager() {
     auto& services = ServiceManager::instance();
     if (!services.servers()) {
         // The local supervisor talks to a process it starts itself, so it needs
-        // no endpoint or credentials; only this service is initialized because
-        // it is the one service in this layer the launcher actually runs.
-        services.initialize(
-            {{ServiceType::ServerManagement, ServiceConfig{}}});
+        // no endpoint or credentials. This is unconditional because the
+        // accessor's contract is that a supervisor exists: callers act on the
+        // result, and a null one used to turn their failures into no-ops.
+        services.configure_servers(ServiceConfig{});
     }
     return services.servers();
 }

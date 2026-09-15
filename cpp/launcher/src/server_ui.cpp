@@ -73,8 +73,7 @@ static void load_local_servers(std::vector<server::ServerConfig>& servers) {
 // Local run state belongs to the process the service is supervising; the saved
 // list only records a hint. Every read of "is this server running" asks here.
 static bool local_server_supervised(const server::ServerConfig& sv) {
-    auto* svc = aml::services::ServiceManager::instance().servers();
-    return svc && svc->is_local_server_running(sv.name);
+    return aml::services::local_server_manager()->is_local_server_running(sv.name);
 }
 
 static server::ServerStage effective_stage(const UiState& st,
@@ -175,11 +174,71 @@ struct ServerUIState {
     std::string detail_console_input;
     bool detail_console_auto_scroll = true;
     double detail_console_last_refresh = 0.0;
+
+    // The last action this page asked the service to take and the reason the
+    // service refused. Kept here so the cause is rendered on this page; the
+    // floating Alerts window can fall outside a small launcher window.
+    std::string action_failure_action;
+    std::string action_failure_server;
+    std::string action_failure_cause;
 };
 
 static ServerUIState& state() {
     static ServerUIState s;
     return s;
+}
+
+// Server actions report their failure here, keeping the cause the service
+// reported (missing jar, Java it cannot resolve, port already in use, wrong
+// state) instead of replacing it with a generic line.
+static void report_server_failure(ServerUIState& s, UiState& st, const char* action,
+                                 const std::string& server, const std::string& cause) {
+    s.action_failure_action = action;
+    s.action_failure_server = server;
+    s.action_failure_cause = cause.empty()
+        ? "The server service refused the request without reporting a cause."
+        : cause;
+    push_notice(st, ui_model::NoticeLevel::Error, std::string(action) + " failed",
+                server.empty() ? s.action_failure_cause
+                               : server + ": " + s.action_failure_cause);
+}
+
+static void clear_server_failure(ServerUIState& s) {
+    s.action_failure_action.clear();
+    s.action_failure_server.clear();
+    s.action_failure_cause.clear();
+}
+
+// Rendered inside the page content, above everything else the Servers page
+// draws, so the reason is readable without leaving the page or opening Alerts.
+static void draw_server_action_failure(UiState& st) {
+    auto& s = state();
+    if (s.action_failure_action.empty()) return;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(k.red.x, k.red.y, k.red.z, 0.08f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(k.red.x, k.red.y, k.red.z, 0.30f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_px(8.0f));
+    if (ImGui::BeginChild("##server_action_failure", ImVec2(-1, 0),
+                          ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY)) {
+        ImGui::PushFont(f_bold);
+        ImGui::TextColored(k.red, "%s failed", s.action_failure_action.c_str());
+        ImGui::PopFont();
+        if (!s.action_failure_server.empty()) {
+            ImGui::SameLine(0, ui_px(6.0f));
+            ImGui::TextColored(k.muted, "%s", s.action_failure_server.c_str());
+        }
+        ImGui::PushFont(f_small);
+        ImGui::TextWrapped("%s", s.action_failure_cause.c_str());
+        ImGui::PopFont();
+        ImGui::Spacing();
+        if (ghost_button("Dismiss", ImVec2(ui_px(86.0f), ui_px(24.0f)))) {
+            clear_server_failure(s);
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+    ImGui::Spacing();
 }
 
 // ---------------------------------------------------------------------------
@@ -629,44 +688,40 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     float bw = ui_px(80.0f);
     float bh = ui_px(28.0f);
 
+    auto* svc = aml::services::local_server_manager();
     if (is_running) {
         if (ghost_button("Stop", ImVec2(bw, bh))) {
-            auto* svc = aml::services::ServiceManager::instance().servers();
             std::string error;
-            const bool ok = svc && svc->stop_local_server(sv.name, &error);
-            if (ok) {
+            if (svc->stop_local_server(sv.name, &error)) {
                 sv.stage = server::ServerStage::Stopped;
                 save_local_servers(st.servers);
+                clear_server_failure(s);
             } else {
-                push_notice(st, ui_model::NoticeLevel::Error, "Stop Failed",
-                            error.empty() ? "The local server could not be stopped." : error);
+                report_server_failure(s, st, "Stop", sv.name, error);
             }
         }
         ImGui::SameLine(0, ui_px(4.0f));
         if (ghost_button("Restart", ImVec2(bw + ui_px(10.0f), bh))) {
-            auto* svc = aml::services::ServiceManager::instance().servers();
             std::string error;
-            const bool stopped = svc && svc->stop_local_server(sv.name, &error);
-            const bool started = stopped && svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
+            const bool started = svc->stop_local_server(sv.name, &error) &&
+                                 svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
             if (started) {
                 sv.stage = server::ServerStage::Running;
                 save_local_servers(st.servers);
+                clear_server_failure(s);
             } else {
-                push_notice(st, ui_model::NoticeLevel::Error, "Restart Failed",
-                            error.empty() ? "The local server could not be restarted." : error);
+                report_server_failure(s, st, "Restart", sv.name, error);
             }
         }
     } else if (is_ready) {
         if (primary_button("Start", ImVec2(bw, bh))) {
-            auto* svc = aml::services::ServiceManager::instance().servers();
             std::string error;
-            const bool ok = svc && svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
-            if (ok) {
+            if (svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error)) {
                 sv.stage = server::ServerStage::Running;
                 save_local_servers(st.servers);
+                clear_server_failure(s);
             } else {
-                push_notice(st, ui_model::NoticeLevel::Error, "Start Failed",
-                            error.empty() ? "The local server could not be started." : error);
+                report_server_failure(s, st, "Start", sv.name, error);
             }
         }
     }
@@ -797,16 +852,24 @@ static void draw_console_panel(UiState& st) {
                 s.console_log.push_back(cmd_entry);
 
                 // Send to server
-                auto* svc = aml::services::ServiceManager::instance().servers();
-                if (svc) {
-                    std::string response;
-                    svc->send_command(sv.name, s.console_input, &response);
+                std::string response;
+                std::string send_error;
+                if (aml::services::local_server_manager()->send_command(
+                        sv.name, s.console_input, &response, &send_error)) {
                     if (!response.empty()) {
                         server::ServerConsoleEntry resp_entry;
                         resp_entry.timestamp = "<";
                         resp_entry.message = response;
                         s.console_log.push_back(resp_entry);
                     }
+                } else {
+                    // A refused command belongs in the console it was typed in.
+                    server::ServerConsoleEntry err_entry;
+                    err_entry.timestamp = "!";
+                    err_entry.message = send_error.empty()
+                        ? "Command could not be sent"
+                        : send_error;
+                    s.console_log.push_back(err_entry);
                 }
                 s.console_input.clear();
             }
@@ -820,16 +883,24 @@ static void draw_console_panel(UiState& st) {
                 cmd_entry.message = s.console_input;
                 s.console_log.push_back(cmd_entry);
 
-                auto* svc = aml::services::ServiceManager::instance().servers();
-                if (svc) {
-                    std::string response;
-                    svc->send_command(sv.name, s.console_input, &response);
+                std::string response;
+                std::string send_error;
+                if (aml::services::local_server_manager()->send_command(
+                        sv.name, s.console_input, &response, &send_error)) {
                     if (!response.empty()) {
                         server::ServerConsoleEntry resp_entry;
                         resp_entry.timestamp = "<";
                         resp_entry.message = response;
                         s.console_log.push_back(resp_entry);
                     }
+                } else {
+                    // A refused command belongs in the console it was typed in.
+                    server::ServerConsoleEntry err_entry;
+                    err_entry.timestamp = "!";
+                    err_entry.message = send_error.empty()
+                        ? "Command could not be sent"
+                        : send_error;
+                    s.console_log.push_back(err_entry);
                 }
                 s.console_input.clear();
             }
@@ -1246,13 +1317,17 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
                             std::max(0.0f, ImGui::GetContentRegionAvail().x - ui_px(140.0f)));
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ui_px(26.0f)) * 0.5f);
             if (ghost_button("Kick", ImVec2(ui_px(62.0f), ui_px(26.0f)))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
-                if (svc) svc->send_command(sv.name, "kick " + p.name, nullptr);
+                std::string error;
+                if (!aml::services::local_server_manager()->send_command(
+                        sv.name, "kick " + p.name, nullptr, &error))
+                    report_server_failure(s, st, "Kick", sv.name, error);
             }
             ImGui::SameLine(0, ui_px(4.0f));
             if (ghost_button("Ban", ImVec2(ui_px(62.0f), ui_px(26.0f)))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
-                if (svc) svc->send_command(sv.name, "ban " + p.name, nullptr);
+                std::string error;
+                if (!aml::services::local_server_manager()->send_command(
+                        sv.name, "ban " + p.name, nullptr, &error))
+                    report_server_failure(s, st, "Ban", sv.name, error);
             }
             ImGui::Dummy(ImVec2(0, row_h));
             ImGui::PopID();
@@ -1274,10 +1349,12 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
     ImGui::SameLine();
     if (primary_button("Add to Whitelist", ImVec2(ui_px(130.0f), ui_px(26.0f))) &&
         !s.player_whitelist_input.empty()) {
-        auto* svc = aml::services::ServiceManager::instance().servers();
-        if (svc) {
-            svc->send_command(sv.name, "whitelist add " + s.player_whitelist_input, nullptr);
+        std::string error;
+        if (aml::services::local_server_manager()->send_command(
+                sv.name, "whitelist add " + s.player_whitelist_input, nullptr, &error)) {
             s.player_whitelist_input.clear();
+        } else {
+            report_server_failure(s, st, "Add to Whitelist", sv.name, error);
         }
     }
     ImGui::Spacing();
@@ -1289,9 +1366,10 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
             ImGui::TextColored(k.text, "%s", s.whitelist_entries[i].c_str());
             ImGui::SameLine(0, ui_px(12.0f));
             if (ghost_button("Remove", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
-                if (svc) svc->send_command(sv.name,
-                    "whitelist remove " + s.whitelist_entries[i], nullptr);
+                std::string error;
+                if (!aml::services::local_server_manager()->send_command(
+                        sv.name, "whitelist remove " + s.whitelist_entries[i], nullptr, &error))
+                    report_server_failure(s, st, "Remove from Whitelist", sv.name, error);
             }
             ImGui::PopID();
         }
@@ -1312,10 +1390,12 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
     ImGui::SameLine();
     if (primary_button("Make OP", ImVec2(ui_px(100.0f), ui_px(26.0f))) &&
         !s.player_op_input.empty()) {
-        auto* svc = aml::services::ServiceManager::instance().servers();
-        if (svc) {
-            svc->send_command(sv.name, "op " + s.player_op_input, nullptr);
+        std::string error;
+        if (aml::services::local_server_manager()->send_command(
+                sv.name, "op " + s.player_op_input, nullptr, &error)) {
             s.player_op_input.clear();
+        } else {
+            report_server_failure(s, st, "Make OP", sv.name, error);
         }
     }
     ImGui::Spacing();
@@ -1327,9 +1407,10 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
             ImGui::TextColored(k.brand, "%s", s.ops_entries[i].c_str());
             ImGui::SameLine(0, ui_px(12.0f));
             if (ghost_button("De-op", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
-                if (svc) svc->send_command(sv.name,
-                    "deop " + s.ops_entries[i], nullptr);
+                std::string error;
+                if (!aml::services::local_server_manager()->send_command(
+                        sv.name, "deop " + s.ops_entries[i], nullptr, &error))
+                    report_server_failure(s, st, "De-op", sv.name, error);
             }
             ImGui::PopID();
         }
@@ -1413,8 +1494,10 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
 
             if (effective_stage(st, sv) == server::ServerStage::Running) {
                 if (ghost_button("Save-All", ImVec2(bw, bh))) {
-                    auto* svc = aml::services::ServiceManager::instance().servers();
-                    if (svc) svc->send_command(sv.name, "save-all", nullptr);
+                    std::string error;
+                    if (!aml::services::local_server_manager()->send_command(
+                            sv.name, "save-all", nullptr, &error))
+                        report_server_failure(s, st, "Save-All", sv.name, error);
                 }
                 ImGui::SameLine(0, ui_px(4.0f));
             }
@@ -1438,15 +1521,13 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
     ImGui::Spacing();
 
     if (ghost_button("Create Backup", ImVec2(ui_px(120.0f), ui_px(30.0f)))) {
-        auto* svc = aml::services::ServiceManager::instance().servers();
-        if (svc) {
-            std::string backup_id;
-            std::string backup_err;
-            svc->create_backup(sv.name, sv.name + "_manual", &backup_id, &backup_err);
-            if (!backup_err.empty()) {
-                // Show inline error
-                ImGui::TextColored(k.red, "Backup failed: %s", backup_err.c_str());
-            }
+        std::string backup_id;
+        std::string backup_err;
+        if (aml::services::local_server_manager()->create_backup(
+                sv.name, sv.name + "_manual", &backup_id, &backup_err)) {
+            clear_server_failure(s);
+        } else {
+            report_server_failure(s, st, "Create Backup", sv.name, backup_err);
         }
     }
 
@@ -1454,38 +1535,38 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
 
     // List backups from the services layer
     {
-        auto* svc = aml::services::ServiceManager::instance().servers();
-        if (svc) {
-            std::string berr;
-            auto backups = svc->list_backups(sv.name, &berr);
-            if (backups.empty()) {
-                empty_state("No backups yet", "Create a backup above to protect your world.");
-            } else {
-                card_begin("##backups_list", ImVec2(-1, 0));
-                for (size_t i = 0; i < backups.size(); ++i) {
-                    ImGui::PushID(static_cast<int>(i + 3000));
-                    auto& b = backups[i];
-                    auto name_it = b.find("name");
-                    auto id_it = b.find("id");
-                    auto time_it = b.find("created_at");
-                    std::string bname = name_it != b.end() ? name_it->second : "Backup";
-                    std::string bid = id_it != b.end() ? id_it->second : "";
-                    std::string btime = time_it != b.end() ? time_it->second : "";
+        auto backups = aml::services::local_server_manager()->list_backups(sv.name);
+        if (backups.empty()) {
+            empty_state("No backups yet", "Create a backup above to protect your world.");
+        } else {
+            card_begin("##backups_list", ImVec2(-1, 0));
+            for (size_t i = 0; i < backups.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i + 3000));
+                auto& b = backups[i];
+                auto name_it = b.find("name");
+                auto id_it = b.find("id");
+                auto time_it = b.find("created_at");
+                std::string bname = name_it != b.end() ? name_it->second : "Backup";
+                std::string bid = id_it != b.end() ? id_it->second : "";
+                std::string btime = time_it != b.end() ? time_it->second : "";
 
-                    ImGui::TextColored(k.text, "%s", bname.c_str());
-                    if (!btime.empty()) {
-                        ImGui::SameLine();
-                        ImGui::TextColored(k.muted, "(%s)", btime.c_str());
-                    }
-                    ImGui::SameLine(0, ui_px(12.0f));
-                    if (ghost_button("Restore", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
-                        auto* svc2 = aml::services::ServiceManager::instance().servers();
-                        if (svc2) svc2->restore_backup(sv.name, bid, nullptr);
-                    }
-                    ImGui::PopID();
+                ImGui::TextColored(k.text, "%s", bname.c_str());
+                if (!btime.empty()) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(k.muted, "(%s)", btime.c_str());
                 }
-                card_end();
+                ImGui::SameLine(0, ui_px(12.0f));
+                if (ghost_button("Restore", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
+                    std::string restore_error;
+                    if (aml::services::local_server_manager()->restore_backup(
+                            sv.name, bid, &restore_error))
+                        clear_server_failure(s);
+                    else
+                        report_server_failure(s, st, "Restore Backup", sv.name, restore_error);
+                }
+                ImGui::PopID();
             }
+            card_end();
         }
     }
 }
@@ -1497,23 +1578,21 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
 static void draw_server_detail_console(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
     if (ImGui::GetTime() - s.detail_console_last_refresh >= 1.0) {
         s.detail_console_last_refresh = ImGui::GetTime();
-        auto* service = aml::services::ServiceManager::instance().servers();
-        if (service) {
-            const auto live_entries = service->get_console_logs(sv.name, 500, nullptr);
-            if (!live_entries.empty()) {
-                s.console_log.clear();
-                s.console_log.reserve(live_entries.size());
-                for (const auto& live : live_entries) {
-                    server::ServerConsoleEntry entry;
-                    const std::time_t raw_time = static_cast<std::time_t>(live.timestamp);
-                    std::tm local_time{};
-                    char time_text[16]{};
-                    if (localtime_s(&local_time, &raw_time) == 0)
-                        std::strftime(time_text, sizeof(time_text), "%H:%M:%S", &local_time);
-                    entry.timestamp = time_text[0] ? time_text : "live";
-                    entry.message = live.message;
-                    s.console_log.push_back(std::move(entry));
-                }
+        const auto live_entries =
+            aml::services::local_server_manager()->get_console_logs(sv.name, 500, nullptr);
+        if (!live_entries.empty()) {
+            s.console_log.clear();
+            s.console_log.reserve(live_entries.size());
+            for (const auto& live : live_entries) {
+                server::ServerConsoleEntry entry;
+                const std::time_t raw_time = static_cast<std::time_t>(live.timestamp);
+                std::tm local_time{};
+                char time_text[16]{};
+                if (localtime_s(&local_time, &raw_time) == 0)
+                    std::strftime(time_text, sizeof(time_text), "%H:%M:%S", &local_time);
+                entry.timestamp = time_text[0] ? time_text : "live";
+                entry.message = live.message;
+                s.console_log.push_back(std::move(entry));
             }
         }
     }
@@ -1591,11 +1670,10 @@ static void draw_server_detail_console(ServerUIState& s, const server::ServerCon
         cmd_entry.message = command;
         s.console_log.push_back(std::move(cmd_entry));
 
-        auto* service = aml::services::ServiceManager::instance().servers();
         std::string response;
         std::string command_error;
-        const bool sent = service &&
-            service->send_command(sv.name, command, &response, &command_error);
+        const bool sent = aml::services::local_server_manager()->send_command(
+            sv.name, command, &response, &command_error);
         server::ServerConsoleEntry result_entry;
         result_entry.timestamp = sent ? "<" : "!";
         result_entry.message = sent
@@ -1734,44 +1812,40 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         float bw = ui_px(100.0f);
         float bh = ui_px(32.0f);
 
+        auto* svc = aml::services::local_server_manager();
         if (is_running) {
             if (primary_button("Stop", ImVec2(bw + ui_px(10.0f), bh))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
                 std::string error;
-                const bool ok = svc && svc->stop_local_server(sv.name, &error);
-                if (ok) {
+                if (svc->stop_local_server(sv.name, &error)) {
                     sv.stage = server::ServerStage::Stopped;
                     save_local_servers(st.servers);
+                    clear_server_failure(s);
                 } else {
-                    push_notice(st, ui_model::NoticeLevel::Error, "Stop Failed",
-                                error.empty() ? "The local server could not be stopped." : error);
+                    report_server_failure(s, st, "Stop", sv.name, error);
                 }
             }
             ImGui::SameLine(0, ui_px(6.0f));
             if (ghost_button("Restart", ImVec2(bw + ui_px(10.0f), bh))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
                 std::string error;
-                const bool stopped = svc && svc->stop_local_server(sv.name, &error);
-                const bool started = stopped && svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
+                const bool started = svc->stop_local_server(sv.name, &error) &&
+                                     svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
                 if (started) {
                     sv.stage = server::ServerStage::Running;
                     save_local_servers(st.servers);
+                    clear_server_failure(s);
                 } else {
-                    push_notice(st, ui_model::NoticeLevel::Error, "Restart Failed",
-                                error.empty() ? "The local server could not be restarted." : error);
+                    report_server_failure(s, st, "Restart", sv.name, error);
                 }
             }
         } else if (is_ready) {
             if (primary_button("Start", ImVec2(bw + ui_px(10.0f), bh))) {
-                auto* svc = aml::services::ServiceManager::instance().servers();
                 std::string error;
-                const bool ok = svc && svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
-                if (ok) {
+                if (svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error)) {
                     sv.stage = server::ServerStage::Running;
                     save_local_servers(st.servers);
+                    clear_server_failure(s);
                 } else {
-                    push_notice(st, ui_model::NoticeLevel::Error, "Start Failed",
-                                error.empty() ? "The local server could not be started." : error);
+                    report_server_failure(s, st, "Start", sv.name, error);
                 }
             }
             ImGui::SameLine(0, ui_px(6.0f));
@@ -2463,14 +2537,11 @@ void set_fixture_server_detail(int server_index, int tab) {
 
 void draw_server_manager(UiState& st) {
     auto& s = state();
-    // This page is the only consumer of the server service layer. Without a
-    // supervisor every action here is null-guarded into a silent no-op, so ask
-    // for it before deciding what is running, and keep it pointed at the Java
-    // directory the rest of the launcher uses — the settings page can change it
-    // while the launcher runs.
-    if (auto* supervisor = aml::services::local_server_manager()) {
-        supervisor->set_local_java_root(st.cfg ? st.cfg->java_cache_dir : std::wstring());
-    }
+    // This page is the only consumer of the server service layer. Keep the
+    // supervisor pointed at the Java directory the rest of the launcher uses —
+    // the settings page can change it while the launcher runs.
+    aml::services::local_server_manager()->set_local_java_root(
+        st.cfg ? st.cfg->java_cache_dir : std::wstring());
     if (!s.loaded) {
         // In fixture mode the visual seed already populated st.servers.
         if (!st.fixture_mode || st.servers.empty()) {
@@ -2484,6 +2555,7 @@ void draw_server_manager(UiState& st) {
     if (s.detail_server_idx >= 0) {
         page_title("Servers", nullptr);
         draw_breadcrumbs({"Home", "Servers", "Local"});
+        draw_server_action_failure(st);
         draw_server_detail(st);
         // Overlays
         draw_create_dialog(st);
@@ -2495,6 +2567,7 @@ void draw_server_manager(UiState& st) {
     draw_page_emblem(st, "server-emblem-ai.png");
     page_title("Servers", "Run local servers here — hosted servers are managed on the website.");
     draw_breadcrumbs({"Home", "Servers"});
+    draw_server_action_failure(st);
 
     // Branded scene keeps this operational page visually connected to the
     // launcher while the controls remain real and readable on top.
