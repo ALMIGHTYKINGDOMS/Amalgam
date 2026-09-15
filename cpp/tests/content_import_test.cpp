@@ -1,11 +1,24 @@
 #include "instances.h"
 
+#include <windows.h>
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 
 namespace {
+
+std::wstring temporary_path(const wchar_t* suffix) {
+    wchar_t directory[MAX_PATH]{};
+    wchar_t file[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, directory) == 0 ||
+        GetTempFileNameW(directory, L"aml", 0, file) == 0)
+        return {};
+    std::wstring path = file;
+    DeleteFileW(path.c_str());
+    return path + suffix;
+}
 
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -22,8 +35,7 @@ bool write_file(const std::filesystem::path& path, const std::string& body) {
 
 int main() {
     namespace fs = std::filesystem;
-    fs::path root = fs::current_path() / "amalgam_content_import_test";
-    fs::remove_all(root);
+    fs::path root = temporary_path(L"_content_import_test");
     fs::create_directories(root / "profile");
     fs::path source = root / "external.jar";
     std::ofstream(source, std::ios::binary) << "PK\x03\x04local mod";

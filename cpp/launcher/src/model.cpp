@@ -238,7 +238,12 @@ bool resolve_loader_version(const std::string& mc_id, const std::string& loader,
                                 : L"https://meta.fabricmc.net/v2/versions/loader/") +
                            net::to_wide(mc_id);
         std::vector<uint8_t> bytes;
-        if (!net::get(url, bytes, err)) return false;
+        if (!net::get(url, bytes, err)) {
+            // fabric-meta answers 400 (not 404) for an unknown game version;
+            // surface what the user controls instead of the raw HTTP status.
+            if (err) *err = "no " + loader + " loader for Minecraft " + mc_id;
+            return false;
+        }
         std::string text(bytes.begin(), bytes.end());
         Json j = Json::parse(text, err);
         if (!j.is(Json::Type::Arr) || j.size() == 0) {

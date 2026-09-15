@@ -43,18 +43,29 @@ foreach ($case in $cases) {
     # The launcher is a GUI-subsystem executable: console callers cannot rely
     # on pipeline completion, so wait on the process with a timeout and kill
     # a hung run instead of blocking the QA session indefinitely.
-    $proc = Start-Process -FilePath $launcher `
-        -ArgumentList @("--launch", $case.Version, $case.Loader, "--dry-run") `
-        -WorkingDirectory $BuildDir -PassThru -WindowStyle Hidden
-    # 300s: a cached-profile dry run can still fetch one missing mod jar
-    # (measured 200s for fabric-api over a slow link); 180s caused false fails.
-    if (-not $proc.WaitForExit(300000)) {
-        $proc.Kill()
-        $proc.WaitForExit()
-        throw "Cached dry-run timed out for $($case.Version)/$($case.Loader)"
-    }
-    if ($proc.ExitCode -ne 0) {
-        throw "Cached dry-run failed for $($case.Version)/$($case.Loader) (exit $($proc.ExitCode))"
+    # One retry on timeout: a first attempt that just misses the budget leaves
+    # the missing jar cached, so the retry measures launch logic, not CDN
+    # speed. Nonzero exits are real launch failures and are not retried.
+    $passed = $false
+    for ($attempt = 1; $attempt -le 2 -and -not $passed; $attempt++) {
+        $proc = Start-Process -FilePath $launcher `
+            -ArgumentList @("--launch", $case.Version, $case.Loader, "--dry-run") `
+            -WorkingDirectory $BuildDir -PassThru -WindowStyle Hidden
+        # 300s: a cached-profile dry run can still fetch one missing mod jar
+        # (measured 200s for fabric-api over a slow link); 180s caused false fails.
+        if ($proc.WaitForExit(300000)) {
+            if ($proc.ExitCode -ne 0) {
+                throw "Cached dry-run failed for $($case.Version)/$($case.Loader) (exit $($proc.ExitCode))"
+            }
+            $passed = $true
+        } else {
+            $proc.Kill()
+            $proc.WaitForExit()
+            if ($attempt -ge 2) {
+                throw "Cached dry-run timed out for $($case.Version)/$($case.Loader)"
+            }
+            Write-Output "retry $($case.Version)/$($case.Loader) (first attempt exceeded 300s)"
+        }
     }
     Write-Output "PASS $($case.Version)/$($case.Loader)"
 }

@@ -1189,6 +1189,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     const bool safe_mode = has_arg(argc, argv, L"--safe-mode");
     const std::string initial_page = lowercase(
         aml::net::to_utf8(value_after_arg(argc, argv, L"--page")));
+    // An unrecognized flag almost always means a user typed the launcher into
+    // a terminal expecting --help/--version style output (or misspelled a
+    // command). Without console output the process appears to hang silently.
+    // The full command list lives in is_cli_invocation(); attaching to the
+    // caller's terminal here is harmless for double-click launches (there is
+    // no parent console to attach to). Must run before argv is freed.
+    if (argc > 1 && argv[1][0] == L'-' &&
+        !has_arg(argc, argv, L"--page") &&
+        !has_arg(argc, argv, L"--safe-mode")) {
+        attach_cli_output();
+        std::wprintf(
+            L"Amalgam Launcher: unknown option '%s'.\n"
+            L"This command starts the graphical launcher. Run it without "
+            L"arguments for the GUI, or use a documented CLI command such as "
+            L"--versions, --check-prereqs, --doctor, --launch, --mods-search.\n",
+            argv[1]);
+        std::fflush(stdout);
+    }
     if (argv) LocalFree(argv);
     (void)instance;
     (void)prev;

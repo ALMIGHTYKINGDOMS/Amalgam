@@ -10,6 +10,17 @@
 
 namespace {
 
+std::wstring temporary_path(const wchar_t* suffix) {
+    wchar_t directory[MAX_PATH]{};
+    wchar_t file[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, directory) == 0 ||
+        GetTempFileNameW(directory, L"aml", 0, file) == 0)
+        return {};
+    std::wstring path = file;
+    DeleteFileW(path.c_str());
+    return path + suffix;
+}
+
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
@@ -29,7 +40,7 @@ bool has_staging_folder(const std::filesystem::path& root) {
 
 int main() {
     namespace fs = std::filesystem;
-    fs::path root = fs::current_path() / "amalgam_import_pack_test";
+    fs::path root = temporary_path(L"_import_pack_test");
     fs::remove_all(root);
     fs::create_directories(root / "mods");
     std::ofstream(root / "mods" / "example.jar") << "jar";
@@ -40,9 +51,9 @@ int main() {
     instance.loader = "forge";
     instance.loader_version = "47.4.15";
     instance.directory = root.wstring();
-    fs::path mrpack = fs::current_path() / "amalgam_import_pack_test.mrpack";
-    fs::path curseforge = fs::current_path() / "amalgam_import_pack_test.zip";
-    fs::path instances_dir = fs::current_path() / "amalgam_import_pack_instances";
+    fs::path mrpack = temporary_path(L"_import_pack_test.mrpack");
+    fs::path curseforge = temporary_path(L"_import_pack_test.zip");
+    fs::path instances_dir = temporary_path(L"_import_pack_instances");
     std::string error;
     if (!aml::import_pack::export_mrpack(instance, mrpack.wstring(), &error) ||
         !aml::import_pack::export_curseforge(instance, curseforge.wstring(), &error)) {
@@ -90,7 +101,7 @@ int main() {
     aml::instances::Instance imported_into;
     aml::instances::Instance incompatible = instance;
     incompatible.minecraft_version = "1.21.1";
-    fs::path incompatible_pack = fs::current_path() / "amalgam_import_pack_incompatible.mrpack";
+    fs::path incompatible_pack = temporary_path(L"_import_pack_incompatible.mrpack");
     if (!aml::import_pack::export_mrpack(incompatible, incompatible_pack.wstring(), &error) ||
         aml::import_pack::archive_into(incompatible_pack.wstring(), target, api, imported_into, nullptr, &error) ||
         read_file(fs::path(target.directory) / "mods" / "keep.jar") != "keep" ||
@@ -149,8 +160,8 @@ int main() {
     // The diff must classify every managed outcome: a content mismatch is
     // replaced, new paths are added, and nothing else is removed — while the
     // live profile stays untouched until the user commits.
-    fs::path replace_stage = fs::current_path() / "amalgam_import_pack_replace";
-    fs::path replace_pack = fs::current_path() / "amalgam_import_pack_replace.mrpack";
+    fs::path replace_stage = temporary_path(L"_import_pack_replace");
+    fs::path replace_pack = temporary_path(L"_import_pack_replace.mrpack");
     fs::create_directories(replace_stage);
     std::ofstream(replace_stage / "modrinth.index.json", std::ios::binary)
         << "{\"formatVersion\":1,\"game\":\"minecraft\",\"versionId\":\"diff\","
@@ -178,7 +189,7 @@ int main() {
 
     // Re-exporting the committed profile produces an identical override: the
     // diff must recognize the file as unchanged rather than a replacement.
-    fs::path unchanged_pack = fs::current_path() / "amalgam_import_pack_unchanged.mrpack";
+    fs::path unchanged_pack = temporary_path(L"_import_pack_unchanged.mrpack");
     error.clear();
     if (!aml::import_pack::export_mrpack(imported_into, unchanged_pack.wstring(), &error) ||
         !aml::import_pack::preview_archive(unchanged_pack.wstring(), target, diff_preview, &error) ||

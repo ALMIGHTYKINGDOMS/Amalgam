@@ -911,7 +911,15 @@ bool install_one(const ApiCfg& cfg, const std::string& slug, const std::string& 
                  const std::string& required_by, const Progress& progress) {
     if (!visited.insert(source + ":" + slug).second) return true;
     ModInfo mod;
-    if (!project_files(cfg, slug, source, mod, err)) return false;
+    if (!project_files(cfg, slug, source, mod, err)) {
+        // Providers answer raw HTTP 404 for an unknown project; state the
+        // user's input (and the dependent, for dependency lookups) instead.
+        if (err && err->rfind("http status", 0) == 0) {
+            *err = "'" + slug + "' was not found on " + source +
+                   (required_by.empty() ? "" : " (required by " + required_by + ")");
+        }
+        return false;
+    }
     const FileInfo* f = pick(mod.files, loader, game_version);
     if (!f) {
         const std::string target = (loader.empty() ? "any loader" : loader) +
