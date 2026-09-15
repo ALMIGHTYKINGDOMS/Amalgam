@@ -254,7 +254,8 @@ void InviteManager::on_invite_received(InviteReceivedCallback cb) {
 
 void InviteManager::poll_invites() {
     while (running_) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        for (int i = 0; i < 10 && running_; ++i)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!running_) break;
 
         auto& supabase = aml::supabase::SupabaseManager::instance();

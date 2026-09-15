@@ -534,6 +534,19 @@ if(BUILD_TESTING)
     target_include_directories(amalgam_essentials_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
     add_test(NAME amalgam_essentials_test COMMAND amalgam_essentials_test)
 
+    add_executable(amalgam_essentials_lifecycle_test
+        tests/essentials_lifecycle_test.cpp
+        launcher/src/essentials_manager.cpp
+        launcher/src/essentials_session.cpp
+        launcher/src/essentials_address.cpp
+        launcher/src/supabase.cpp
+        launcher/src/json.cpp
+        launcher/src/net.cpp)
+    target_include_directories(amalgam_essentials_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    target_compile_definitions(amalgam_essentials_lifecycle_test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(amalgam_essentials_lifecycle_test PRIVATE wininet advapi32 ws2_32)
+    add_test(NAME amalgam_essentials_lifecycle_test COMMAND amalgam_essentials_lifecycle_test)
+
     add_executable(amalgam_server_providers_test
         tests/server_providers_test.cpp
         launcher/src/server_providers.cpp

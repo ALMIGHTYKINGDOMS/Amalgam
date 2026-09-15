@@ -13804,6 +13804,23 @@ bool init_window(UiState& st, const RunOptions& options) {
     return st.hwnd != nullptr;
 }
 
+// Amalgam account services (friends, presence, invites, live sessions) run only
+// while a real account is signed in. Start and stop are idempotent, so this is
+// safe to call from every auth transition as well as startup and shutdown.
+void sync_essentials_services(bool authenticated) {
+    if (authenticated) {
+        aml::essentials::FriendsManager::instance().initialize();
+        aml::essentials::PresenceManager::instance().initialize();
+        aml::essentials::InviteManager::instance().initialize();
+        aml::essentials::SessionManager::instance().initialize();
+    } else {
+        aml::essentials::InviteManager::instance().shutdown();
+        aml::essentials::SessionManager::instance().shutdown();
+        aml::essentials::PresenceManager::instance().shutdown();
+        aml::essentials::FriendsManager::instance().shutdown();
+    }
+}
+
 bool run_window(config::Config* cfg, const RunOptions& options) {
     // Win32 would otherwise bitmap-scale the entire OpenGL surface on a
     // high-DPI display.  That produces blurry text and icons regardless of
@@ -13891,13 +13908,27 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         auto& supabase = aml::supabase::SupabaseManager::instance();
         supabase.initialize(
             cfg->supabase_url, cfg->supabase_anon_key, cfg->supabase_service_key);
+        // Account services track the real auth state: they start when the user
+        // signs in and stop when they sign out. Visual-review fixtures and safe
+        // mode never open background account sessions.
+        const bool essentials_enabled = !st.fixture_mode && !st.safe_mode;
+        if (essentials_enabled && supabase.client()) {
+            supabase.client()->on_auth_state_change(
+                [](bool authenticated, const auto&) {
+                    sync_essentials_services(authenticated);
+                });
+        }
         auto& accounts = aml::account::AccountManager::instance();
         auto session = accounts.get_current_session();
         if (!session.id.empty()) {
             if (session.is_expired()) {
                 accounts.refresh_current_session();
             } else {
-                supabase.auto_login(session.access_token, session.refresh_token);
+                const bool restored =
+                    supabase.auto_login(session.access_token, session.refresh_token);
+                // A restored session does not fire an auth-state change, so start
+                // the account services directly.
+                if (essentials_enabled && restored) sync_essentials_services(true);
                 // Kick off an early entitlements fetch from Supabase (Whop-synced
                 // subscription data) so the launcher knows the user's plan on first
                 // render without waiting for the Account page.
@@ -14213,6 +14244,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     }
     if (!st.fixture_mode) persist_jobs(st);
     join_workers(st);
+    if (!st.fixture_mode) sync_essentials_services(false);
     if (!st.fixture_mode) {
         st.cfg->base_dir = net::to_wide(st.ui_base);
         st.cfg->assets_dir = net::to_wide(st.ui_assets);

@@ -2694,8 +2694,9 @@ bool SupabaseManager::delete_bedrock_profile(const std::string& profile_id) {
 // ---------------------------------------------------------------------------
 
 std::vector<SupabaseFriendship> SupabaseManager::get_friends() {
-    auto result = client_->call_edge_function("get_friends");
     std::vector<SupabaseFriendship> friends;
+    if (!client_ || !client_->is_authenticated()) return friends;
+    auto result = client_->call_edge_function("get_friends");
     if (result.success && result.data.isArray()) {
         for (const auto& item : result.data) {
             SupabaseFriendship f;
@@ -2727,8 +2728,9 @@ std::vector<SupabaseFriendship> SupabaseManager::get_friends() {
 }
 
 std::vector<SupabaseFriendRequest> SupabaseManager::get_friend_requests() {
-    auto result = client_->call_edge_function("get_friend_requests");
     std::vector<SupabaseFriendRequest> requests;
+    if (!client_ || !client_->is_authenticated()) return requests;
+    auto result = client_->call_edge_function("get_friend_requests");
     if (result.success && result.data.isArray()) {
         for (const auto& item : result.data) {
             SupabaseFriendRequest r;
@@ -3005,6 +3007,7 @@ std::vector<SupabasePartyMember> SupabaseManager::get_party_members(const std::s
 // ---------------------------------------------------------------------------
 
 bool SupabaseManager::update_presence(const std::string& status, const std::string& status_message, const std::string& server_id) {
+    if (!client_ || !client_->is_authenticated()) return false;
     Json body;
     body.set("status", status);
     body.set("status_message", status_message);
@@ -3030,8 +3033,9 @@ SupabasePresence SupabaseManager::get_user_presence(const std::string& user_id) 
 }
 
 std::vector<SupabasePresence> SupabaseManager::get_friends_presence() {
-    auto result = client_->call_edge_function("get_friends_presence");
     std::vector<SupabasePresence> presences;
+    if (!client_ || !client_->is_authenticated()) return presences;
+    auto result = client_->call_edge_function("get_friends_presence");
     if (result.success && result.data.isArray()) {
         for (const auto& item : result.data) {
             SupabasePresence p;

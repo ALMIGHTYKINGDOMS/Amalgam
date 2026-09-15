@@ -22,11 +22,15 @@ bool FriendsManager::initialize() {
     if (running_) return true;
 
     running_ = true;
-    refresh_friends();
 
+    // Fetch on the worker thread so signing in never blocks the UI thread on
+    // three sequential network calls, and sleep in short steps so shutdown is
+    // immediate instead of waiting out a full polling interval.
     presence_thread_ = std::thread([this]() {
+        refresh_friends();
         while (running_) {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
+            for (int i = 0; i < 60 && running_; ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             if (!running_) break;
             refresh_friends();
         }
@@ -36,7 +40,7 @@ bool FriendsManager::initialize() {
 }
 
 void FriendsManager::shutdown() {
-    running_ = false;
+    if (!running_.exchange(false)) return;
     if (presence_thread_.joinable()) {
         presence_thread_.join();
     }
@@ -197,17 +201,17 @@ bool PresenceManager::initialize() {
 
     running_ = true;
 
-    auto& supa = aml::supabase::SupabaseManager::instance();
-    supa.update_presence("online");
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        self_presence_.status = FriendStatus::Online;
+        self_presence_.last_seen = static_cast<int64_t>(std::time(nullptr));
+    }
 
-    self_presence_.status = FriendStatus::Online;
-    self_presence_.last_seen = static_cast<int64_t>(std::time(nullptr));
-
+    // Publish the first heartbeat from the worker thread so sign-in never
+    // blocks the UI thread on a network call, and sleep in short steps so
+    // shutdown is immediate instead of waiting out a full polling interval.
     heartbeat_thread_ = std::thread([this]() {
         while (running_) {
-            std::this_thread::sleep_for(std::chrono::seconds(30));
-            if (!running_) break;
-
             auto& supa = aml::supabase::SupabaseManager::instance();
             std::string status_str;
             {
@@ -246,6 +250,9 @@ bool PresenceManager::initialize() {
                     cb(uid, ep);
                 }
             }
+
+            for (int i = 0; i < 30 && running_; ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     });
 
@@ -253,11 +260,12 @@ bool PresenceManager::initialize() {
 }
 
 void PresenceManager::shutdown() {
-    running_ = false;
-    {
-        auto& supa = aml::supabase::SupabaseManager::instance();
-        supa.update_presence("offline");
-    }
+    if (!running_.exchange(false)) return;
+
+    // Announce offline only for a session we actually published as online.
+    auto& supa = aml::supabase::SupabaseManager::instance();
+    supa.update_presence("offline");
+
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
