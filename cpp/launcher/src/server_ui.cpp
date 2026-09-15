@@ -70,6 +70,35 @@ static void load_local_servers(std::vector<server::ServerConfig>& servers) {
     }
 }
 
+// Local run state belongs to the process the service is supervising; the saved
+// list only records a hint. Every read of "is this server running" asks here.
+static bool local_server_supervised(const server::ServerConfig& sv) {
+    auto* svc = aml::services::ServiceManager::instance().servers();
+    return svc && svc->is_local_server_running(sv.name);
+}
+
+static server::ServerStage effective_stage(const UiState& st,
+                                           const server::ServerConfig& sv) {
+    // Visual-review fixtures seed a running server with no process on purpose.
+    if (st.fixture_mode) return sv.stage;
+    return server::reconciled_stage(sv, local_server_supervised(sv));
+}
+
+// Correct a run stage no supervised process backs, so the saved list stops
+// claiming a server is up after a restart.
+static void reconcile_local_server_stages(std::vector<server::ServerConfig>& servers) {
+    bool changed = false;
+    for (auto& sv : servers) {
+        const server::ServerStage stage =
+            server::reconciled_stage(sv, local_server_supervised(sv));
+        if (stage != sv.stage) {
+            sv.stage = stage;
+            changed = true;
+        }
+    }
+    if (changed) save_local_servers(servers);
+}
+
 // ---------------------------------------------------------------------------
 // UI state singleton (codebase pattern)
 // ---------------------------------------------------------------------------
@@ -232,17 +261,19 @@ static const char* status_filter_name(int idx) {
     return "All";
 }
 
-static bool matches_filters(const server::ServerConfig& sv, int filter_status, int filter_software) {
+static bool matches_filters(const UiState& st, const server::ServerConfig& sv,
+                            int filter_status, int filter_software) {
     if (filter_status > 0) {
+        const server::ServerStage stage = effective_stage(st, sv);
         server::ServerStage target;
         switch (filter_status) {
             case 1: target = server::ServerStage::Running; break;
             case 2: target = server::ServerStage::Ready; break;
             case 3: target = server::ServerStage::Stopped; break;
             case 4: target = server::ServerStage::Error; break;
-            default: target = sv.stage;
+            default: target = stage;
         }
-        if (sv.stage != target) return false;
+        if (stage != target) return false;
     }
     if (filter_software > 0) {
         int sw_idx = filter_software - 1;
@@ -423,10 +454,11 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     auto& s = state();
     ImGui::PushID(index);
 
-    bool is_running = (sv.stage == server::ServerStage::Running);
-    bool is_ready = (sv.stage == server::ServerStage::Ready ||
-                     sv.stage == server::ServerStage::Stopped ||
-                     sv.stage == server::ServerStage::NotInstalled);
+    const server::ServerStage stage = effective_stage(st, sv);
+    bool is_running = (stage == server::ServerStage::Running);
+    bool is_ready = (stage == server::ServerStage::Ready ||
+                     stage == server::ServerStage::Stopped ||
+                     stage == server::ServerStage::NotInstalled);
 
     // ── Card with left status strip ──────────────────────────────────
     card_begin(("##srv_" + std::to_string(index)).c_str(), ImVec2(-1, 0));
@@ -435,7 +467,7 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     ImVec2 card_min = ImGui::GetCursorScreenPos();
     ImVec2 card_content_max = ImGui::GetContentRegionMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec4 strip_color = stage_color(sv.stage);
+    ImVec4 strip_color = stage_color(stage);
     dl->AddRectFilled(
         card_min,
         ImVec2(card_min.x + ui_px(4.0f), card_min.y + ui_px(76.0f)),
@@ -470,7 +502,7 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     }
 
     ImGui::SameLine(0, ui_px(8.0f));
-    draw_status_badge(sv.stage);
+    draw_status_badge(stage);
 
     ImGui::SameLine(0, ui_px(6.0f));
     {
@@ -521,7 +553,7 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
 
     if (!is_running && !sv.status_message.empty()) {
         ImGui::Spacing();
-        const ImVec4 sc = (sv.stage == server::ServerStage::Error) ? k.red : k.muted;
+        const ImVec4 sc = (stage == server::ServerStage::Error) ? k.red : k.muted;
         ImGui::TextColored(sc, "%s", sv.status_message.c_str());
     }
 
@@ -692,7 +724,7 @@ static void draw_console_panel(UiState& st) {
         ImGui::TextColored(k.text, "Console: %s", sv.name.c_str());
         ImGui::PopFont();
         ImGui::SameLine(0, ui_px(12.0f));
-        draw_status_badge(sv.stage);
+        draw_status_badge(effective_stage(st, sv));
 
         ImGui::Spacing();
 
@@ -1165,13 +1197,13 @@ static void draw_server_files_tab(ServerUIState& s, const server::ServerConfig& 
 // Server detail – players tab
 // ---------------------------------------------------------------------------
 
-static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig& sv, UiState&) {
+static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
     ImGui::PushFont(f_h2);
     ImGui::TextColored(k.text, "Online Players");
     ImGui::PopFont();
     ImGui::Spacing();
 
-    if (sv.stage != server::ServerStage::Running) {
+    if (effective_stage(st, sv) != server::ServerStage::Running) {
         empty_state("Server not running", "Start the server to see online players.");
     } else if (s.detail_players.empty()) {
         empty_state("No players online", "Waiting for players to join.");
@@ -1309,7 +1341,7 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
 // Server detail – world tab
 // ---------------------------------------------------------------------------
 
-static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& sv) {
+static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
     ImGui::PushFont(f_h2);
     ImGui::TextColored(k.text, "World");
     ImGui::PopFont();
@@ -1379,7 +1411,7 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
             float bw = ui_px(100.0f);
             float bh = ui_px(28.0f);
 
-            if (sv.stage == server::ServerStage::Running) {
+            if (effective_stage(st, sv) == server::ServerStage::Running) {
                 if (ghost_button("Save-All", ImVec2(bw, bh))) {
                     auto* svc = aml::services::ServiceManager::instance().servers();
                     if (svc) svc->send_command(sv.name, "save-all", nullptr);
@@ -1462,7 +1494,7 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
 // Server detail – console tab (embedded)
 // ---------------------------------------------------------------------------
 
-static void draw_server_detail_console(ServerUIState& s, const server::ServerConfig& sv) {
+static void draw_server_detail_console(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
     if (ImGui::GetTime() - s.detail_console_last_refresh >= 1.0) {
         s.detail_console_last_refresh = ImGui::GetTime();
         auto* service = aml::services::ServiceManager::instance().servers();
@@ -1491,7 +1523,7 @@ static void draw_server_detail_console(ServerUIState& s, const server::ServerCon
     ImGui::TextColored(k.text, "Console: %s", sv.name.c_str());
     ImGui::PopFont();
     ImGui::SameLine(0, ui_px(12.0f));
-    draw_status_badge(sv.stage);
+    draw_status_badge(effective_stage(st, sv));
 
     ImGui::Spacing();
 
@@ -1596,10 +1628,11 @@ static void draw_server_detail_console(ServerUIState& s, const server::ServerCon
 // ---------------------------------------------------------------------------
 
 static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv, UiState& st) {
-    bool is_running = (sv.stage == server::ServerStage::Running);
-    bool is_ready = (sv.stage == server::ServerStage::Ready ||
-                     sv.stage == server::ServerStage::Stopped ||
-                     sv.stage == server::ServerStage::NotInstalled);
+    const server::ServerStage stage = effective_stage(st, sv);
+    bool is_running = (stage == server::ServerStage::Running);
+    bool is_ready = (stage == server::ServerStage::Ready ||
+                     stage == server::ServerStage::Stopped ||
+                     stage == server::ServerStage::NotInstalled);
 
     // ── Status hero card ────────────────────────────────────────────
     card_begin("##detail_hero", ImVec2(-1, 0));
@@ -1620,7 +1653,7 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
 
         // Left status strip
         ImVec2 card_min = ImGui::GetCursorScreenPos();
-        ImVec4 strip_color = stage_color(sv.stage);
+        ImVec4 strip_color = stage_color(stage);
         ImGui::GetWindowDrawList()->AddRectFilled(
             card_min,
             ImVec2(card_min.x + ui_px(5.0f), card_min.y + ui_px(90.0f)),
@@ -1634,7 +1667,7 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         ImGui::TextUnformatted(sv.name.c_str());
         ImGui::PopFont();
         ImGui::SameLine(0, ui_px(12.0f));
-        draw_status_badge(sv.stage);
+        draw_status_badge(stage);
         ImGui::SameLine(0, ui_px(8.0f));
         {
             ImDrawList* dl2 = ImGui::GetWindowDrawList();
@@ -1681,7 +1714,7 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
 
         if (!sv.status_message.empty()) {
             ImGui::Spacing();
-            const ImVec4 sc = (sv.stage == server::ServerStage::Error) ? k.red : k.muted;
+            const ImVec4 sc = (stage == server::ServerStage::Error) ? k.red : k.muted;
             ImGui::TextColored(sc, "%s", sv.status_message.c_str());
         }
 
@@ -2159,12 +2192,12 @@ static void draw_server_detail(UiState& st) {
     // ── Tab content ───────────────────────────────────────────────
     switch (s.detail_tab) {
         case 0: draw_server_overview_tab(s, sv, st); break;
-        case 1: draw_server_detail_console(s, sv); break;
+        case 1: draw_server_detail_console(s, sv, st); break;
         case 2: draw_server_files_tab(s, sv); break;
         case 3: draw_server_players_tab(s, sv, st); break;
         case 4: draw_server_plugins_tab(s, sv); break;
         case 5: draw_server_properties_tab(s, sv); break;
-        case 6: draw_server_world_tab(s, sv); break;
+        case 6: draw_server_world_tab(s, sv, st); break;
     }
 }
 
@@ -2434,6 +2467,7 @@ void draw_server_manager(UiState& st) {
         // In fixture mode the visual seed already populated st.servers.
         if (!st.fixture_mode || st.servers.empty()) {
             load_local_servers(st.servers);
+            reconcile_local_server_stages(st.servers);
         }
         s.loaded = true;
     }
@@ -2666,7 +2700,7 @@ void draw_server_manager(UiState& st) {
     ImGui::SameLine(0, ui_px(12.0f));
     int shown = 0;
     for (const auto& sv : st.servers) {
-        if (matches_filters(sv, s.filter_status, s.filter_software)) ++shown;
+        if (matches_filters(st, sv, s.filter_status, s.filter_software)) ++shown;
     }
     ImGui::TextColored(k.muted, "%d / %d servers", shown, (int)st.servers.size());
 
@@ -2695,7 +2729,7 @@ void draw_server_manager(UiState& st) {
         // Collect filtered indices for sorting
         std::vector<int> indices;
         for (int i = 0; i < static_cast<int>(st.servers.size()); ++i) {
-            if (matches_filters(st.servers[i], s.filter_status, s.filter_software))
+            if (matches_filters(st, st.servers[i], s.filter_status, s.filter_software))
                 indices.push_back(i);
         }
 
@@ -2704,7 +2738,8 @@ void draw_server_manager(UiState& st) {
             const auto& sa = st.servers[a];
             const auto& sb = st.servers[b];
             switch (s.sort_mode) {
-                case 1: return static_cast<int>(sa.stage) < static_cast<int>(sb.stage);
+                case 1: return static_cast<int>(effective_stage(st, sa)) <
+                               static_cast<int>(effective_stage(st, sb));
                 case 2: return sa.minecraft_version < sb.minecraft_version;
                 case 3: return sa.port < sb.port;
                 default: return sa.name < sb.name;

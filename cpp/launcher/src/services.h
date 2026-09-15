@@ -430,6 +430,10 @@ public:
     bool start_local_server(const std::string& server_id, const std::string& java_path, 
                            int ram_mb, std::string* error = nullptr);
     bool stop_local_server(const std::string& server_id, std::string* error = nullptr);
+
+    // The supervised process is the only owner of local run state. A stage
+    // persisted elsewhere is a hint that must be reconciled against this.
+    bool is_local_server_running(const std::string& server_id) const;
     
     // Events
     void on_server_started(const std::function<void(const std::string&)>& callback);
@@ -453,6 +457,11 @@ private:
                             const std::string& body = "", std::string* error = nullptr);
     std::string build_auth_header() const;
     std::string get_server_path(const std::string& server_id) const;
+
+    // Releases everything the supervisor holds for a server: its console
+    // transport, the reader thread and the process handle. The caller stops the
+    // process first; this only forgets it.
+    void forget_local_server(const std::string& server_id);
 };
 
 // ---------------------------------------------------------------------------

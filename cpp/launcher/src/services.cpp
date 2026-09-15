@@ -1982,14 +1982,13 @@ bool ServerManager::start_local_server(const std::string& server_id, const std::
         return false;
     }
     
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto running = running_servers_.find(server_id);
-        if (running != running_servers_.end() && running->second.process_handle) {
-            if (error) *error = "Server is already running";
-            return false;
-        }
+    if (is_local_server_running(server_id)) {
+        if (error) *error = "Server is already running";
+        return false;
     }
+    // A process that exited on its own leaves a record with no live process
+    // behind it; release that record so this start owns the server again.
+    forget_local_server(server_id);
     
     std::filesystem::path server_dir = std::filesystem::path(get_server_path(server_id));
     
@@ -2192,32 +2191,7 @@ bool ServerManager::stop_local_server(const std::string& server_id, std::string*
         }
     }
 
-    std::unique_ptr<LocalServerTransport> transport;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto transport_it = local_transports_.find(server_id);
-        if (transport_it != local_transports_.end()) {
-            transport = std::move(transport_it->second);
-            local_transports_.erase(transport_it);
-        }
-        running_servers_.erase(server_id);
-    }
-    if (transport) {
-        transport->stop_reader = true;
-        if (transport->stdin_write) {
-            CloseHandle(transport->stdin_write);
-            transport->stdin_write = nullptr;
-        }
-        if (transport->reader.joinable()) {
-            CancelSynchronousIo(static_cast<HANDLE>(transport->reader.native_handle()));
-        }
-        if (transport->stdout_read) {
-            CloseHandle(transport->stdout_read);
-            transport->stdout_read = nullptr;
-        }
-        if (transport->reader.joinable()) transport->reader.join();
-    }
-    if (server.process_handle) CloseHandle(server.process_handle);
+    forget_local_server(server_id);
 
     server.online = false;
     auto& supabase = aml::supabase::SupabaseManager::instance();
@@ -2244,6 +2218,48 @@ bool ServerManager::stop_local_server(const std::string& server_id, std::string*
             : (command_error.empty() ? "Server was force-closed" : command_error);
     }
     return true;
+}
+
+bool ServerManager::is_local_server_running(const std::string& server_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = running_servers_.find(server_id);
+    if (it == running_servers_.end() || !it->second.process_handle) return false;
+    // A supervised server is running while its process handle is still live.
+    return WaitForSingleObject(it->second.process_handle, 0) != WAIT_OBJECT_0;
+}
+
+void ServerManager::forget_local_server(const std::string& server_id) {
+    ServerInfo info;
+    std::unique_ptr<LocalServerTransport> transport;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto running = running_servers_.find(server_id);
+        if (running != running_servers_.end()) {
+            info = running->second;
+            running_servers_.erase(running);
+        }
+        auto transport_it = local_transports_.find(server_id);
+        if (transport_it != local_transports_.end()) {
+            transport = std::move(transport_it->second);
+            local_transports_.erase(transport_it);
+        }
+    }
+    if (transport) {
+        transport->stop_reader = true;
+        if (transport->stdin_write) {
+            CloseHandle(transport->stdin_write);
+            transport->stdin_write = nullptr;
+        }
+        if (transport->reader.joinable()) {
+            CancelSynchronousIo(static_cast<HANDLE>(transport->reader.native_handle()));
+        }
+        if (transport->stdout_read) {
+            CloseHandle(transport->stdout_read);
+            transport->stdout_read = nullptr;
+        }
+        if (transport->reader.joinable()) transport->reader.join();
+    }
+    if (info.process_handle) CloseHandle(info.process_handle);
 }
 
 void ServerManager::on_server_started(const std::function<void(const std::string&)>& callback) {

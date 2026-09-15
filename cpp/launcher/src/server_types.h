@@ -79,6 +79,14 @@ inline bool is_modded_software(ServerSoftware s) {
            s == ServerSoftware::Fabric || s == ServerSoftware::Quilt;
 }
 
+// A stage restored from disk is only a hint. The process the service supervises
+// owns local run state, so an unsupervised Running stage has to read as Stopped
+// instead of as a server that is actually up.
+inline ServerStage reconciled_stage(const ServerConfig& server, bool supervised) {
+    return (server.stage == ServerStage::Running && !supervised) ? ServerStage::Stopped
+                                                                 : server.stage;
+}
+
 struct ServerMod {
     std::string name;
     std::string version;

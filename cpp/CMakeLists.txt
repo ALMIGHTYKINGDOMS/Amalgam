@@ -547,6 +547,10 @@ if(BUILD_TESTING)
     target_link_libraries(amalgam_essentials_lifecycle_test PRIVATE wininet advapi32 ws2_32)
     add_test(NAME amalgam_essentials_lifecycle_test COMMAND amalgam_essentials_lifecycle_test)
 
+    add_executable(amalgam_server_run_state_test tests/server_run_state_test.cpp)
+    target_include_directories(amalgam_server_run_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    add_test(NAME amalgam_server_run_state_test COMMAND amalgam_server_run_state_test)
+
     add_executable(amalgam_server_providers_test
         tests/server_providers_test.cpp
         launcher/src/server_providers.cpp

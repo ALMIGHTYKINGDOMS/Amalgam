@@ -746,6 +746,10 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
         return 2;
     }
 
+    // The supervisor owns local run state: the server reads as running exactly
+    // while its process is alive, and as stopped once the stop is clean.
+    const bool running_while_up = manager.is_local_server_running("probe");
+
     const std::vector<uint8_t> file_payload = {'o', 'k'};
     std::string file_error;
     std::vector<uint8_t> roundtrip;
@@ -787,13 +791,17 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
         if (!observed) Sleep(20);
     }
     const bool stopped = manager.stop_local_server("probe", &error);
+    const bool running_after_stop = manager.is_local_server_running("probe");
     SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
-    if (!observed || !stopped) {
-        std::printf("server transport verification failed: observed=%s stopped=%s %s\n",
-                    observed ? "yes" : "no", stopped ? "yes" : "no", error.c_str());
+    if (!observed || !stopped || !running_while_up || running_after_stop) {
+        std::printf("server transport verification failed: observed=%s stopped=%s up=%s after_stop=%s %s\n",
+                    observed ? "yes" : "no", stopped ? "yes" : "no",
+                    running_while_up ? "yes" : "no", running_after_stop ? "yes" : "no",
+                    error.c_str());
         return 5;
     }
     std::printf("server transport: READY (files, path boundary, stdin, stdout, graceful stop)\n");
+    std::printf("server run state: running_while_up=1 running_after_clean_stop=0\n");
     return 0;
 }
 
