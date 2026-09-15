@@ -126,6 +126,13 @@ bool test_website_links_are_canonical() {
     config.website_url = "https://example.test///";
     assert(config.page_url("plans") == "https://example.test/plans");
     assert(config.page_url("/account/membership") == "https://example.test/account/membership");
+
+    // A configured host without a scheme must still become a link the shell can
+    // open, and an empty value must fall back to the public site.
+    config.website_url = "example.test";
+    assert(config.page_url("plans") == "https://example.test/plans");
+    config.website_url = "";
+    assert(config.page_url("") == "https://amalgam-mc.com");
     return true;
 }
 

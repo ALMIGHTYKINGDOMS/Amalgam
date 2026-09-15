@@ -73,25 +73,6 @@ void apply_remote_profile(const aml::supabase::SupabaseProfile& remote,
     local.last_played = remote.last_played_at;
 }
 
-bool profile_from_operation(const SyncOperation& operation,
-                            aml::supabase::SupabaseProfile& profile) {
-    if (operation.data.empty()) return false;
-    std::string error;
-    Json data = Json::parse(operation.data, &error);
-    if (!data.isObject()) return false;
-
-    profile.id = operation.id.empty() ? data.get("id").as_str() : operation.id;
-    profile.name = data.get("name").as_str();
-    profile.minecraft_version = data.get("minecraft_version").as_str();
-    profile.loader = data.get("loader").as_str("auto");
-    profile.loader_version = data.get("loader_version").as_str();
-    profile.java_path = data.get("java_path").as_str();
-    profile.memory_mb = static_cast<int>(data.get("memory_mb").as_int(2048));
-    profile.updated_at = data.get("updated_at").as_int(static_cast<int64_t>(std::time(nullptr)));
-    profile.last_played_at = data.get("last_played_at").as_int();
-    return !profile.id.empty() && !profile.name.empty() && !profile.minecraft_version.empty();
-}
-
 void remember_sync_error(std::mutex& state_mu, SyncState& sync_state,
                          const std::string& error) {
     std::lock_guard<std::mutex> lock(state_mu);
@@ -172,12 +153,6 @@ void SyncManager::shutdown() {
     // Unsubscribe from updates
     unsubscribe_from_updates();
     
-    // Clear pending operations
-    {
-        std::lock_guard<std::mutex> lock(pending_mu_);
-        pending_operations_.clear();
-    }
-
     std::lock_guard<std::mutex> lock(state_mu_);
     sync_state_.is_online = false;
     sync_state_.is_syncing = false;
@@ -630,94 +605,6 @@ ConflictResolution SyncManager::resolve_conflict(
 }
 
 // ---------------------------------------------------------------------------
-// Offline Support
-// ---------------------------------------------------------------------------
-
-bool SyncManager::queue_operation(const SyncOperation& operation) {
-    std::lock_guard<std::mutex> lock(pending_mu_);
-    pending_operations_.push_back(operation);
-    return true;
-}
-
-bool SyncManager::process_pending_operations() {
-    if (pending_operations_.empty()) {
-        return true;
-    }
-    
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    if (!supabase.is_authenticated()) {
-        return false;
-    }
-    
-    std::lock_guard<std::mutex> lock(pending_mu_);
-    bool all_success = true;
-    std::vector<SyncOperation> remaining;
-
-    for (const auto& operation : pending_operations_) {
-        bool success = false;
-        
-        switch (operation.data_type) {
-            case SyncDataType::Servers:
-                if (operation.operation_type == SyncOperationType::Delete) {
-                    success = supabase.delete_server(operation.id);
-                }
-                break;
-            case SyncDataType::Profiles:
-                if (operation.operation_type == SyncOperationType::Delete) {
-                    success = supabase.delete_profile(operation.id);
-                } else {
-                    aml::supabase::SupabaseProfile profile;
-                    if (profile_from_operation(operation, profile)) {
-                        success = operation.operation_type == SyncOperationType::Create
-                            ? !supabase.create_profile(profile).id.empty()
-                            : supabase.update_profile(profile);
-                    }
-                }
-                break;
-            case SyncDataType::Nodes:
-                if (operation.operation_type == SyncOperationType::Delete) {
-                    success = supabase.deregister_node(operation.id);
-                }
-                break;
-            case SyncDataType::Backups:
-                if (operation.operation_type == SyncOperationType::Delete) {
-                    success = aml::storage::StorageManager::instance().delete_backup(operation.id);
-                }
-                break;
-            case SyncDataType::Modpacks:
-                if (operation.operation_type == SyncOperationType::Delete) {
-                    success = aml::storage::StorageManager::instance().delete_modpack(operation.id);
-                }
-                break;
-            case SyncDataType::Friends:
-            case SyncDataType::Messages:
-            case SyncDataType::Parties:
-            case SyncDataType::Presence:
-                // These data types have no write API in SyncManager yet.
-                success = false;
-                break;
-            default:
-                success = false;
-                break;
-        }
-        
-        if (!success) {
-            all_success = false;
-            remaining.push_back(operation);
-        }
-    }
-
-    pending_operations_ = std::move(remaining);
-    
-    return all_success;
-}
-
-std::vector<SyncOperation> SyncManager::get_pending_operations() const {
-    std::lock_guard<std::mutex> lock(pending_mu_);
-    return pending_operations_;
-}
-
-// ---------------------------------------------------------------------------
 // Subscription Management
 // ---------------------------------------------------------------------------
 
@@ -817,11 +704,7 @@ SyncStats SyncManager::get_stats() const {
         stats.is_syncing = sync_state_.is_syncing;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(pending_mu_);
-        stats.pending_operations = static_cast<int>(pending_operations_.size());
-    }
-    
+
     return stats;
 }
 

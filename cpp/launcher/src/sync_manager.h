@@ -82,27 +82,11 @@ struct SyncStats {
     int consecutive_failures = 0;
     bool is_online = false;
     bool is_syncing = false;
-    int pending_operations = 0;
 };
 
 // ---------------------------------------------------------------------------
 // Sync Operation
 // ---------------------------------------------------------------------------
-
-enum class SyncOperationType {
-    Create,
-    Update,
-    Delete
-};
-
-struct SyncOperation {
-    SyncDataType data_type;
-    SyncOperationType operation_type;
-    std::string id;
-    std::string data;
-    int64_t timestamp = 0;
-    int retry_count = 0;
-};
 
 // ---------------------------------------------------------------------------
 // Conflict Resolution
@@ -166,11 +150,6 @@ public:
     // Conflict Resolution
     ConflictResolution resolve_conflict(const SyncConflict& conflict);
     
-    // Offline Support
-    bool queue_operation(const SyncOperation& operation);
-    bool process_pending_operations();
-    std::vector<SyncOperation> get_pending_operations() const;
-    
     // Subscription Management
     bool subscribe(SyncDataType type, const std::function<void(const std::string&)>& callback);
     bool unsubscribe(SyncDataType type, const std::function<void(const std::string&)>& callback);
@@ -207,10 +186,6 @@ private:
     // State
     mutable std::mutex state_mu_;
     SyncState sync_state_;
-    
-    // Pending Operations
-    mutable std::mutex pending_mu_;
-    std::vector<SyncOperation> pending_operations_;
     
     // Subscribers
     mutable std::mutex subscribers_mu_;

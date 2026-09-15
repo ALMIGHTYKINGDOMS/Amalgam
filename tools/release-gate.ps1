@@ -23,6 +23,10 @@ $installerPath = Join-Path $root "dist\installer\AmalgamLauncher-$Version-Setup.
 function Step([string]$name) { Write-Output "" ; Write-Output "=== GATE: $name ===" }
 function Pass([string]$name) { Write-Output "[PASS] $name" }
 $failed = $false
+# Whether the staged package actually carries its public backend and sign-in
+# configuration. The summary reports this, not the flag, so the result is the
+# truth about the artifact whichever way the gate was invoked.
+$packagePublicConfig = $false
 
 try {
     # 1. Build toolchain and release vault sanity.
@@ -72,6 +76,15 @@ try {
     & (Join-Path $root "tools\build-installer.ps1") -SourceDir $packageDir -Version $Version
     if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
     Pass "installer compiled"
+
+    $templatePath = Join-Path $packageDir "launcher.json.template"
+    if (Test-Path -LiteralPath $templatePath) {
+        $templateConfig = Get-Content -LiteralPath $templatePath -Raw | ConvertFrom-Json
+        $packagePublicConfig =
+            -not [string]::IsNullOrWhiteSpace([string]$templateConfig.microsoft_client_id) -and
+            -not [string]::IsNullOrWhiteSpace([string]$templateConfig.supabase_url) -and
+            -not [string]::IsNullOrWhiteSpace([string]$templateConfig.supabase_anon_key)
+    }
 
     # 6. Package integrity (hashes, manifest, SBOM).
     Step "package-validation"
@@ -151,7 +164,7 @@ if ($failed) {
 }
 Write-Output "RESULT: ALL LOCAL GATES PASSED for Amalgam $Version"
 Write-Output ""
-if ($AllowInertConfig) {
+if (-not $packagePublicConfig) {
     Write-Output "NOT RELEASABLE: package was built without a required public configuration"
     Write-Output "  (rerun without -AllowInertConfig and with AMALGAM_MICROSOFT_CLIENT_ID,"
     Write-Output "   AMALGAM_SUPABASE_URL, and AMALGAM_SUPABASE_PUBLISHABLE_KEY set)"

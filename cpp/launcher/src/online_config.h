@@ -31,10 +31,13 @@ struct OnlineConfig {
     std::string supabase_url;
     std::string supabase_publishable_key;
 
-    // Derived helpers. All browser links go through page_url() so a custom
-    // website URL without a trailing slash cannot produce malformed links.
+    // Derived helpers. All browser links go through page_url() so neither a
+    // custom website URL without a trailing slash nor a scheme-less host can
+    // produce a link the browser cannot open.
     std::string page_url(const std::string& path) const {
         std::string root = website_url.empty() ? "https://amalgam-mc.com/" : website_url;
+        if (root.rfind("http://", 0) != 0 && root.rfind("https://", 0) != 0)
+            root.insert(0, "https://");
         while (root.size() > 1 && root.back() == '/') root.pop_back();
         if (!path.empty() && path.front() == '/') return root + path;
         return root + "/" + path;

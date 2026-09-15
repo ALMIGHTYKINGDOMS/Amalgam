@@ -549,11 +549,6 @@ void draw_performance_offline(UiState& st) {
     
     ImGui::Spacing();
     
-    ImGui::TextUnformatted("Pending Changes");
-    ImGui::TextColored(k.muted, "%d changes waiting to sync", sync_stats.pending_operations);
-    
-    ImGui::Spacing();
-    
     if (ghost_button("Force Sync Now", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
         if (sync.perform_manual_sync()) {
             push_notice(st, ui_model::NoticeLevel::Success, "Sync Started",
