@@ -500,4 +500,29 @@ std::wstring managed_runtime_root(const std::wstring& base_dir) {
     return base_dir + suffix;
 }
 
+namespace {
+
+// The directory the running launcher lives in. Managed runtimes sit beside it
+// because that is where the packaged launcher.json points java_cache_dir.
+std::wstring launcher_dir() {
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring path = self;
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? L"." : path.substr(0, slash);
+}
+
+}  // namespace
+
+std::wstring managed_root() {
+    return managed_runtime_root(launcher_dir());
+}
+
+std::wstring managed_root(const std::wstring& configured) {
+    if (configured.empty()) return managed_root();
+    const std::filesystem::path root(configured);
+    return root.is_relative() ? (std::filesystem::path(launcher_dir()) / root).wstring()
+                              : root.wstring();
+}
+
 }  // namespace aml::java

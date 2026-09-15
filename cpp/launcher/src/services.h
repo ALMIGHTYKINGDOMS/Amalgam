@@ -434,6 +434,13 @@ public:
     // The supervised process is the only owner of local run state. A stage
     // persisted elsewhere is a hint that must be reconciled against this.
     bool is_local_server_running(const std::string& server_id) const;
+
+    // Where this supervisor looks for managed Java: the launcher's
+    // java_cache_dir, so the Java it starts servers with is the Java the game
+    // launch path and --check-java report. Empty means the launcher's own
+    // <launcher>\runtimes\java. May be set while workers start servers.
+    void set_local_java_root(const std::wstring& root);
+    std::wstring local_java_root() const;
     
     // Events
     void on_server_started(const std::function<void(const std::string&)>& callback);
@@ -444,6 +451,7 @@ private:
     struct LocalServerTransport;
     ServiceConfig config_;
     mutable std::mutex mutex_;
+    std::wstring configured_java_root_;  // guarded by mutex_
     
     std::vector<std::function<void(const std::string&)>> server_started_callbacks_;
     std::vector<std::function<void(const std::string&)>> server_stopped_callbacks_;
@@ -453,6 +461,11 @@ private:
     std::map<std::string, std::unique_ptr<LocalServerTransport>> local_transports_;
     
     // Internal helpers
+    // The Java executable a local server of this version starts with, resolved
+    // from local_java_root(). start_local_server calls this, so the root has one
+    // expression rather than a second copy of the path policy.
+    std::wstring resolve_local_server_java(const std::string& minecraft_version,
+                                           std::string* error) const;
     std::string make_request(const std::string& method, const std::string& endpoint,
                             const std::string& body = "", std::string* error = nullptr);
     std::string build_auth_header() const;

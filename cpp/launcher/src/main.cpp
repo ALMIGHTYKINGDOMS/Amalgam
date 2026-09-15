@@ -226,9 +226,14 @@ std::wstring executable_dir() {
 }
 
 int cli_java() {
+    // Report the root and the runtimes the launcher actually keeps and uses: the
+    // same root game launch and local server start resolve Java from, which a
+    // configured java_cache_dir can move away from the launcher directory.
+    aml::config::Config cfg;
+    load_launcher_config(executable_dir(), cfg);
+    std::wprintf(L"java root: %s\n", aml::java::managed_root(cfg.java_cache_dir).c_str());
     std::vector<aml::java::Install> list = aml::java::scan_installed();
-    aml::java::JavaRuntimeManager manager(
-        executable_dir() + L"\\runtimes\\java");
+    aml::java::JavaRuntimeManager manager(aml::java::managed_root(cfg.java_cache_dir));
     for (const auto& runtime : manager.GetInstalledRuntimes()) {
         const bool present = std::any_of(list.begin(), list.end(),
             [&runtime](const aml::java::Install& install) {
@@ -262,7 +267,9 @@ int cli_java_install(int argc, wchar_t** argv) {
         std::printf("unsupported managed Java version\n");
         return 2;
     }
-    aml::java::JavaRuntimeManager manager(executable_dir() + L"\\runtimes\\java");
+    aml::config::Config cfg;
+    load_launcher_config(executable_dir(), cfg);
+    aml::java::JavaRuntimeManager manager(aml::java::managed_root(cfg.java_cache_dir));
     auto progress = [](uint64_t done, uint64_t total) {
         static int last = -1;
         const int pct = total > 0 ? static_cast<int>(done * 100 / total) : -1;
@@ -557,7 +564,7 @@ int cli_launch(int argc, wchar_t** argv) {
     opt.loader = loader;
     opt.base_dir = exe_dir;
     opt.assets_dir = exe_dir + L"\\assets";
-    opt.java_cache_dir = exe_dir + L"\\runtimes\\java";
+    opt.java_cache_dir = aml::java::managed_root();
     opt.bridges_dir = exe_dir + L"\\bridges";
     opt.dll_path = exe_dir + L"\\amalgam.dll";
     // A dry-run still needs a launcher argument, but real launches replace
@@ -622,8 +629,7 @@ int cli_doctor(int argc, wchar_t** argv) {
 
     aml::readiness::Options options;
     options.launcher_dir = exe_dir;
-        options.java_cache_dir = config.java_cache_dir.empty() ? exe_dir + L"\\runtimes\\java"
-                                                           : config.java_cache_dir;
+    options.java_cache_dir = config.java_cache_dir;
     options.provider_api = aml::provider_config::make(config);
     options.verify_providers = has_arg(argc, argv, L"--online");
     const aml::readiness::Report report = aml::readiness::run(options);
@@ -666,7 +672,7 @@ int cli_ui_snapshot(int argc, wchar_t** argv) {
     if (!load_launcher_config(exe_dir, cfg)) {
         cfg.base_dir = exe_dir;
         cfg.assets_dir = exe_dir + L"\\assets";
-        cfg.java_cache_dir = exe_dir + L"\\runtimes\\java";
+        cfg.java_cache_dir = aml::java::managed_root();
         cfg.loader = "auto";
         cfg.addon = true;
     }
@@ -789,6 +795,19 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
         std::printf("server transport start failed: no local server supervisor\n");
         return 2;
     }
+    // A local server must start with managed Java from the root the rest of the
+    // launcher reports. This probe pushes no configured root, so the supervisor
+    // has to fall back to the launcher's own <launcher>\runtimes\java and never
+    // to a second location no part of the launcher creates.
+    const std::wstring supervisor_root = manager->local_java_root();
+    const std::wstring reported_root = aml::java::managed_root();
+    if (supervisor_root != reported_root) {
+        SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
+        std::wprintf(L"server java root diverged: supervisor=%s check-java=%s\n",
+                     supervisor_root.c_str(), reported_root.c_str());
+        return 6;
+    }
+    std::wprintf(L"server java root: %s\n", supervisor_root.c_str());
     std::string error;
     if (!manager->start_local_server("probe", aml::net::to_utf8(java_path), 512, &error)) {
         SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);

@@ -1,5 +1,8 @@
 #include "java.h"
 
+#include <windows.h>
+
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -97,6 +100,39 @@ int main() {
         if (root != L"C:\\Amalgam\\runtimes\\java" ||
             aml::java::managed_runtime_root(root) != root) {
             std::cerr << "managed_runtime_root() returned an unexpected path\n";
+            return 1;
+        }
+    }
+    // managed_root() is the launcher's single managed-runtime directory: game
+    // launch, server start, --check-java and every runtime download resolve
+    // through it. It must stay the directory the launcher creates beside itself,
+    // never a second location no part of the launcher populates.
+    {
+        wchar_t self[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::wstring dir = self;
+        const size_t slash = dir.find_last_of(L"\\/");
+        dir = slash == std::wstring::npos ? L"." : dir.substr(0, slash);
+        const std::wstring expected = aml::java::managed_runtime_root(dir);
+        if (aml::java::managed_root() != expected) {
+            std::cerr << "managed_root() is not the launcher's own runtimes/java\n";
+            return 1;
+        }
+        // No config value means the launcher's own directory, so a server start
+        // and --check-java cannot disagree about where managed Java lives.
+        if (aml::java::managed_root(L"") != expected) {
+            std::cerr << "managed_root(empty) diverged from managed_root()\n";
+            return 1;
+        }
+        // A configured directory is honored verbatim, as an absolute path...
+        if (aml::java::managed_root(L"C:\\Custom\\java") != L"C:\\Custom\\java") {
+            std::cerr << "managed_root(configured) did not keep the configured path\n";
+            return 1;
+        }
+        // ...and a relative one resolves against the launcher directory.
+        const std::wstring relative = aml::java::managed_root(L"runtimes\\java");
+        if (std::filesystem::path(relative) != std::filesystem::path(expected)) {
+            std::cerr << "managed_root(relative) did not resolve under the launcher\n";
             return 1;
         }
     }

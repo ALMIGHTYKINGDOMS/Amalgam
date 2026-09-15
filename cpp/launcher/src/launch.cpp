@@ -168,8 +168,9 @@ std::wstring resolve_java_impl(int major, const launch::Options& opt,
             return kv.second;
         }
     }
-    net::mkdirs(opt.java_cache_dir);
-    return java::resolve(major, java::scan_installed(), opt.java_cache_dir,
+    const std::wstring java_root = java::managed_root(opt.java_cache_dir);
+    net::mkdirs(java_root);
+    return java::resolve(major, java::scan_installed(), java_root,
                          [&](uint64_t done, uint64_t total) {
                              static int last = -1;
                              int pct = total > 0 ? static_cast<int>(done * 100 / total) : -1;

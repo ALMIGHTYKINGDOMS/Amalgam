@@ -2465,8 +2465,12 @@ void draw_server_manager(UiState& st) {
     auto& s = state();
     // This page is the only consumer of the server service layer. Without a
     // supervisor every action here is null-guarded into a silent no-op, so ask
-    // for it before deciding what is running.
-    aml::services::local_server_manager();
+    // for it before deciding what is running, and keep it pointed at the Java
+    // directory the rest of the launcher uses — the settings page can change it
+    // while the launcher runs.
+    if (auto* supervisor = aml::services::local_server_manager()) {
+        supervisor->set_local_java_root(st.cfg ? st.cfg->java_cache_dir : std::wstring());
+    }
     if (!s.loaded) {
         // In fixture mode the visual seed already populated st.servers.
         if (!st.fixture_mode || st.servers.empty()) {

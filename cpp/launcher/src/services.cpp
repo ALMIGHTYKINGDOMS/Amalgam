@@ -1975,6 +1975,34 @@ ServerCreateRequest ServerManager::get_template(const std::string& template_id, 
     return ServerCreateRequest();
 }
 
+void ServerManager::set_local_java_root(const std::wstring& root) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    configured_java_root_ = root;
+}
+
+std::wstring ServerManager::local_java_root() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return java::managed_root(configured_java_root_);
+}
+
+std::wstring ServerManager::resolve_local_server_java(const std::string& minecraft_version,
+                                                     std::string* error) const {
+    java::JavaRuntimeManager runtime_manager(local_java_root());
+    java::MinecraftVersion minecraft{minecraft_version.empty() ? "1.20.1" : minecraft_version};
+    const int required_major = runtime_manager.ResolveRequiredJava(
+        minecraft, java::LoaderType::Vanilla, java::ServerType::Local);
+    std::string resolve_error;
+    const std::wstring home = runtime_manager.Resolve(
+        required_major, java::scan_installed(), {}, &resolve_error);
+    if (home.empty()) {
+        if (error) *error = resolve_error.empty()
+            ? "Unable to resolve a compatible managed Java runtime"
+            : resolve_error;
+        return std::wstring();
+    }
+    return home + L"\\bin\\java.exe";
+}
+
 bool ServerManager::start_local_server(const std::string& server_id, const std::string& java_path, 
                                        int ram_mb, std::string* error) {
     ServerInfo info = get_server_info(server_id, error);
@@ -2002,22 +2030,8 @@ bool ServerManager::start_local_server(const std::string& server_id, const std::
     if (!java_path.empty()) {
         wjava = net::to_wide(java_path);
     } else {
-        const std::wstring runtime_root = net::get_local_app_data_path() +
-                                          L"\\Amalgam\\runtimes\\java";
-        java::JavaRuntimeManager runtime_manager(runtime_root);
-        java::MinecraftVersion minecraft{info.version.empty() ? "1.20.1" : info.version};
-        const int required_major = runtime_manager.ResolveRequiredJava(
-            minecraft, java::LoaderType::Vanilla, java::ServerType::Local);
-        std::string resolve_error;
-        const std::wstring home = runtime_manager.Resolve(
-            required_major, java::scan_installed(), {}, &resolve_error);
-        if (home.empty()) {
-            if (error) *error = resolve_error.empty()
-                ? "Unable to resolve a compatible managed Java runtime"
-                : resolve_error;
-            return false;
-        }
-        wjava = home + L"\\bin\\java.exe";
+        wjava = resolve_local_server_java(info.version, error);
+        if (wjava.empty()) return false;
     }
     const int memory_mb = ram_mb > 0 ? ram_mb : 2048;
     std::wstring full_cmd = L"\"" + wjava + L"\" -Xms512M -Xmx" +

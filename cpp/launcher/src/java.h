@@ -113,7 +113,19 @@ private:
     JavaRuntimeDownloader downloader_;
 };
 
+// Appends \runtimes\java to a launcher base directory unless the directory is
+// already a managed-runtime root.
 std::wstring managed_runtime_root(const std::wstring& base_dir);
+
+// The one directory that holds launcher-managed Java runtimes. Game launch,
+// server start, --check-java/--java-install and every download that populates
+// the directory resolve through here, so the Java the launcher reports is the
+// Java it runs and nothing looks in a directory the launcher never creates.
+// `configured` is config::Config::java_cache_dir; empty falls back to the
+// launcher's own <launcher>\runtimes\java, and a relative value is resolved
+// against the launcher directory.
+std::wstring managed_root(const std::wstring& configured);
+std::wstring managed_root();
 
 std::vector<Install> scan_installed();
 

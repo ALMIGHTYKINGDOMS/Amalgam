@@ -59,6 +59,14 @@ endif()
 if(NOT probe_output MATCHES "server transport: READY")
     message(FATAL_ERROR "Server transport probe did not report readiness: ${probe_output}")
 endif()
+# Local servers must start with managed Java from the same root --check-java
+# reports, and never from a per-user directory the launcher does not create.
+if(NOT probe_output MATCHES "server java root: .*runtimes[\\/]java")
+    message(FATAL_ERROR "Server transport probe did not report the managed Java root: ${probe_output}")
+endif()
+if(probe_output MATCHES "server java root: .*AppData")
+    message(FATAL_ERROR "Server Java root is not a directory the launcher creates: ${probe_output}")
+endif()
 
 file(REMOVE_RECURSE "${AMALGAM_WORK}")
 message(STATUS "${probe_output}")

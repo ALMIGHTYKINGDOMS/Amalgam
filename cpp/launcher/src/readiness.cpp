@@ -70,11 +70,7 @@ int count_cached_java(const std::wstring& root) {
 }
 
 std::wstring resolved_cache_dir(const Options& options) {
-    std::filesystem::path cache(options.java_cache_dir.empty()
-                                    ? options.launcher_dir + L"\\runtimes\\java"
-                                    : options.java_cache_dir);
-    if (cache.is_relative()) cache = std::filesystem::path(options.launcher_dir) / cache;
-    return cache.wstring();
+    return java::managed_root(options.java_cache_dir);
 }
 
 std::string count_detail(int count, const char* singular, const char* plural) {

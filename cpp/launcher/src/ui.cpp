@@ -875,9 +875,7 @@ void test_curseforge_connection(UiState& st, config::Config snapshot) {
 void run_player_readiness(UiState& st, config::Config snapshot) {
     readiness::Options options;
     options.launcher_dir = st.exe_dir;
-    options.java_cache_dir = snapshot.java_cache_dir.empty()
-                                  ? st.exe_dir + L"\\runtimes\\java"
-                                 : snapshot.java_cache_dir;
+    options.java_cache_dir = snapshot.java_cache_dir;
     options.provider_api = provider_config::make(snapshot);
     options.verify_providers = true;
     readiness::Report report = readiness::run(options);
@@ -2338,8 +2336,7 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
     if (!instance_dir.empty()) opt.instance_dir = instance_dir;
     opt.assets_dir = snapshot.assets_dir.empty() ? st.exe_dir + L"\\assets" : snapshot.assets_dir;
     if (!instance_dir.empty() && snapshot.assets_dir.empty()) opt.assets_dir = instance_dir + L"\\assets";
-    opt.java_cache_dir = snapshot.java_cache_dir.empty() ? st.exe_dir + L"\\runtimes\\java"
-                                                         : snapshot.java_cache_dir;
+    opt.java_cache_dir = snapshot.java_cache_dir;
     opt.username = snapshot.username.empty() ? L"Player" : snapshot.username;
     opt.width = snapshot.width;
     opt.height = snapshot.height;
@@ -2414,7 +2411,7 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
         }
         std::string bridge_error;
         if (prepared.java_executable.empty()) {
-            java::JavaRuntimeManager runtime_manager(opt.java_cache_dir);
+            java::JavaRuntimeManager runtime_manager(java::managed_root(opt.java_cache_dir));
             const std::wstring java_home = runtime_manager.Resolve(
                 java_major, java::scan_installed(), {}, &bridge_error);
             if (!java_home.empty()) prepared.java_executable = java_home + L"\\bin\\java.exe";
@@ -2779,8 +2776,7 @@ std::vector<UiState::LaunchCheck> evaluate_launch(const UiState& st, const std::
     }
 
     const auto java = java::scan_installed();
-    const std::wstring java_cache = st.cfg->java_cache_dir.empty() ? st.exe_dir + L"\\runtimes\\java" :
-                                    st.cfg->java_cache_dir;
+    const std::wstring java_cache = java::managed_root(st.cfg->java_cache_dir);
     java::JavaRuntimeManager runtime_manager(java_cache);
     const bool cached_java = !runtime_manager.GetInstalledRuntimes().empty();
     const bool java_ready = !java.empty() || cached_java;
@@ -10639,9 +10635,8 @@ static void start_managed_java_install(UiState& st, int major) {
         st.java_install_message.clear();
         st.java_install_success = false;
     }
-    const std::wstring root = st.cfg && !st.cfg->java_cache_dir.empty()
-        ? st.cfg->java_cache_dir
-        : st.exe_dir + L"\\runtimes\\java";
+    const std::wstring root =
+        java::managed_root(st.cfg ? st.cfg->java_cache_dir : std::wstring());
     spawn_worker(st, std::thread([&st, root, major]() {
         java::JavaRuntimeManager manager(root);
         java::DownloadResult result = manager.DownloadJava(
@@ -10668,9 +10663,8 @@ static void start_managed_java_install(UiState& st, int major) {
 void draw_java_tab(UiState& st) {
     draw_page_emblem(st, "java-emblem-ai.png");
     page_title("Java Manager", "Installed runtimes detected for Minecraft versions and loaders.");
-    const std::wstring managed_java_root = st.cfg && !st.cfg->java_cache_dir.empty()
-        ? st.cfg->java_cache_dir
-        : st.exe_dir + L"\\runtimes\\java";
+    const std::wstring managed_java_root =
+        java::managed_root(st.cfg ? st.cfg->java_cache_dir : std::wstring());
     java::JavaRuntimeManager managed_java_manager(managed_java_root);
     static int pending_managed_remove = 0;
 
@@ -11474,7 +11468,7 @@ void draw_config_tab(UiState& st) {
     ImGui::Text("Loader: %s", c.loader.c_str());
     ImGui::Text("Base directory: %s", net::to_utf8(c.base_dir).c_str());
     ImGui::Text("Assets directory: %s", net::to_utf8(c.assets_dir).c_str());
-    ImGui::Text("Java runtimes: %s", net::to_utf8(c.java_cache_dir).c_str());
+    ImGui::Text("Java runtimes: %s", net::to_utf8(java::managed_root(c.java_cache_dir)).c_str());
     ImGui::Text("Provider credentials: %s", (c.has_unreadable_secrets ? "recovery required" : "protected"));
     ImGui::Spacing();
     ImGui::TextColored(k.muted, "Use the Launcher, Java, Performance, Modpacks, and Admin sections to edit these values safely.");
@@ -14116,9 +14110,8 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
             st.java_scanned = true;
             spawn_worker(st, std::thread([&st]() {
                 auto list = java::scan_installed();
-                const std::wstring root = st.cfg && !st.cfg->java_cache_dir.empty()
-                    ? st.cfg->java_cache_dir
-                    : st.exe_dir + L"\\runtimes\\java";
+                const std::wstring root =
+                    java::managed_root(st.cfg ? st.cfg->java_cache_dir : std::wstring());
                 java::JavaRuntimeManager manager(root);
                 for (const auto& managed : manager.GetInstalledRuntimes()) {
                     const bool present = std::any_of(list.begin(), list.end(),
