@@ -6,6 +6,7 @@
 #include "entitlements.h"
 #include "net.h"
 #include "config.h"
+#include "online_config.h"
 
 #include <windows.h>
 #include <sstream>
@@ -117,6 +118,13 @@ bool write_client_bridge(const config::Config& cfg, const std::wstring& target_d
 
     if (!write_bridge_file(root / L"shared_servers.txt", [&](std::ofstream& out) {
         out << "# Shared server list (launcher -> client)\n";
+        // The official network is always joinable, ahead of the player's own
+        // entries, so the client never lists an empty server tab.
+        const auto& online = aml::online::config();
+        if (!online.network_address.empty()) {
+            out << bridge_field(online.network_name) << "|"
+                << bridge_field(online.network_address) << "\n";
+        }
         for (const auto& server : cfg.servers) {
             out << bridge_field(server.name) << "|"
                 << bridge_field(aml::net::to_utf8(server.address)) << "\n";

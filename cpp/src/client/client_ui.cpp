@@ -18,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -4406,11 +4407,15 @@ void ClientUI::render_settings_page() {
             ImGui::TextDisabled("The ultimate Minecraft launcher.");
             ImGui::TextDisabled("Play. Create. Host. Together.");
             ImGui::Spacing();
-            ImGui::TextDisabled("Copyright 2024 Amalgam. All rights reserved.");
+            std::time_t now = std::time(nullptr);
+            std::tm local{};
+            localtime_s(&local, &now);
+            ImGui::TextDisabled("Copyright %d Amalgam. All rights reserved.",
+                                local.tm_year + 1900);
             ImGui::Spacing();
             float link_w = (ImGui::GetContentRegionAvail().x - 8) / 2.0f;
             if (client_secondary_button("Website", ImVec2(link_w, 24))) {
-                ShellExecuteA(nullptr, "open", "https://amalgam-net.com",
+                ShellExecuteA(nullptr, "open", "https://amalgam-mc.com/",
                     nullptr, nullptr, SW_SHOW);
             }
             ImGui::SameLine(0, 8);

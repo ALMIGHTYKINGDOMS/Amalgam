@@ -23,6 +23,11 @@ struct OnlineConfig {
     // Public website (account management, plans, checkout, billing pages).
     std::string website_url = "https://amalgam-mc.com/";
 
+    // The branded Amalgam network players join in game: host:port as typed
+    // into Minecraft's multiplayer screen.
+    std::string network_name = "Amalgam Network";
+    std::string network_address = "play.amalgam-network.com:9564";
+
     // Amalgam API backend (Replit or equivalent). The launcher talks ONLY to
     // this endpoint; it never talks to infrastructure providers directly.
     std::string api_url;

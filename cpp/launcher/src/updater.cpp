@@ -171,9 +171,8 @@ std::string canonical_manifest_json(const UpdateInfo& info) {
 }
 
 std::wstring default_manifest_url() {
-    // Backend-owned release manifest. Replace with the real endpoint during
-    // release engineering; the schema below must be preserved.
-    return L"https://amalgam-net.com/releases/launcher/manifest.json";
+    // Backend-owned release manifest; the schema below must be preserved.
+    return L"https://amalgam-mc.com/releases/launcher/manifest.json";
 }
 
 bool parse_manifest_text(const std::string& text, UpdateInfo& out, std::string* err) {

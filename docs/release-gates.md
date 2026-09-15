@@ -81,7 +81,7 @@ the product a public CurseForge-quality release.
    timestamping, then rerun `tools/release-gate.ps1 -RequireSigned` and verify
    SmartScreen/reputation behavior and upgrade/uninstall on a clean machine.
 6. **Update feed deployment.** Upload `dist/update-feed/manifest.json` to
-   `https://amalgam-net.com/releases/launcher/manifest.json` and the ZIP to the
+   `https://amalgam-mc.com/releases/launcher/manifest.json` and the ZIP to the
    `download_url` it advertises. The manifest is signed with the release vault
    key; the launcher embeds the matching public key and fails closed. Verify
    the deployed URL serves the manifest verbatim after upload.

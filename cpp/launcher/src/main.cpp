@@ -12,6 +12,7 @@
 #include "model.h"
 #include "mods.h"
 #include "net.h"
+#include "online_config.h"
 #include "readiness.h"
 #include "provider_config.h"
 #include "services.h"
@@ -837,11 +838,14 @@ int cli_client_bridge_probe(int argc, wchar_t** argv) {
     };
     const std::string profile_text = read_text(bridge_root / L"shared_profile.txt");
     const std::string server_text = read_text(bridge_root / L"shared_servers.txt");
+    const auto& online = aml::online::config();
+    const std::string network_row = online.network_name + "|" + online.network_address;
     const bool verified = prepared &&
         profile_text.find("profile_id=bridge-probe") != std::string::npos &&
         profile_text.find("minecraft_version=1.21.1") != std::string::npos &&
         profile_text.find("loader=fabric") != std::string::npos &&
         server_text.find("Integration Server|127.0.0.1:25565") != std::string::npos &&
+        server_text.find(network_row) != std::string::npos &&
         std::filesystem::exists(bridge_root / L"shared_friends.txt") &&
         std::filesystem::exists(bridge_root / L"shared_cosmetics.txt");
 
