@@ -580,7 +580,6 @@ void draw_performance_offline(UiState& st) {
     
     ImGui::Spacing();
     
-    // In a real implementation, this would show what data is cached
     ImGui::TextColored(k.muted, "- Installed mods and configurations");
     ImGui::TextColored(k.muted, "- Instance settings");
     ImGui::TextColored(k.muted, "- Launcher preferences");

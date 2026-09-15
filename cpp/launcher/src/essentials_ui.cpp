@@ -735,11 +735,29 @@ static void draw_friend_profile_panel(UiState& st) {
 static void draw_essentials_empty_state(UiState& st) {
     auto& ui = get_essentials_ui_state();
 
+    // Friends, sessions, and invites are all account-backed, so a signed-out
+    // visitor gets a sign-in prompt instead of actions that cannot succeed.
+    const bool signed_in = aml::supabase::SupabaseManager::instance().is_authenticated();
+
     // Left: add friend
     ImGui::PushFont(f_h2);
     ImGui::TextColored(k.text, "Friends");
     ImGui::PopFont();
     ImGui::Spacing();
+
+    if (!signed_in) {
+        card_begin("##empty_sign_in", ImVec2(-1, 0));
+        ImGui::TextColored(k.muted, "Friends, worlds, and invites need an");
+        ImGui::TextColored(k.muted, "Amalgam account. Sign in to get started.");
+        ImGui::Spacing();
+        if (primary_button("Sign In", ImVec2(ui_px(140.0f), ui_px(32.0f)))) {
+            st.auth_prompt_dismissed = false;
+            st.login_popup_open = true;
+        }
+        card_end();
+        ImGui::Spacing();
+        return;
+    }
 
     card_begin("##empty_add_friend", ImVec2(-1, 0));
     ImGui::TextColored(k.muted, "Add friends to start hosting worlds,");

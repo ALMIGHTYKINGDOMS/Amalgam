@@ -24,6 +24,7 @@
 #include "essentials_manager.h"
 #include "essentials_session.h"
 #include "essentials.h"
+#include "sync_manager.h"
 #include "supabase.h"
 #include "updater.h"
 #include "bedrock.h"
@@ -13804,16 +13805,18 @@ bool init_window(UiState& st, const RunOptions& options) {
     return st.hwnd != nullptr;
 }
 
-// Amalgam account services (friends, presence, invites, live sessions) run only
-// while a real account is signed in. Start and stop are idempotent, so this is
-// safe to call from every auth transition as well as startup and shutdown.
-void sync_essentials_services(bool authenticated) {
+// Account services (friends, presence, invites, live sessions, and cloud sync)
+// run only while a real account is signed in. Start and stop are idempotent, so
+// this is safe to call from every auth transition as well as startup/shutdown.
+void sync_account_services(bool authenticated) {
     if (authenticated) {
         aml::essentials::FriendsManager::instance().initialize();
         aml::essentials::PresenceManager::instance().initialize();
         aml::essentials::InviteManager::instance().initialize();
         aml::essentials::SessionManager::instance().initialize();
+        aml::sync::SyncManager::instance().initialize();
     } else {
+        aml::sync::SyncManager::instance().shutdown();
         aml::essentials::InviteManager::instance().shutdown();
         aml::essentials::SessionManager::instance().shutdown();
         aml::essentials::PresenceManager::instance().shutdown();
@@ -13915,7 +13918,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         if (essentials_enabled && supabase.client()) {
             supabase.client()->on_auth_state_change(
                 [](bool authenticated, const auto&) {
-                    sync_essentials_services(authenticated);
+                    sync_account_services(authenticated);
                 });
         }
         auto& accounts = aml::account::AccountManager::instance();
@@ -13928,7 +13931,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
                     supabase.auto_login(session.access_token, session.refresh_token);
                 // A restored session does not fire an auth-state change, so start
                 // the account services directly.
-                if (essentials_enabled && restored) sync_essentials_services(true);
+                if (essentials_enabled && restored) sync_account_services(true);
                 // Kick off an early entitlements fetch from Supabase (Whop-synced
                 // subscription data) so the launcher knows the user's plan on first
                 // render without waiting for the Account page.
@@ -14244,7 +14247,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     }
     if (!st.fixture_mode) persist_jobs(st);
     join_workers(st);
-    if (!st.fixture_mode) sync_essentials_services(false);
+    if (!st.fixture_mode) sync_account_services(false);
     if (!st.fixture_mode) {
         st.cfg->base_dir = net::to_wide(st.ui_base);
         st.cfg->assets_dir = net::to_wide(st.ui_assets);

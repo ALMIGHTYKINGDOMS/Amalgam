@@ -168,7 +168,8 @@ bool SyncManager::initialize() {
 void SyncManager::shutdown() {
     // Stop sync timer
     stop_sync_timer();
-    
+    stop_reconnection_monitoring();
+
     // Unsubscribe from updates
     unsubscribe_from_updates();
     
@@ -200,8 +201,12 @@ void SyncManager::start_sync_timer() {
                 std::lock_guard<std::mutex> lock(state_mu_);
                 interval = sync_state_.sync_interval;
             }
-            std::this_thread::sleep_for(std::chrono::seconds(interval));
-            
+
+            // Sleep in short steps so shutdown is immediate instead of waiting
+            // out a full sync interval.
+            for (int i = 0; i < interval && sync_timer_active_; ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+
             if (!sync_timer_active_) break;
             
             // Perform periodic sync
@@ -819,7 +824,8 @@ void SyncManager::start_reconnection_monitoring() {
     reconnection_monitoring_ = true;
     reconnection_thread_ = std::thread([this]() {
         while (reconnection_monitoring_) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            for (int i = 0; i < 5 && reconnection_monitoring_; ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             
             if (!is_online()) {
                 // Try to reconnect
