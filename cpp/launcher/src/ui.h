@@ -30,6 +30,10 @@ struct RunOptions {
 
 bool run_window(config::Config* cfg, const RunOptions& options = {});
 
+// Canonical release identity, shared by the About page, the updater policy and
+// the command-line help so the version is reported from one place.
+const char* launcher_version();
+
 // Synchronize launcher-owned metadata and shared services into the selected
 // profile's in-game client directory. Exposed for the launch path and its
 // integration probe; normal UI code calls it automatically before play.

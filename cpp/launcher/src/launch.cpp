@@ -304,6 +304,13 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
     int game_rank = rank(opt.mc_id);
     std::string loader = opt.loader;
     if (loader == "auto") {
+        // An id that does not parse as a version cannot be satisfied by any
+        // loader; falling back to forge would report a loader problem for what
+        // is really a typo in the version.
+        if (game_rank == 0) {
+            if (err) *err = "unknown Minecraft version: " + opt.mc_id;
+            return false;
+        }
         loader = game_rank >= 1140 ? "fabric" : "forge";
     }
     if (loader == "vanilla") loader.clear();

@@ -103,6 +103,50 @@ bool is_cli_invocation(int argc, wchar_t** argv) {
            has_arg(argc, argv, L"--bedrock-launch") || has_arg(argc, argv, L"--bedrock-install");
 }
 
+// The launcher doubles as its own diagnostics tool, but until --help existed
+// the only way to discover a command was to read the source: an unknown flag
+// printed a warning and then opened the window anyway.
+void print_cli_help() {
+    std::printf(
+        "Amalgam Launcher %s\n"
+        "\n"
+        "Usage:\n"
+        "  amalgam_launcher.exe                    open the graphical launcher\n"
+        "  amalgam_launcher.exe --page <page>      open it on a specific page\n"
+        "  amalgam_launcher.exe <command> [args]   run one command below\n"
+        "\n"
+        "Commands:\n"
+        "  --versions [loader]                 list launchable Minecraft versions\n"
+        "  --inspect <mc_id> [loader]          show what a launch would install\n"
+        "  --launch <mc_id> [loader] [--dry-run] [--wait] [--print-command]\n"
+        "  --check-java                        list detected Java runtimes\n"
+        "  --java-install <8|11|17|21|25>      download a managed Java runtime\n"
+        "  --check-official-launcher           locate the official Minecraft Launcher\n"
+        "  --doctor [--online]                 report readiness to play\n"
+        "  --check-prereqs                     verify bundled runtime prerequisites\n"
+        "  --mods-search <query> [loader] [game_version] [facet]\n"
+        "  --mods-install <slug> [source] [loader] [game_version] [mods_dir]\n"
+        "  --pack-install <slug> [source] [loader] [game_version] [instances_dir]\n"
+        "  --ai-chat <message> [model]         ask the Amalgam AI\n"
+        "  --ai-image <prompt> [out.png]       generate an image\n"
+        "  --ai-vision <image> [model]         describe an image\n"
+        "  --bedrock-info | --bedrock-launch | --bedrock-install <file>\n"
+        "  --login | --logout                  manage the Amalgam account session\n"
+        "\n"
+        "UI flags:\n"
+        "  --safe-mode                         start without automatic network calls\n"
+        "  --help, -h                          show this help\n"
+        "  --version                           show the launcher version\n"
+        "\n"
+        "Release and QA tooling:\n"
+        "  --check-update [url]                validate a signed update manifest\n"
+        "  --ui-snapshot <out.png> [w] [h] [page]\n"
+        "  --server-transport-probe <dir> <java.exe>\n"
+        "  --client-bridge-probe <dir>\n"
+        "  --official-handoff-probe <dir>\n",
+        aml::ui::launcher_version());
+}
+
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -486,22 +530,22 @@ int cli_inspect(int argc, wchar_t** argv) {
 }
 
 int cli_launch(int argc, wchar_t** argv) {
-    if (argc < 3) {
+    // Flags may appear anywhere, so the loader is the second argument that is
+    // not a flag. Reading argv[3] directly made --launch <id> --wait and
+    // --launch <id> --print-command fail with "unknown loader".
+    std::vector<std::wstring> operands;
+    for (int i = 2; i < argc; ++i) {
+        if (argv[i][0] != L'-') operands.push_back(argv[i]);
+    }
+    if (operands.empty()) {
         std::printf("usage: --launch <mc_id> [loader] [--dry-run] [--wait]\n");
         return 1;
     }
-    std::string mc = aml::net::to_utf8(arg_at(argc, argv, 2));
-    std::string loader = "auto";
-    if (argc >= 4 && _wcsicmp(argv[3], L"--dry-run") != 0)
-        loader = aml::net::to_utf8(arg_at(argc, argv, 3));
-    bool dry = false;
-    bool wait = false;
-    bool print_command = false;
-    for (int i = 1; i < argc; ++i) {
-        if (_wcsicmp(argv[i], L"--dry-run") == 0) dry = true;
-        if (_wcsicmp(argv[i], L"--wait") == 0) wait = true;
-        if (_wcsicmp(argv[i], L"--print-command") == 0) print_command = true;
-    }
+    std::string mc = aml::net::to_utf8(operands[0]);
+    std::string loader = operands.size() > 1 ? aml::net::to_utf8(operands[1]) : "auto";
+    const bool dry = has_arg(argc, argv, L"--dry-run");
+    const bool wait = has_arg(argc, argv, L"--wait");
+    const bool print_command = has_arg(argc, argv, L"--print-command");
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring exe_dir = self;
@@ -1168,6 +1212,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     aml::updater::init_from_embedded_key();
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (has_arg(argc, argv, L"--help") || has_arg(argc, argv, L"-h") ||
+        has_arg(argc, argv, L"-?")) {
+        attach_cli_output();
+        print_cli_help();
+        std::fflush(stdout);
+        if (argv) LocalFree(argv);
+        return 0;
+    }
+    if (has_arg(argc, argv, L"--version")) {
+        attach_cli_output();
+        std::printf("%s\n", aml::ui::launcher_version());
+        std::fflush(stdout);
+        if (argv) LocalFree(argv);
+        return 0;
+    }
     if (is_cli_invocation(argc, argv)) {
         attach_cli_output();
         int result = 1;
@@ -1219,7 +1278,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
             L"Amalgam Launcher: unknown option '%s'.\n"
             L"This command starts the graphical launcher. Run it without "
             L"arguments for the GUI, or use a documented CLI command such as "
-            L"--versions, --check-prereqs, --doctor, --launch, --mods-search.\n",
+            L"--versions, --check-prereqs, --doctor, --launch, --mods-search.\n"
+            L"Run --help for the full command list.\n",
             argv[1]);
         std::fflush(stdout);
     }

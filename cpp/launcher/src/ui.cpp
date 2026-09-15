@@ -123,6 +123,10 @@ static std::vector<std::string> available_profile_versions(UiState& st,
 static const char* kVersion = "1.0.0";
 static const char* kChannel = "stable";
 
+const char* launcher_version() {
+    return kVersion;
+}
+
 // ---------------------------------------------------------------------------
 // Theme / fonts (shared via ui_internal.h extern declarations)
 // ---------------------------------------------------------------------------
