@@ -5130,13 +5130,15 @@ void draw_home_tab(UiState& st) {
 
         // Rotating hero content: news / launcher update / featured pack /
         // announcement. Crossfades every 7s with a 250ms ease.
-        static const struct HeroSlide {
+        struct HeroSlide {
             const char* title;
             const char* subtitle;
             const char* action;   // button label, empty = none
             const char* nav_action; // 'discover' | 'settings' | 'downloads' | ''
-        } kHeroSlides[] = {
-            {"AMALGAM 1.0.0",
+        };
+        static const std::string kHeroVersionTitle = std::string("AMALGAM ") + kVersion;
+        static const HeroSlide kHeroSlides[] = {
+            {kHeroVersionTitle.c_str(),
              "Your unified Minecraft platform — launch, discover, and play together.",
              "", ""},
             {"Discover Your Next Adventure",
@@ -5239,16 +5241,19 @@ void draw_home_tab(UiState& st) {
             draw_instance_art(st, *most_recent,
                               ImVec2(qc_pos.x + ui_px(14.0f), qc_pos.y + ui_px(17.0f)),
                               ImVec2(ui_px(48.0f), ui_px(48.0f)), c32(k.brand_dk), 8.0f);
-            // Profile info
+            // Profile info: pin each line to the info column so the meta
+            // row can never drift over the art regardless of name width.
             const float info_x = qc_pos.x + ui_px(88.0f);
             const float info_width = std::max(ui_px(80.0f), qc_size.x - ui_px(224.0f));
-            ImGui::SetCursorScreenPos(ImVec2(info_x, qc_pos.y + ui_px(18.0f)));
+            const float name_y = qc_pos.y + ui_px(16.0f);
+            ImGui::SetCursorScreenPos(ImVec2(info_x, name_y));
 
             ImGui::PushFont(f_h2);
             ImGui::TextUnformatted(
                 elide_to_width(most_recent->name.empty() ? most_recent->id : most_recent->name,
                                info_width).c_str());
             ImGui::PopFont();
+            ImGui::SetCursorScreenPos(ImVec2(info_x, name_y + ImGui::GetTextLineHeight() + ui_px(6.0f)));
             ImGui::PushFont(f_small);
             ImGui::TextColored(k.muted, "%s  |  %s  %s",
                                profile_activity_label(*most_recent).c_str(),

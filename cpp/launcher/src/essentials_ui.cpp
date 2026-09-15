@@ -847,9 +847,11 @@ static void draw_essentials_hero(UiState& st) {
     ImGui::Dummy(ImVec2(ui_px(18.0f), hero_h));
     ImGui::SetCursorScreenPos(ImVec2(hero_min.x + ui_px(18.0f), hero_min.y + ui_px(14.0f)));
 
-    // Title + subtitle
+    // Title + subtitle.  The page header above already reads "Amalgam
+    // Essentials"; repeat the product name here and the hero reads as a
+    // duplicate.  The hero carries status + actions instead.
     ImGui::PushFont(f_title);
-    ImGui::TextColored(k.text, "Amalgam Essentials");
+    ImGui::TextColored(k.text, "Essentials");
     ImGui::PopFont();
     ImGui::SameLine(0, ui_px(10.0f));
     ImVec4 online_col = k.green;
@@ -1682,37 +1684,47 @@ static void draw_friends_tab(UiState& st) {
     // ══════════════════════════════════════════════════════════════
     // Empty state — all three sections still render for consistency
     // ══════════════════════════════════════════════════════════════
+    // Columns must be width-scoped children: the section bodies use
+    // fill-width widgets, so without a child the left column consumes the
+    // whole row and SameLine pushes the other columns off-window.
+    auto draw_column = [&](float width, const char* id, auto&& body) {
+        if (stacked_columns) {
+            ImGui::Spacing();
+            body();
+            return;
+        }
+        ImGui::BeginChild(id, ImVec2(width, 0),
+                          ImGuiChildFlags_None | ImGuiChildFlags_AutoResizeY,
+                          ImGuiWindowFlags_NoScrollbar);
+        body();
+        ImGui::EndChild();
+        ImGui::SameLine(0, gap);
+    };
+
     if (friends.empty()) {
-        draw_essentials_empty_state(st);
-
-        if (!stacked_columns) ImGui::SameLine(0, gap);
-        else ImGui::Spacing();
-        draw_center_content();
-
-        if (!stacked_columns) ImGui::SameLine(0, gap);
-        else ImGui::Spacing();
-        draw_right_rail();
+        draw_column(stacked_columns ? 0.0f : left_w, "##ess_col_left",
+                    [&] { draw_essentials_empty_state(st); });
+        draw_column(stacked_columns ? 0.0f : center_w, "##ess_col_center", draw_center_content);
+        draw_column(stacked_columns ? 0.0f : right_w, "##ess_col_right", draw_right_rail);
+        if (!stacked_columns) ImGui::NewLine();
         return;
     }
 
     // ══════════════════════════════════════════════════════════════
-    // LEFT — Friends list (flows in page scroll, no nested scroll)
+    // LEFT — Friends list
     // ══════════════════════════════════════════════════════════════
-    draw_friends_list_content();
+    draw_column(left_w, "##ess_col_left", draw_friends_list_content);
 
     // ══════════════════════════════════════════════════════════════
     // CENTER — Session / activity / invites
     // ══════════════════════════════════════════════════════════════
-    if (!stacked_columns) ImGui::SameLine(0, gap);
-    else ImGui::Spacing();
-    draw_center_content();
+    draw_column(center_w, "##ess_col_center", draw_center_content);
 
     // ══════════════════════════════════════════════════════════════
     // RIGHT — Status / quick actions / connection / info
     // ══════════════════════════════════════════════════════════════
-    if (!stacked_columns) ImGui::SameLine(0, gap);
-    else ImGui::Spacing();
-    draw_right_rail();
+    draw_column(right_w, "##ess_col_right", draw_right_rail);
+    if (!stacked_columns) ImGui::NewLine();
 }
 
 // ---------------------------------------------------------------------------
