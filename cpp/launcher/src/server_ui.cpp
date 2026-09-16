@@ -746,10 +746,8 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     }
 
     ImGui::SameLine(0, ui_px(4.0f));
-    if (ghost_button("Delete", ImVec2(bw, bh))) {
+    if (ghost_button("Delete", ImVec2(bw, bh)))
         s.action_pending = index;
-        ImGui::OpenPopup("Confirm Delete");
-    }
 
     card_end();
     ImGui::PopID();
@@ -1857,10 +1855,8 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         }
 
         ImGui::SameLine(0, ui_px(6.0f));
-        if (ghost_button("Delete Server", ImVec2(bw + ui_px(10.0f), bh))) {
+        if (ghost_button("Delete Server", ImVec2(bw + ui_px(10.0f), bh)))
             s.action_pending = s.detail_server_idx;
-            ImGui::OpenPopup("Confirm Delete");
-        }
     }
 
     ImGui::Spacing();

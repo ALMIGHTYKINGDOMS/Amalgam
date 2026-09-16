@@ -166,7 +166,17 @@ std::string project_source_text(const mods::SearchResult& project, const mods::M
 float auto_item_width(float preferred, float minimum = 0.0f, float reserved = 0.0f);
 bool input_text(const char* label, std::string* value);
 bool input_text_hint(const char* label, const char* hint, std::string* value);
-void empty_state(const char* title, const char* message, const char* icon = nullptr, const char* action_label = nullptr);
+// Draws an empty state, optionally with one action button. Returns true on the
+// frame that action was pressed, so the caller wires it to real behaviour.
+bool empty_state(const char* title, const char* message, const char* icon = nullptr,
+                 const char* action_label = nullptr);
+// Dear ImGui resolves a popup id against the id stack of the window that opens
+// it, and every card body is a child window. A control drawn inside a card
+// therefore cannot open a modal its page begins by name. Such controls call
+// request_popup(); the page's own window drains it with open_requested_popup()
+// once per frame, so the id matches the BeginPopupModal the page runs.
+void request_popup(const char* label);
+void open_requested_popup();
 // Premium empty state with a layered geometric brand illustration, consistent
 // title/message/CTA. Used everywhere so no page is left as blank space.
 void illustrated_empty_state(IconId icon, const char* title, const char* message,

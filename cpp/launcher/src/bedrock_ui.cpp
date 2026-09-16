@@ -1043,7 +1043,7 @@ void draw_bedrock_profiles(UiState& st) {
             ImGui::Separator();
             if (ImGui::MenuItem("Delete", nullptr, false, !profile.favorite)) {
                 bedrock_ui.pending_delete_id = profile.id;
-                ImGui::OpenPopup("Delete Profile?");
+                request_popup("Delete Profile?");
             }
             ImGui::EndPopup();
         }
@@ -1402,7 +1402,7 @@ void draw_bedrock_worlds(UiState& st) {
         if (ghost_button("Delete", ImVec2(btn_w, ui_px(28.0f)))) {
             bedrock_ui.pending_world_profile_id = world.profile_id;
             bedrock_ui.pending_world_id = world.folder;
-            ImGui::OpenPopup("Delete World?");
+            request_popup("Delete World?");
         }
         card_end();
         ImGui::PopID();
@@ -1561,13 +1561,13 @@ void draw_bedrock_backups(UiState& st) {
         if (ghost_button("Restore", ImVec2(btn_w, ui_px(28.0f)))) {
             bedrock_ui.pending_restore_id = backup.profile_id;
             bedrock_ui.pending_restore_backup_id = backup.id;
-            ImGui::OpenPopup("Restore Backup?");
+            request_popup("Restore Backup?");
         }
         ImGui::SameLine();
         if (ghost_button("Delete", ImVec2(btn_w, ui_px(28.0f)))) {
             bedrock_ui.selected_backup_profile_id = backup.profile_id;
             bedrock_ui.selected_backup_id = backup.id;
-            ImGui::OpenPopup("Delete Backup?");
+            request_popup("Delete Backup?");
         }
         card_end();
         ImGui::PopID();
@@ -1850,7 +1850,7 @@ void draw_bedrock_addons_installed(UiState& st) {
             bedrock_ui.pending_addon_filename = addon.filename;
             bedrock_ui.pending_addon_uuid = addon.uuid;
             bedrock_ui.pending_addon_type = addon.type;
-            ImGui::OpenPopup("Delete Addon?");
+            request_popup("Delete Addon?");
         }
         ImGui::PopID();
         card_end();

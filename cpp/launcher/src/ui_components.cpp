@@ -364,10 +364,28 @@ void card_end(bool was_hoverable) {
 }
 
 // ---------------------------------------------------------------------------
+// Popups requested from inside a card
+// ---------------------------------------------------------------------------
+
+// One pending request. The UI thread sets it while drawing a card and the page
+// window drains it by the end of the frame or the next one, so it cannot pile up.
+static std::string g_requested_popup;
+
+void request_popup(const char* label) {
+    if (label && label[0]) g_requested_popup = label;
+}
+
+void open_requested_popup() {
+    if (g_requested_popup.empty()) return;
+    ImGui::OpenPopup(g_requested_popup.c_str());
+    g_requested_popup.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Empty state display
 // ---------------------------------------------------------------------------
 
-void empty_state(const char* title, const char* message, const char* icon, const char* action_label) {
+bool empty_state(const char* title, const char* message, const char* icon, const char* action_label) {
     const ImVec2 content = ImGui::GetContentRegionAvail();
     const float width = std::min(ui_px(460.0f), std::max(ui_px(220.0f), content.x - ui_px(32.0f)));
     const float height = icon ? ui_px(198.0f) : ui_px(104.0f);
@@ -429,17 +447,17 @@ void empty_state(const char* title, const char* message, const char* icon, const
     ImGui::TextColored(k.muted, "%s", message);
     ImGui::PopTextWrapPos();
     
+    bool action_pressed = false;
     if (action_label) {
         ImGui::Spacing();
         ImGui::Spacing();
         const float btn_width = ImGui::CalcTextSize(action_label).x + ui_px(32.0f);
         ImGui::SetCursorPosX(origin.x + (width - btn_width) * 0.5f);
-        if (primary_button(action_label)) {
-            // Action callback would be handled by caller
-        }
+        action_pressed = primary_button(action_label);
     }
-    
+
     ImGui::EndGroup();
+    return action_pressed;
 }
 
 void illustrated_empty_state(IconId icon, const char* title, const char* message,

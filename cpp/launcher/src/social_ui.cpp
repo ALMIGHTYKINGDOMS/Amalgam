@@ -290,7 +290,7 @@ void draw_social_friends(UiState& st) {
     
     // Add friend button
     if (primary_button("+ Add Friend", ImVec2(ui_px(120.0f), ui_px(32.0f)))) {
-        ImGui::OpenPopup("##add_friend_popup");
+        request_popup("##add_friend_popup");
     }
     
     ImGui::Spacing();
@@ -466,8 +466,8 @@ void draw_social_friends(UiState& st) {
             if (ImGui::MenuItem("View Profile")) {
                 social_ui.profile_friend_id = friend_.id;
                 social_ui.profile_friend_name = friend_.username;
+                // Opened below, in the window that begins the modal.
                 social_ui.profile_open = true;
-                ImGui::OpenPopup("##social_friend_profile");
             }
             
             if (ImGui::MenuItem("Remove Friend", nullptr, false, true)) {
@@ -702,7 +702,7 @@ void draw_social_parties(UiState& st) {
     
     if (primary_button("+ Create Party", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
         social_ui.party_creating = true;
-        ImGui::OpenPopup("##create_party_popup");
+        request_popup("##create_party_popup");
     }
     
     ImGui::Spacing();

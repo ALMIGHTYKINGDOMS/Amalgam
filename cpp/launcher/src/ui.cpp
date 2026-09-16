@@ -2683,6 +2683,25 @@ void draw_instance_overflow_menu(UiState& st, instances::Instance& instance,
     }
 }
 
+// Loader ids are stored lowercase ("fabric", "neoforge") because they are keys.
+// Every surface that shows one to a user comes through here, so a profile never
+// reads "1.21.1 fabric". The three states stay distinct instead of borrowing one
+// label: an explicit loader is named, "auto" reads "Auto" because launch.cpp
+// resolves it to fabric or forge at launch, and an unset loader reads "Not set"
+// rather than claiming the vanilla loader the profile never selected.
+static std::string loader_display_name(const std::string& raw) {
+    std::string s = raw;
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "fabric") return "Fabric";
+    if (s == "quilt") return "Quilt";
+    if (s == "forge") return "Forge";
+    if (s == "neoforge" || s == "neo forge" || s == "neoforged") return "NeoForge";
+    if (s == "auto") return "Auto";
+    if (s == "vanilla" || s == "liteloader") return "Vanilla";
+    if (s.empty()) return "Not set";
+    return raw;
+}
+
 std::string profile_activity_label(const instances::Instance& instance) {
     if (instance.last_played <= 0) return "Not played yet";
     const int64_t age = std::max<int64_t>(0, static_cast<int64_t>(std::time(nullptr)) -
@@ -3298,7 +3317,7 @@ void request_project_install(UiState& st, const mods::SearchResult& project,
         }
     }
     st.install_confirm_open = true;
-    ImGui::OpenPopup("Confirm content install");
+    request_popup("Confirm content install");
 }
 
 void do_mod_install_target(UiState& st, const std::string& slug, const std::string& source,
@@ -4987,8 +5006,9 @@ void draw_home_profile_card(UiState& st, instances::Instance& instance, float wi
     ImGui::PopFont();
     // Version + loader line
     ImGui::PushFont(f_small);
-    ImGui::TextColored(k.muted, "%s  %s", instance.minecraft_version.c_str(),
-                       instance.loader.empty() ? "" : instance.loader.c_str());
+    ImGui::TextColored(k.muted, "%s  %s",
+                       instance.minecraft_version.empty() ? "Not set" : instance.minecraft_version.c_str(),
+                       loader_display_name(instance.loader).c_str());
     ImGui::PopFont();
     // Source + activity + health status
     ImGui::PushFont(f_small);
@@ -5007,7 +5027,10 @@ void draw_home_profile_card(UiState& st, instances::Instance& instance, float wi
     const float more_width = ui_px(30.0f);
     const float action_width = std::max(ui_px(64.0f),
                                         ImGui::GetContentRegionAvail().x - open_width - more_width - ui_px(12.0f));
-    if (primary_button("PLAY", ImVec2(action_width, ui_px(34.0f))) && !st.running) {
+    // A launch already in flight must read as such here, the way the global
+    // Play button does, instead of accepting a click and doing nothing.
+    if (primary_button(st.running ? "LAUNCHING..." : "PLAY", ImVec2(action_width, ui_px(34.0f)),
+                       st.running) && !st.running) {
         st.selected = instance.minecraft_version;
         st.pending_id = st.selected;
         st.active_instance_dir = instance.directory;
@@ -5289,12 +5312,15 @@ void draw_home_tab(UiState& st) {
             ImGui::TextColored(k.muted, "%s  |  %s  %s",
                                profile_activity_label(*most_recent).c_str(),
                                most_recent->minecraft_version.c_str(),
-                               most_recent->loader.empty() ? "" : most_recent->loader.c_str());
+                               loader_display_name(most_recent->loader).c_str());
             ImGui::PopFont();
             // Play button
-            ImGui::SetCursorScreenPos(ImVec2(qc_pos.x + qc_size.x - ui_px(120.0f),
+            // Wide enough for the longer in-flight label so the button never
+            // outgrows the card and gets clipped by it.
+            ImGui::SetCursorScreenPos(ImVec2(qc_pos.x + qc_size.x - ui_px(152.0f),
                                               qc_pos.y + (qc_height - ui_px(36.0f)) * 0.5f));
-            if (primary_button("QUICK PLAY", ImVec2(ui_px(100.0f), ui_px(36.0f))) && !st.running) {
+            if (primary_button(st.running ? "LAUNCHING..." : "QUICK PLAY", ImVec2(ui_px(132.0f), ui_px(36.0f)),
+                               st.running) && !st.running) {
                 st.selected = most_recent->minecraft_version;
                 st.pending_id = st.selected;
                 st.active_instance_dir = most_recent->directory;
@@ -5648,12 +5674,13 @@ void draw_discover_tab(UiState& st) {
         const bool hovered = ImGui::IsMouseHoveringRect(p, p + sz);
         ImGui::InvisibleButton(("##ctab_" + std::to_string(ct.idx)).c_str(), sz);
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        if (active) {
-            dl->AddRectFilled(p, p + sz, c32(k.brand), ui_px(4.0f));
-            dl->AddRect(p, p + sz, c32(k.brand_hov), ui_px(4.0f), 0, ui_px(1.0f));
-        }
-        const ImVec4 text_color = active || hovered ? k.text : k.muted;
-        dl->AddText(p + ImVec2(ui_px(8.0f), ui_px(3.0f)), c32(text_color), ct.label);
+        // Every content type carries a surface, so the row reads as a control the
+        // user can switch rather than a line of labels with one highlighted word.
+        dl->AddRectFilled(p, p + sz, c32(active ? k.brand : (hovered ? k.surface2 : k.surface)),
+                          ui_px(4.0f));
+        dl->AddRect(p, p + sz, c32(active ? k.brand_hov : k.border), ui_px(4.0f), 0, ui_px(1.0f));
+        dl->AddText(p + ImVec2(ui_px(8.0f), ui_px(3.0f)), c32(k.text), ct.label);
+        if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) {
             st.discover_sub_tab = ct.idx;
             st.browse_category = ct.category;
@@ -6662,7 +6689,7 @@ void draw_mods_tab(UiState& st) {
             std::string loader_str;
             for (size_t li2 = 0; li2 < r.loaders.size() && li2 < 3; ++li2) {
                 if (!loader_str.empty()) loader_str += " • ";
-                loader_str += r.loaders[li2];
+                loader_str += loader_display_name(r.loaders[li2]);
             }
             dl->AddText(ImVec2(tx, ty), c32(k.muted), elide_to_width(loader_str, cw - ui_px(16.0f)).c_str());
             // Source badge
@@ -8527,8 +8554,8 @@ void draw_instance_detail(UiState& st) {
     ImGui::Dummy(ImVec2(0, banner_size.y));
 
     // ── Profile info overlay (below banner) ───────────────────────────────
-    const char* mc_ver = inst.minecraft_version.empty() ? "unconfigured" : inst.minecraft_version.c_str();
-    const char* loader_name = inst.loader.empty() || inst.loader == "auto" ? "vanilla" : inst.loader.c_str();
+    const char* mc_ver = inst.minecraft_version.empty() ? "Not set" : inst.minecraft_version.c_str();
+    const std::string loader_name = loader_display_name(inst.loader);
     auto issues = profile_health(st, inst);
     bool healthy = issues.empty();
 
@@ -8557,7 +8584,7 @@ void draw_instance_detail(UiState& st) {
         ImGui::SameLine(0, ui_px(4.0f));
     };
     badge(mc_ver, c32(k.surface));
-    badge(loader_name, c32(k.surface));
+    badge(loader_name.c_str(), c32(k.surface));
     if (mod_count > 0)
         badge((std::to_string(mod_count) + (mod_count == 1 ? " Mod" : " Mods")).c_str(), c32(k.surface));
     badge(inst.pack_source.empty() ? "Custom" : (inst.pack_modified ? "Modified" : "Published"),
@@ -8578,8 +8605,8 @@ void draw_instance_detail(UiState& st) {
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
                                   ImGui::GetContentRegionAvail().x - cluster_w));
 
-    if (primary_button(st.running ? "Running" : "Play", ImVec2(play_w, btn_h)) && !st.running &&
-        !inst.minecraft_version.empty()) {
+    if (primary_button(st.running ? "Running" : "Play", ImVec2(play_w, btn_h), st.running) &&
+        !st.running && !inst.minecraft_version.empty()) {
         st.selected = inst.minecraft_version;
         st.active_instance_dir = inst.directory;
         st.pending_instance_dir = inst.directory;
@@ -8698,7 +8725,7 @@ void draw_instance_detail(UiState& st) {
             ImGui::PopFont();
         };
         health_item("Minecraft", !inst.minecraft_version.empty(), mc_ver);
-        health_item("Loader", !inst.loader.empty() && inst.loader != "auto", loader_name);
+        health_item("Loader", !inst.loader.empty() && inst.loader != "auto", loader_name.c_str());
         health_item("Dependencies", issues.empty(), issues.empty() ? "OK" : issues.front().c_str());
         health_item("Game Files", true, (std::to_string(mod_count) + " mods installed").c_str());
         if (!healthy) {
@@ -8809,7 +8836,7 @@ void draw_instance_detail(UiState& st) {
                 st.pack_update_confirm_copy = create_copy;
                 st.pack_update_confirm_version = pack_update.latest_version;
                 st.pack_update_confirm_open = true;
-                ImGui::OpenPopup("Confirm creator update");
+                request_popup("Confirm creator update");
             }
         } else if (pack_check_succeeded) {
             ImGui::TextColored(k.green, "Everything is up to date");
@@ -9189,7 +9216,7 @@ void draw_instance_detail(UiState& st) {
         if (ghost_button("Change Version", ImVec2(ui_px(150.0f), ui_px(30.0f)))) {
             st.version_change_kind = 1;
             st.version_change_backup = true;
-            ImGui::OpenPopup("##version_change_modal");
+            request_popup("Change Version##version_change_modal");
         }
         card_end();
         ImGui::Spacing();
@@ -9198,7 +9225,7 @@ void draw_instance_detail(UiState& st) {
         ImGui::TextUnformatted("MOD LOADER");
         ImGui::PopFont();
         ImGui::PushFont(f_bold);
-        ImGui::Text("%s", loader_name);
+        ImGui::Text("%s", loader_name.c_str());
         ImGui::PopFont();
         if (!inst.loader_version.empty()) {
             ImGui::TextColored(k.muted, "Current: %s", inst.loader_version.c_str());
@@ -9209,7 +9236,7 @@ void draw_instance_detail(UiState& st) {
         if (ghost_button("Change Loader", ImVec2(ui_px(150.0f), ui_px(30.0f)))) {
             st.version_change_kind = 2;
             st.version_change_backup = true;
-            ImGui::OpenPopup("##version_change_modal");
+            request_popup("Change Version##version_change_modal");
         }
         card_end();
         ImGui::Spacing();
@@ -9367,7 +9394,7 @@ void draw_instance_detail(UiState& st) {
         ImGui::PushFont(f_bold);
         ImGui::TextUnformatted("MINECRAFT");
         ImGui::PopFont();
-        ImGui::Text("Version: %s    Loader: %s", mc_ver, loader_name);
+        ImGui::Text("Version: %s    Loader: %s", mc_ver, loader_name.c_str());
         if (!inst.loader_version.empty()) ImGui::Text("Loader version: %s", inst.loader_version.c_str());
         card_end();
         ImGui::Spacing();
@@ -9892,12 +9919,12 @@ void draw_instances_tab(UiState& st) {
                     if (ghost_button("Rename", ImVec2(btn_w, ui_px(28.0f)))) {
                         st.new_group_name = card.name;
                         st.rename_group_target = card.name;
-                        ImGui::OpenPopup("##rename_group_modal");
+                        request_popup("Rename Group##rename_group_modal");
                     }
                     ImGui::SameLine(0, ui_px(6.0f));
                     if (ghost_button("Delete", ImVec2(btn_w, ui_px(28.0f)))) {
                         st.delete_group_target = card.name;
-                        ImGui::OpenPopup("##delete_group_modal");
+                        request_popup("Delete Group##delete_group_modal");
                     }
                 } else {
                     ImGui::SameLine(0, ui_px(6.0f));
@@ -10006,7 +10033,7 @@ void draw_instances_tab(UiState& st) {
     if (ghost_button("Create Group", ImVec2(ui_px(140.0f), ui_px(38.0f)))) {
         st.new_group_name.clear();
         st.group_target.clear();
-        ImGui::OpenPopup("##new_group_modal");
+        request_popup("New Group##new_group_modal");
     }
     const float toolbar_width = ImGui::GetContentRegionAvail().x;
     const bool narrow_toolbar = toolbar_width < ui_px(930.0f);
@@ -10104,8 +10131,9 @@ void draw_instances_tab(UiState& st) {
             if (!instances::save(instance, &error))
                 log_line(st, L"[instances] save failed: " + net::to_wide(error));
         }
-        ImGui::TextColored(k.muted, "%s  |  %s", instance.minecraft_version.empty() ? "unconfigured" : instance.minecraft_version.c_str(),
-                           instance.loader.empty() ? "auto" : instance.loader.c_str());
+        ImGui::TextColored(k.muted, "%s  |  %s",
+                           instance.minecraft_version.empty() ? "Not set" : instance.minecraft_version.c_str(),
+                           loader_display_name(instance.loader).c_str());
         ImGui::TextColored(instance.pack_source.empty() ? k.muted :
                                (instance.pack_modified ? k.yellow : k.green), "%s",
                            instance.pack_source.empty() ? "Custom profile" :
@@ -10120,7 +10148,8 @@ void draw_instances_tab(UiState& st) {
         const float library_open_width = ui_px(70.0f);
         const float library_play_width = std::max(ui_px(64.0f),
             ImGui::GetContentRegionAvail().x - library_more_width - library_open_width - ui_px(14.0f));
-        if (primary_button("Play", ImVec2(library_play_width, ui_px(32.0f))) && !st.running &&
+        if (primary_button(st.running ? "LAUNCHING..." : "Play", ImVec2(library_play_width, ui_px(32.0f)),
+                           st.running) && !st.running &&
             !instance.minecraft_version.empty()) {
             st.selected = instance.minecraft_version;
             st.pending_instance_dir = instance.directory;
@@ -10156,13 +10185,13 @@ void draw_instances_tab(UiState& st) {
                 if (ImGui::MenuItem("New group...")) {
                     st.new_group_name.clear();
                     st.group_target = instance.id;
-                    ImGui::OpenPopup("##new_group_modal");
+                    request_popup("New Group##new_group_modal");
                 }
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Move to recovery...")) {
                 st.delete_target = instance.id;
-                ImGui::OpenPopup("##delete_modal");
+                request_popup("Move Modpack to Recovery##delete_modal");
             }
             ImGui::EndPopup();
         }
@@ -10667,6 +10696,12 @@ void draw_java_tab(UiState& st) {
         java::managed_root(st.cfg ? st.cfg->java_cache_dir : std::wstring());
     java::JavaRuntimeManager managed_java_manager(managed_java_root);
     static int pending_managed_remove = 0;
+    // Every card below is a child window, and Dear ImGui seeds a popup's id with
+    // the id stack of the window that opens it. Resolve both ids here, in the
+    // window that calls BeginPopupModal, so the buttons inside the cards can
+    // open them at all.
+    const ImGuiID install_java_popup = ImGui::GetID("Install Managed Java");
+    const ImGuiID remove_java_popup = ImGui::GetID("Remove Managed Java");
 
     if (!st.java_installing) {
         std::string install_message;
@@ -10697,7 +10732,7 @@ void draw_java_tab(UiState& st) {
     else
         ImGui::Spacing();
     if (primary_button("+ Install Java", ImVec2(ui_px(140.0f), ui_px(32.0f))))
-        ImGui::OpenPopup("Install Managed Java");
+        ImGui::OpenPopup(install_java_popup);
     if (!stack_java_actions) ImGui::SameLine();
     if (ghost_button("Rescan", ImVec2(ui_px(92.0f), ui_px(32.0f)))) {
         st.java_scanned = false;
@@ -10829,9 +10864,13 @@ void draw_java_tab(UiState& st) {
     ImGui::Spacing();
 
     if (java_snapshot.empty()) {
-        empty_state("No Java runtimes detected",
-                    "Scan now or install a supported runtime from Adoptium Temurin.",
-                    "J");
+        // A machine with no managed Java is the first thing a new player hits, so
+        // the empty state performs the install rather than pointing at it.
+        if (empty_state("No Java runtimes detected",
+                        "Amalgam downloads Eclipse Temurin for you, so you never install Java "
+                        "by hand. Java 21 covers most modpacks.",
+                        "J", "Install Java"))
+            ImGui::OpenPopup(install_java_popup);
     } else {
         // Filter bar
         ImGui::SetNextItemWidth(ui_px(240.0f));
@@ -11038,7 +11077,7 @@ void draw_java_tab(UiState& st) {
                       ImGui::SameLine();
                       if (ghost_button("Remove", ImVec2(ui_px(72.0f), ui_px(30.0f)))) {
                           pending_managed_remove = j.major;
-                          ImGui::OpenPopup("Remove Managed Java");
+                          ImGui::OpenPopup(remove_java_popup);
                       }
                   }
              } else {
@@ -11798,7 +11837,7 @@ void draw_pack_wizard(UiState& st) {
                         std::string loaders_str = "Loaders: ";
                         for (size_t i = 0; i < st.wizard_resolved_loaders.size(); ++i) {
                             if (i) loaders_str += ", ";
-                            loaders_str += st.wizard_resolved_loaders[i];
+                            loaders_str += loader_display_name(st.wizard_resolved_loaders[i]);
                         }
                         ImGui::TextColored(k.muted, "%s", loaders_str.c_str());
                     }
@@ -13385,6 +13424,10 @@ void draw_shell(UiState& st) {
     ImGui::BeginChild("##contentmax", ImVec2(content_width, 0),
                       ImGuiChildFlags_None, ImGuiWindowFlags_None);
     ImGui::PopStyleColor();
+    // This child window is where every page body runs, so it owns the popups the
+    // pages begin. Controls inside a card open theirs through here instead of
+    // opening a popup in the card's own window, where the page could never see it.
+    open_requested_popup();
 
     switch (st.active_tab) {
         case 0:

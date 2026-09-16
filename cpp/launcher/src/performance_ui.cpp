@@ -389,7 +389,7 @@ void draw_performance_cache(UiState& st) {
     
     if (primary_button("Clear All Cache", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
         perf_ui.cache_cleanup_open = true;
-        ImGui::OpenPopup("##clear_cache_confirm");
+        request_popup("##clear_cache_confirm");
     }
     
     card_end();
