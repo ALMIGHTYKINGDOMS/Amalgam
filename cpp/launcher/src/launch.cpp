@@ -298,7 +298,7 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
         authenticated = auth::ensure_valid(authenticated_account, log, &account_error);
     }
     if (!authenticated && opt.require_account) {
-        if (err) *err = account_error.empty() ? "Minecraft account required for direct launch; use the official Minecraft Launcher for sign-in" : account_error;
+        if (err) *err = account_error.empty() ? "A Minecraft account is required for a direct launch; use the Minecraft Launcher handoff for this profile instead" : account_error;
         return false;
     }
 

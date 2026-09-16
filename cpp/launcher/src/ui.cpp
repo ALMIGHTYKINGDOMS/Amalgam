@@ -1564,7 +1564,10 @@ void do_update_install(UiState& st) {
 
 void start_microsoft_login(UiState& st) {
     st.wizard_open = false;
-    constexpr bool kDirectMicrosoftLoginEnabled = false;
+    // Direct sign-in runs the device-code flow in-launcher. Minecraft services
+    // approval for the app registration is still pending, so the final step can
+    // be rejected; the wizard says so and offers the Minecraft Launcher mode.
+    constexpr bool kDirectMicrosoftLoginEnabled = true;
     if (!kDirectMicrosoftLoginEnabled) {
         const bool launcher_installed = official_launcher::IsOfficialLauncherInstalled();
         const bool launcher_opened = launcher_installed && official_launcher::OpenOfficialLauncher();
@@ -1574,7 +1577,7 @@ void start_microsoft_login(UiState& st) {
             ? "The official Minecraft Launcher is open. Sign in there, then return to Amalgam and press Play on a prepared profile."
             : (launcher_installed
                 ? "The official Minecraft Launcher is installed, but Windows could not open it. Use Open Minecraft Launcher to try again."
-                : "Microsoft approval for direct Amalgam sign-in is pending. Install the official Minecraft Launcher to sign in and play for now.");
+                : "Direct sign-in inside Amalgam is not available in this build. Install the Minecraft Launcher: Amalgam prepares your profile and hands it over, and the launcher signs you in with your own account.");
         st.login_wizard_open = true;
         st.microsoft_login_popup_open = true;
         st.auth_working = false;
@@ -1584,8 +1587,10 @@ void start_microsoft_login(UiState& st) {
     if (!auth::valid_client_id(client_id)) {
         st.login_wizard_state = 3;
         st.login_error = client_id.empty()
-            ? "Microsoft sign-in needs an application ID in launcher settings."
-            : "The Microsoft application ID is invalid.";
+            ? "Signing in with Microsoft inside Amalgam is not available in this build.\n"
+              "Play still works: switch to the Minecraft Launcher mode in Settings and\n"
+              "Amalgam hands it your prepared profile."
+            : "This launcher's Microsoft application ID is not valid.";
         st.login_wizard_open = true;
         st.microsoft_login_popup_open = true;
         return;
@@ -2795,7 +2800,8 @@ std::vector<UiState::LaunchCheck> evaluate_launch(const UiState& st, const std::
     if (signed_in) {
         add("Microsoft account", "A saved account is available.", true, false);
     } else {
-        add("Minecraft authentication", "The official Minecraft Launcher will handle Microsoft sign-in.",
+        add("Minecraft authentication",
+            "The Minecraft Launcher signs you in when Play hands it your prepared profile.",
             official_launcher::IsOfficialLauncherInstalled(), true);
     }
 
@@ -4290,6 +4296,21 @@ void draw_brand_mark(ImDrawList* dl, const ImVec2& center, float scale) {
     dl->AddQuadFilled(diamond_top, diamond_right, diamond_bottom, diamond_left, blue);
 }
 
+void draw_brand_badge(ImDrawList* dl, const ImVec2& center, float radius, float mark_scale) {
+    // The mark is drawn over artwork that is often lighter than it is, so it
+    // needs a darker field behind it.  A single opaque circle reads as a
+    // sticker glued onto the surface; a short radial falloff keeps the
+    // contrast without a visible edge.  The mark's own wings reach about 25
+    // units from its centre, which is what callers size mark_scale against.
+    for (int ring = 5; ring >= 1; --ring) {
+        const float t = static_cast<float>(ring) / 5.0f;
+        ImVec4 field = k.bg;
+        field.w = 0.12f + 0.50f * (1.0f - t);
+        dl->AddCircleFilled(center, radius * (0.57f + 0.43f * t), c32(field), 32);
+    }
+    draw_brand_mark(dl, center, mark_scale);
+}
+
 void draw_sidebar(UiState& st) {
     const float window_width = visible_window_width(st.hwnd);
     st.sidebar_compact = st.sidebar_collapsed || window_width < ui_px(1180.0f);
@@ -4342,14 +4363,10 @@ void draw_sidebar(UiState& st) {
         const ImVec2 logo_pos = ImGui::GetCursorScreenPos();
         const float logo_h = ui_px(44.0f);
         ImDrawList* logo_dl = ImGui::GetWindowDrawList();
-        ImVec4 logo_halo = k.brand;
-        logo_halo.w = 0.13f;
         ImVec4 logo_tile = k.surface2;
         logo_tile.w = 0.72f;
         ImVec4 logo_border = k.brand_hov;
         logo_border.w = 0.52f;
-        logo_dl->AddCircleFilled(logo_pos + ImVec2(logo_h * 0.5f, logo_h * 0.5f),
-                                 logo_h * 0.54f, c32(logo_halo), 28);
         logo_dl->AddRectFilled(logo_pos, logo_pos + ImVec2(logo_h, logo_h),
                                c32(logo_tile), ui_px(12.0f));
         logo_dl->AddRect(logo_pos, logo_pos + ImVec2(logo_h, logo_h),
@@ -4590,10 +4607,8 @@ void draw_sidebar(UiState& st) {
                                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
         card_begin("##connect_minecraft_hero", ImVec2(-1, ui_px(92.0f)));
         const ImVec2 hero_origin = ImGui::GetCursorScreenPos();
-        ImDrawList* hero_draw = ImGui::GetWindowDrawList();
-        hero_draw->AddCircleFilled(hero_origin + ImVec2(ui_px(30.0f), ui_px(30.0f)), ui_px(25.0f),
-                                   c32(ImVec4(k.brand_dk.x, k.brand_dk.y, k.brand_dk.z, 0.92f)));
-        draw_brand_mark(hero_draw, hero_origin + ImVec2(ui_px(30.0f), ui_px(30.0f)), ui_px(1.0f));
+        draw_brand_badge(ImGui::GetWindowDrawList(),
+                         hero_origin + ImVec2(ui_px(30.0f), ui_px(30.0f)), ui_px(26.0f), ui_px(1.0f));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(66.0f));
         ImGui::PushFont(f_h2);
         ImGui::TextUnformatted("Connect Microsoft");
@@ -4747,7 +4762,10 @@ bool topbar_compact_account_button(UiState&, const char* label, bool signed_in) 
     if (hovered || focused) dl->AddRectFilled(p0, p0 + size, c32(k.hover), ui_px(8.0f));
     const ImVec2 avatar_center = p0 + size * 0.5f;
     dl->AddCircleFilled(avatar_center, ui_px(13.0f), c32(k.brand_dk));
-    draw_brand_mark(dl, avatar_center, ui_px(0.33f));
+    // The mark's own wings reach ~25 units from its centre, so this scale is
+    // the largest that still fits the 13px radius avatar instead of leaving a
+    // small glyph marooned in the middle of the circle.
+    draw_brand_mark(dl, avatar_center, ui_px(0.50f));
     dl->AddCircleFilled(ImVec2(avatar_center.x + ui_px(9.0f), avatar_center.y + ui_px(9.0f)),
                         ui_px(3.5f), c32(signed_in ? k.green : k.yellow));
     if (hovered) {
@@ -4772,7 +4790,7 @@ bool topbar_user_button(UiState&, const char* label, bool signed_in) {
         ImGui::GetWindowDrawList()->AddRectFilled(p0, p0 + size, c32(k.hover), 8.0f);
     const ImVec2 avatar_center(p0.x + ui_px(20.0f), p0.y + size.y * 0.5f);
     ImGui::GetWindowDrawList()->AddCircleFilled(avatar_center, ui_px(15.0f), c32(k.brand_dk));
-    draw_brand_mark(ImGui::GetWindowDrawList(), avatar_center, ui_px(0.38f));
+    draw_brand_mark(ImGui::GetWindowDrawList(), avatar_center, ui_px(0.55f));
     ImGui::GetWindowDrawList()->AddCircleFilled(
         ImVec2(avatar_center.x + ui_px(10.0f), avatar_center.y + ui_px(10.0f)),
         ui_px(4.0f), c32(signed_in ? k.green : k.yellow));
@@ -7450,9 +7468,16 @@ void draw_settings_tab(UiState& st) {
     }
     ImGui::TextColored(k.muted, "%s", auth_status.c_str());
     const bool sign_in_configured = auth::valid_client_id(c.microsoft_client_id);
-    if (!sign_in_configured) {
+    if (sign_in_configured) {
         ImGui::TextColored(k.yellow,
-                           "Microsoft sign-in is unavailable in this build.");
+                           "Microsoft sign-in is built in and ready, but it is still waiting on\n"
+                           "Minecraft approval, so it may not complete yet. If it fails, set Play to\n"
+                           "the Minecraft Launcher mode below and play there.");
+    } else {
+        ImGui::TextColored(k.yellow,
+                           "Microsoft sign-in is unavailable in this build. Play still works: set\n"
+                           "Play to the Minecraft Launcher mode below and Amalgam hands it your\n"
+                           "prepared profile.");
     }
     if (st.auth_working) {
         ImGui::SameLine();
@@ -7486,11 +7511,11 @@ void draw_settings_tab(UiState& st) {
     ImGui::TextUnformatted("How Play starts the game");
     ImGui::PopFont();
     ImGui::TextColored(k.muted,
-                       "Choose whether Amalgam launches Minecraft itself or hands the\n"
-                       "prepared profile to the official Minecraft Launcher.");
+                       "Both modes play the same prepared profile. Choose whether\n"
+                       "Amalgam signs you in, or hands the profile to the Minecraft Launcher.");
     const bool microsoft_available = sign_in_configured && auth::valid_client_id(c.microsoft_client_id);
     int mode_index = c.launch_mode == "microsoft" ? 0 : 1;
-    if (ImGui::RadioButton("Amalgam (sign in with Microsoft here)", &mode_index, 0)) {
+    if (ImGui::RadioButton("Amalgam (connect a Microsoft account here)", &mode_index, 0)) {
         c.launch_mode = "microsoft";
         st.settings_dirty = true;
     }
@@ -7498,7 +7523,8 @@ void draw_settings_tab(UiState& st) {
         ImGui::SameLine();
         ImGui::TextColored(k.yellow, "unavailable in this build");
     }
-    if (ImGui::RadioButton("Official Minecraft Launcher (use its Microsoft sign-in)", &mode_index, 1)) {
+    if (ImGui::RadioButton("Minecraft Launcher (Amalgam hands it your prepared profile)",
+                           &mode_index, 1)) {
         c.launch_mode = "official_launcher";
         st.settings_dirty = true;
     }
@@ -7507,6 +7533,12 @@ void draw_settings_tab(UiState& st) {
                            ? "Play opens the game directly with your connected account."
                            : "Play prepares the profile, then opens the Minecraft Launcher.\n"
                              "Select the Amalgam profile there and press Play.");
+    if (microsoft_available) {
+        ImGui::TextColored(k.yellow,
+                           "Signing in here is built in and ready, but it is still waiting on\n"
+                           "Minecraft approval, so it may not complete yet. If it fails, pick the\n"
+                           "Minecraft Launcher mode above and Play works there either way.");
+    }
     card_end();
 
     ImGui::Spacing();
@@ -8093,11 +8125,17 @@ void draw_settings_tab(UiState& st) {
         ImGui::Spacing();
 
         // Real packaged logo, with a small vector fallback for recovery mode
-        // when a user launches from an incomplete development directory.
+        // when a user launches from an incomplete development directory.  The
+        // mark band only: at this size the lockup's own wordmark renders a few
+        // pixels tall and reads as a second, garbled "AMALGAM" next to the
+        // title beside it.
         ImVec2 logo_pos = ImGui::GetCursorScreenPos();
         ImVec2 logo_size(ui_px(56.0f), ui_px(56.0f));
+        // The mark band is letterboxed inside the square, so the card's own
+        // surface is the right backdrop for it; a brand-filled tile showed as a
+        // saturated app-icon square around the artwork.
         draw_local_image(st, st.exe_dir + L"\\branding\\amalgam-logo.png",
-                         logo_pos, logo_size, c32(k.brand), ui_model::ImageFit::Contain);
+                         logo_pos, logo_size, c32(k.surface), ui_model::ImageFit::ContainMark);
         ImGui::Dummy(logo_size);
 
         // Group the brand text so every line stays in the title's column instead
@@ -9157,7 +9195,7 @@ void draw_instance_detail(UiState& st) {
                 card_end();
             }
         }
-        ImGui::TextColored(k.muted, "%d world(s)", count);
+        ImGui::TextColored(k.muted, "%s", ui_model::count_label(count, "world").c_str());
         ImGui::SameLine();
         if (ghost_button("Open saves folder", ImVec2(ui_px(150.0f), ui_px(28.0f))))
             ShellExecuteW(st.hwnd, L"open", saves.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -9220,7 +9258,8 @@ void draw_instance_detail(UiState& st) {
                 ImGui::PopID();
             }
             ImGui::Spacing();
-            ImGui::TextColored(k.muted, "%d screenshot(s)", (int)shot_files.size());
+            ImGui::TextColored(k.muted, "%s",
+                               ui_model::count_label((int)shot_files.size(), "screenshot").c_str());
             ImGui::SameLine();
         }
         if (ghost_button("Open folder", ImVec2(ui_px(120.0f), ui_px(28.0f))))
@@ -10141,7 +10180,9 @@ void draw_instances_tab(UiState& st) {
                                (instance.pack_modified ? "Modified" : "Published pack"));
         auto health = profile_health(st, instance);
         ImGui::TextColored(health.empty() ? k.green : k.yellow, "%s",
-                           health.empty() ? "Ready" : (std::to_string(health.size()) + " issue(s)").c_str());
+                           health.empty()
+                               ? "Ready"
+                               : ui_model::count_label((int)health.size(), "issue").c_str());
         if (!instance.group.empty())
             ImGui::TextColored(k.muted, "group: %s", instance.group.c_str());
         ImGui::Spacing();
@@ -11629,10 +11670,8 @@ void draw_pack_wizard(UiState& st) {
                          hero_origin, ImGui::GetWindowSize(),
                          c32(ImVec4(k.text.x, k.text.y, k.text.z, 0.18f)),
                          ui_model::ImageFit::Cover);
-        ImDrawList* hero_draw = ImGui::GetWindowDrawList();
-        hero_draw->AddCircleFilled(hero_origin + ImVec2(ui_px(28.0f), ui_px(28.0f)), ui_px(24.0f),
-                                   c32(ImVec4(k.brand_dk.x, k.brand_dk.y, k.brand_dk.z, 0.90f)));
-        draw_brand_mark(hero_draw, hero_origin + ImVec2(ui_px(28.0f), ui_px(28.0f)), ui_px(1.0f));
+        draw_brand_badge(ImGui::GetWindowDrawList(),
+                         hero_origin + ImVec2(ui_px(28.0f), ui_px(28.0f)), ui_px(25.0f), ui_px(1.0f));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(62.0f));
         ImGui::PushFont(f_h2);
         ImGui::TextUnformatted("Create a launchable profile");
@@ -13109,6 +13148,12 @@ void draw_launch_review(UiState& st) {
         ImGui::PopFont();
         ImGui::TextColored(k.muted, "Amalgam will prepare your profile and open the Minecraft Launcher.");
         ImGui::TextColored(k.muted, "Sign in with your Microsoft account there and press Play.");
+        if (st.cfg && auth::valid_client_id(st.cfg->microsoft_client_id)) {
+            ImGui::TextColored(k.yellow,
+                               "Signing in inside Amalgam is built in but still waiting on Minecraft\n"
+                               "approval, so Play uses the Minecraft Launcher until it is granted.\n"
+                               "You can switch modes in Settings > Account.");
+        }
         ImGui::Spacing();
 
         if (primary_button("Play via Minecraft Launcher", ImVec2(ui_px(220), ui_px(38)))) {
@@ -13132,7 +13177,9 @@ void draw_launch_review(UiState& st) {
         ImGui::PushFont(f_bold);
         ImGui::TextColored(k.yellow, "MINECRAFT LAUNCHER NOT FOUND");
         ImGui::PopFont();
-        ImGui::TextColored(k.muted, "Install the official Minecraft Launcher to sign in and launch.");
+        ImGui::TextColored(k.muted,
+                           "Install the Minecraft Launcher to play: Amalgam prepares the\n"
+                           "profile and hands it over, and the launcher signs you in.");
         ImGui::Spacing();
 
         if (primary_button("Get Minecraft Launcher", ImVec2(ui_px(200), ui_px(38)))) {

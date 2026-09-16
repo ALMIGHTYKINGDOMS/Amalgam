@@ -102,5 +102,10 @@ int main() {
                                                                      compact_actions, 1.5f);
     assert(compact_start >= 138.0f);
     assert(near(compact_start + compact_actions, 1032.0f));
+
+    // Counted nouns must not read as "1 issue(s)".
+    assert(aml::ui_model::count_label(1, "issue") == "1 issue");
+    assert(aml::ui_model::count_label(0, "world") == "0 worlds");
+    assert(aml::ui_model::count_label(2, "screenshot") == "2 screenshots");
     return 0;
 }

@@ -1903,7 +1903,9 @@ void draw_bedrock_addons_discover(UiState& st) {
             ? "Search CurseForge to find Bedrock add-ons."
             : "No Bedrock add-ons found.");
     } else {
-        ImGui::TextColored(k.muted, "%d CurseForge result(s)", static_cast<int>(results.size()));
+        ImGui::TextColored(
+            k.muted, "%s",
+            ui_model::count_label(static_cast<int>(results.size()), "CurseForge result").c_str());
         ImGui::Spacing();
         for (const auto& addon : results) {
             ImGui::PushID(addon.slug.c_str());

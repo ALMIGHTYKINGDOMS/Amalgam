@@ -111,7 +111,12 @@ void draw_page_header(const char* title, const char* subtitle) {
                       c32(k.brand), ui_px(2.0f));
     dl->AddCircleFilled(origin + ImVec2(ui_px(1.5f), ui_px(5.5f)), ui_px(2.2f),
                         c32(k.brand_hov));
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(10.0f));
+    // One text column for the whole header.  Dear ImGui resets the cursor to
+    // the window's left edge on every new line, so each line has to be indented
+    // past the rail explicitly; without it the subtitle is drawn underneath the
+    // rail and loses its first glyph.
+    const float text_x = ImGui::GetCursorPosX() + ui_px(10.0f);
+    ImGui::SetCursorPosX(text_x);
 
     // Enforced hierarchy: PAGE TITLE (f_title) → subtitle (small, muted).
     // The subtitle is kept readable (never the old tiny TextDisabled gray).
@@ -119,7 +124,7 @@ void draw_page_header(const char* title, const char* subtitle) {
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
     if (subtitle && subtitle[0]) {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(0.0f));
+        ImGui::SetCursorPosX(text_x);
         ImGui::PushFont(f_small);
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
         ImGui::TextColored(k.muted, "%s", subtitle);
@@ -127,7 +132,7 @@ void draw_page_header(const char* title, const char* subtitle) {
         ImGui::PopFont();
     }
     const ImVec2 line = ImGui::GetCursorScreenPos();
-    dl->AddLine(ImVec2(line.x + ui_px(10.0f), line.y + ui_px(2.0f)),
+    dl->AddLine(ImVec2(origin.x + ui_px(10.0f), line.y + ui_px(2.0f)),
                 ImVec2(line.x + ImGui::GetContentRegionAvail().x, line.y + ui_px(3.0f)),
                 c32(with_alpha(k.border, 0.72f)), ui_px(1.0f));
     ImGui::Dummy(ImVec2(0.0f, ui_px(5.0f)));

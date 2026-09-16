@@ -201,6 +201,7 @@ void draw_local_image(UiState& st, const std::wstring& path, const ImVec2& pos,
 void draw_project_image(UiState& st, const std::string& url, const ImVec2& pos,
                         const ImVec2& size, ImU32 fallback);
 void draw_brand_mark(ImDrawList* dl, const ImVec2& center, float scale);
+void draw_brand_badge(ImDrawList* dl, const ImVec2& center, float radius, float mark_scale);
 void draw_page_emblem(UiState& st, const char* asset_name);
 std::string format_date(int64_t timestamp);
 void page_title(const char* title, const char* subtitle = nullptr);

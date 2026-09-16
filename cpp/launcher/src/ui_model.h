@@ -268,6 +268,12 @@ inline int stat_card_columns(float available_width, float ui_scale = 1.0f) {
     return 1;
 }
 
+// Counts read as machine output when the label is hand-built ("1 issue(s)").
+// Keeping the wording here makes every surface spell counts the same way.
+inline std::string count_label(int count, const char* noun) {
+    return std::to_string(count) + " " + noun + (count == 1 ? "" : "s");
+}
+
 // Essentials uses three information columns when there is room, and stacked
 // scrollable panels when the content area is narrow. This keeps actions and
 // presence details readable instead of shrinking them into unusable slivers.

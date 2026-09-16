@@ -68,18 +68,21 @@ void draw_wizard_hero(UiState& st, const char* eyebrow, const char* title, const
     draw->AddLine(min + ImVec2(ui_px(14.0f), ui_px(1.0f)),
                   max - ImVec2(ui_px(14.0f), max.y - min.y - ui_px(1.0f)),
                   c32(alpha(k.brand_hov, 0.60f)), ui_px(1.0f));
-    draw->AddCircleFilled(min + ImVec2(ui_px(43.0f), ui_px(55.0f)), ui_px(28.0f),
-                          c32(alpha(k.bg, 0.70f)));
-    draw_brand_mark(draw, min + ImVec2(ui_px(43.0f), ui_px(55.0f)), ui_px(1.16f));
+    draw_brand_badge(draw, min + ImVec2(ui_px(43.0f), ui_px(55.0f)), ui_px(28.0f), ui_px(1.16f));
 
-    ImGui::SetCursorPos(ImVec2(ui_px(88.0f), ui_px(16.0f)));
+    // Every hero line is indented past the mark explicitly: ImGui returns the
+    // cursor to the window's left edge on a new line, which put the title under
+    // the mark instead of in the text column beside it.
+    const float text_x = ui_px(88.0f);
+    ImGui::SetCursorPos(ImVec2(text_x, ui_px(16.0f)));
     ImGui::PushFont(f_small);
     ImGui::TextColored(k.brand_hov, "%s", eyebrow);
     ImGui::PopFont();
+    ImGui::SetCursorPosX(text_x);
     ImGui::PushFont(f_h2);
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
-    ImGui::SetCursorPosX(ui_px(88.0f));
+    ImGui::SetCursorPosX(text_x);
     ImGui::PushTextWrapPos(std::max(min.x + ui_px(210.0f), max.x - ui_px(128.0f)));
     ImGui::TextColored(k.muted, "%s", subtitle);
     ImGui::PopTextWrapPos();
@@ -310,7 +313,7 @@ void draw_microsoft_login_dialog(UiState& st) {
     };
 
     draw_wizard_hero(st, "MINECRAFT ACCESS", "Connect Microsoft",
-                     "Optional here. The official Minecraft Launcher handles Minecraft sign-in when you press Play.");
+                     "Sign in here to play directly, or hand your prepared profile to the Minecraft Launcher instead.");
     ImGui::Spacing();
 
     int state = 0;
@@ -391,9 +394,19 @@ void draw_microsoft_login_dialog(UiState& st) {
             lower_error.find("aadsts700016") != std::string::npos ||
             lower_error.find("app not approved") != std::string::npos;
         if (official_fallback) {
-            draw_security_note("Until approval is complete, Amalgam can prepare your selected profile and the official Minecraft Launcher can handle Microsoft sign-in.");
+            draw_security_note("Direct sign-in is still waiting on Minecraft approval, so this step can fail until it is granted. Playing does not: switch Play to the Minecraft Launcher mode and Amalgam hands it your prepared profile.");
             ImGui::Spacing();
-            if (primary_button("Open Minecraft Launcher", ImVec2(ui_px(218.0f), ui_px(38.0f)))) {
+            if (primary_button("Use Minecraft Launcher mode", ImVec2(ui_px(238.0f), ui_px(38.0f)))) {
+                if (st.cfg) {
+                    st.cfg->launch_mode = "official_launcher";
+                    st.settings_dirty = true;
+                }
+                push_notice(st, ui_model::NoticeLevel::Info, "Minecraft Launcher mode is on",
+                            "Play prepares your profile and hands it to the Minecraft Launcher.");
+                close_login();
+            }
+            ImGui::SameLine();
+            if (ghost_button("Open it now", ImVec2(ui_px(110.0f), ui_px(38.0f)))) {
                 if (!aml::official_launcher::OpenOfficialLauncher()) {
                     push_notice(st, ui_model::NoticeLevel::Error,
                                 "Minecraft Launcher not found",
@@ -401,7 +414,7 @@ void draw_microsoft_login_dialog(UiState& st) {
                 }
             }
             ImGui::SameLine();
-            if (ghost_button("Close", ImVec2(ui_px(100.0f), ui_px(38.0f)))) close_login();
+            if (ghost_button("Close", ImVec2(ui_px(84.0f), ui_px(38.0f)))) close_login();
         } else {
             if (primary_button("Try again", ImVec2(ui_px(120.0f), ui_px(38.0f)))) {
                 close_login();

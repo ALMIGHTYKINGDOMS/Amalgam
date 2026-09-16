@@ -33,19 +33,19 @@ int64_t now_seconds() {
 
 std::string client_id_problem(const std::string& client_id) {
     if (client_id.empty()) {
-        return "Microsoft sign-in is not configured for this Amalgam build. Add this launcher's Application (client) ID in Settings > Advanced before connecting an account.";
+        return "Signing in with Microsoft inside Amalgam is not available in this build. You can still play: Amalgam prepares your profile and opens the Minecraft Launcher, which signs you in with your own account.";
     }
-    return "The Microsoft application ID is not valid. Use the GUID named Application (client) ID from this launcher's Microsoft Entra app registration.";
+    return "This launcher's Microsoft application ID is not valid.";
 }
 
 std::string friendly_oauth_error(const Json& response, const char* fallback) {
     const std::string code = response.get("error").as_str();
     const std::string description = response.get("error_description").as_str();
     if (code == "unauthorized_client" || description.find("AADSTS700016") != std::string::npos) {
-        return "Microsoft rejected this launcher registration. Confirm the Application (client) ID and configure the app for personal Microsoft accounts, then try again.";
+        return "Microsoft rejected this launcher registration. Its application ID must allow personal Microsoft accounts.";
     }
     if (code == "invalid_client") {
-        return "Microsoft could not validate this launcher registration. Check the Application (client) ID in Settings > Advanced.";
+        return "Microsoft could not validate this launcher registration.";
     }
     if (code == "access_denied") return "Microsoft sign-in was cancelled or access was not granted.";
     if (code == "expired_token") return "The Microsoft sign-in code expired. Start a new sign-in and use the new code.";
@@ -212,7 +212,7 @@ bool finish_login(const std::string& microsoft_token, const std::string& refresh
     if (!post_json("https://api.minecraftservices.com/authentication/login_with_xbox", mc_request,
                    mc_response, err)) {
         if (err && err->find("Invalid app registration") != std::string::npos) {
-            *err = "Minecraft rejected this Microsoft app registration. Configure the Entra app for personal Microsoft accounts, enable public client/device-code authentication, and use its Application (client) ID in Amalgam Settings > Advanced.";
+            *err = "Minecraft has not accepted this app registration yet: approval for direct Minecraft sign-in may still be pending, or the app must allow personal Microsoft accounts with public client/device-code authentication. Switch Play to the Minecraft Launcher mode in Settings and play now.";
         }
         return false;
     }
