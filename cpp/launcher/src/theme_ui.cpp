@@ -687,8 +687,7 @@ void apply_theme(const ThemePreset& theme) {
     style.Colors[ImGuiCol_SliderGrab] = k.brand;
     style.Colors[ImGuiCol_SliderGrabActive] = k.brand_hov;
     style.Colors[ImGuiCol_TextSelectedBg] = k.sel;
-    style.Colors[ImGuiCol_ScrollbarGrab] = k.surface2;
-    style.Colors[ImGuiCol_ScrollbarGrabActive] = k.brand;
+    apply_scrollbar_style();
     style.Colors[ImGuiCol_Separator] = k.border;
     style.Colors[ImGuiCol_Tab] = k.surface;
     style.Colors[ImGuiCol_TabHovered] = k.hover;

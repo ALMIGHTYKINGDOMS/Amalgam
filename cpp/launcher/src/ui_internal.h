@@ -62,6 +62,12 @@ struct Theme {
 
 extern Theme k;
 
+// Scrollbar colours (defined in ui.cpp). A grab tinted from the panel surface
+// is invisible on these near-black backgrounds, which hides the fact that a
+// page or dialog continues below the fold, so the grab is tinted from the
+// readable muted text colour instead. Called by every theme applier.
+void apply_scrollbar_style();
+
 // Typography helper (defined in ui_components.cpp). Use this everywhere a
 // page header is drawn so hierarchy stays consistent.
 void draw_page_header(const char* title, const char* subtitle = nullptr);

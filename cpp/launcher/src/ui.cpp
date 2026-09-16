@@ -163,6 +163,14 @@ void init_theme() {
     k.green = ImVec4(0.11f, 0.86f, 0.42f, 1.0f);
 }
 
+void apply_scrollbar_style() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0.32f);
+    s.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(k.muted.x, k.muted.y, k.muted.z, 0.55f);
+    s.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(k.muted.x, k.muted.y, k.muted.z, 0.80f);
+    s.Colors[ImGuiCol_ScrollbarGrabActive] = k.brand_hov;
+}
+
 void apply_theme() {
     ImGuiStyle& s = ImGui::GetStyle();
     // Rebuild from a clean base every time.  WM_DPICHANGED can arrive after
@@ -212,10 +220,7 @@ void apply_theme() {
     ImGui::GetStyle().Colors[ImGuiCol_SliderGrab] = k.brand;
     ImGui::GetStyle().Colors[ImGuiCol_SliderGrabActive] = k.brand_hov;
     ImGui::GetStyle().Colors[ImGuiCol_TextSelectedBg] = k.sel;
-    ImGui::GetStyle().Colors[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0.30f);
-    ImGui::GetStyle().Colors[ImGuiCol_ScrollbarGrab] = k.surface2;
-    ImGui::GetStyle().Colors[ImGuiCol_ScrollbarGrabHovered] = k.surface2 + ImVec4(0.05f, 0.05f, 0.05f, 0);
-    ImGui::GetStyle().Colors[ImGuiCol_ScrollbarGrabActive] = k.brand;
+    apply_scrollbar_style();
     ImGui::GetStyle().Colors[ImGuiCol_Separator] = k.border;
     ImGui::GetStyle().Colors[ImGuiCol_Tab] = k.surface;
     ImGui::GetStyle().Colors[ImGuiCol_TabHovered] = k.hover;
