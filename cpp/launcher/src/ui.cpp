@@ -5054,6 +5054,28 @@ void draw_home_profile_card(UiState& st, instances::Instance& instance, float wi
     ImGui::EndChild();
 }
 
+// One owner of wizard initialization.  Every entry point starts a fresh wizard at
+// step 0 with a usable default name, so opening it from Home cannot resume a
+// half-finished run from another screen or greet the user with a validation error
+// for a field they have not touched yet.
+void open_profile_wizard(UiState& st, int source, const std::string& name) {
+    st.wizard_open = true;
+    st.wizard_step = 0;
+    st.wizard_source = source;
+    st.wizard_preset = -1;
+    st.wizard_name = name;
+    st.wizard_version = st.selected;
+    st.wizard_loader = st.cfg->loader == "auto" ? "fabric" : st.cfg->loader;
+    st.wizard_project.clear();
+    st.wizard_prompt.clear();
+    st.wizard_archive.clear();
+    st.wizard_java.clear();
+    st.wizard_memory = 0;
+    st.wizard_performance_profile = st.cfg->performance_profile;
+    set_pack_summary(st, {});
+    st.pack_plan.clear();
+}
+
 void draw_home_create_card(UiState& st, float width, int index) {
     const float height = ui_px(232.0f);
     ImGui::BeginChild((std::string("##home_create_") + std::to_string(index)).c_str(),
@@ -5112,7 +5134,7 @@ void draw_home_create_card(UiState& st, float width, int index) {
     if (!account_modal_open && (ImGui::IsItemClicked() ||
         (ImGui::IsMouseHoveringRect(card_min, card_min + ImVec2(width, height)) &&
          ImGui::IsMouseClicked(ImGuiMouseButton_Left))))
-        st.wizard_open = true;
+        open_profile_wizard(st, 0, "My Modpack");
     ImGui::EndChild();
 }
 
@@ -5440,7 +5462,8 @@ void draw_home_tab(UiState& st) {
         ImGui::PopFont();
         ImGui::TextColored(k.muted, "Create a profile or install a modpack to get started.");
         ImGui::Spacing();
-        if (primary_button("Create Profile", ImVec2(ui_px(160.0f), ui_px(36.0f)))) st.wizard_open = true;
+        if (primary_button("Create Profile", ImVec2(ui_px(160.0f), ui_px(36.0f))))
+            open_profile_wizard(st, 0, "My Modpack");
         ImGui::SameLine();
         if (ghost_button("Browse Modpacks", ImVec2(ui_px(160.0f), ui_px(36.0f)))) { st.sidebar_item = 2; }
     } else {
@@ -9288,19 +9311,11 @@ void draw_instance_detail(UiState& st) {
                     }
                 }
                 st.version_change_kind = 0;
-                st.wizard_open = true;
-                st.wizard_step = 0;
-                st.wizard_source = 0;
-                st.wizard_name = inst.name.empty() ? inst.id : inst.name;
+                open_profile_wizard(st, 0, inst.name.empty() ? inst.id : inst.name);
                 st.wizard_version = inst.minecraft_version;
                 st.wizard_loader = inst.loader == "auto" ? "fabric" : inst.loader;
-                st.wizard_project.clear();
-                st.wizard_prompt.clear();
-                set_pack_summary(st, {});
-                st.pack_plan.clear();
                 st.wizard_memory = inst.memory_mb;
                 st.wizard_performance_profile = inst.performance_profile;
-                st.wizard_java.clear();
                 st.sidebar_item = 3;
                 st.active_tab = 6;
                 ImGui::CloseCurrentPopup();
@@ -10004,30 +10019,11 @@ void draw_instances_tab(UiState& st) {
     }
     ImGui::BeginChild("##packleft", ImVec2(0, 0));
     if (primary_button("+  Create Custom Profile", ImVec2(ui_px(190.0f), ui_px(38.0f)))) {
-        st.wizard_open = true;
-        st.wizard_step = 0;
-        st.wizard_source = 0;
-        st.wizard_preset = -1;
-        st.wizard_name = "My Modpack";
-        st.wizard_project.clear();
-        st.wizard_version = st.selected;
-        st.wizard_loader = st.cfg->loader == "auto" ? "fabric" : st.cfg->loader;
-        st.wizard_prompt.clear();
-        st.wizard_archive.clear();
-        set_pack_summary(st, {});
-        st.pack_plan.clear();
-        st.wizard_memory = 0;
-        st.wizard_performance_profile = st.cfg->performance_profile;
-        st.wizard_java.clear();
+        open_profile_wizard(st, 0, "My Modpack");
     }
     ImGui::SameLine();
     if (ghost_button("Import", ImVec2(ui_px(105.0f), ui_px(38.0f)))) {
-        st.wizard_open = true;
-        st.wizard_step = 0;
-        st.wizard_source = 4;
-        st.wizard_name = "Imported Modpack";
-        st.wizard_project.clear();
-        st.wizard_performance_profile = st.cfg->performance_profile;
+        open_profile_wizard(st, 4, "Imported Modpack");
     }
     ImGui::SameLine();
     if (ghost_button("Create Group", ImVec2(ui_px(140.0f), ui_px(38.0f)))) {
@@ -11860,12 +11856,13 @@ void draw_pack_wizard(UiState& st) {
                 ImGui::TextColored(col_error, "A description is required for AI planning.");
             }
             bool ai_ready = !st.pack_building && !st.wizard_prompt.empty() && !st.wizard_version.empty();
-            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ai_ready ? 1.0f : 0.5f);
-            if (primary_button(st.pack_building ? "Planning..." : "Plan with AI", ImVec2(ui_px(180.0f), ui_px(34.0f))) && ai_ready) {
+            // Pass the real disabled state: primary_button draws it itself, while a
+            // style alpha around it would not change any of its drawn colours.
+            if (primary_button(st.pack_building ? "Planning..." : "Plan with AI",
+                               ImVec2(ui_px(180.0f), ui_px(34.0f)), false, !ai_ready) && ai_ready) {
                 st.pack_prompt = st.wizard_prompt;
                 spawn_worker(st, std::thread(do_pack_build, std::ref(st)));
             }
-            ImGui::PopStyleVar();
             std::string pack_summary = pack_summary_snapshot(st);
             if (!pack_summary.empty()) {
                 ImGui::Spacing();
@@ -12173,13 +12170,13 @@ void draw_pack_wizard(UiState& st) {
             valid = st.wizard_source == 4 ||
                 version_catalog::supports(st.wizard_loader, st.wizard_version);
         }
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, valid ? 1.0f : 0.45f);
-        if (primary_button("Next", ImVec2(ui_px(110.0f), ui_px(34.0f))) && valid) ++st.wizard_step;
-        ImGui::PopStyleVar();
+        if (primary_button("Next", ImVec2(ui_px(110.0f), ui_px(34.0f)), false, !valid) && valid)
+            ++st.wizard_step;
     } else {
-        if (primary_button("Create Profile", ImVec2(ui_px(150.0f), ui_px(34.0f))) &&
-            (st.wizard_source == 4 ||
-             version_catalog::supports(st.wizard_loader, st.wizard_version))) {
+        const bool create_ready = st.wizard_source == 4 ||
+            version_catalog::supports(st.wizard_loader, st.wizard_version);
+        if (primary_button("Create Profile", ImVec2(ui_px(150.0f), ui_px(34.0f)), false, !create_ready) &&
+            create_ready) {
             if ((st.wizard_source == 1 || st.wizard_source == 2) && !st.wizard_project.empty()) {
                 st.mod_loader = st.wizard_loader;
                 st.mod_version = st.wizard_version;
