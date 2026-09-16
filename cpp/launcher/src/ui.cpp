@@ -4324,7 +4324,7 @@ void draw_sidebar(UiState& st) {
         const ImVec2 mark_pos = ImGui::GetCursorScreenPos();
         const ImVec2 mark_size(sidebar_width - ui_px(16.0f), ui_px(80.0f));
         draw_local_image(st, st.exe_dir + L"\\branding\\amalgam-logo.png", mark_pos, mark_size,
-                         c32(k.sidebar), ImageFit::Contain);
+                         c32(k.sidebar), ImageFit::ContainMark);
         ImGui::Dummy(mark_size);
         ImGui::Dummy(ImVec2(0, ui_px(6.0f)));
         ImGui::SetCursorPosX((sidebar_width - ui_px(34.0f)) * 0.5f);
@@ -4350,7 +4350,7 @@ void draw_sidebar(UiState& st) {
         logo_dl->AddRect(logo_pos, logo_pos + ImVec2(logo_h, logo_h),
                          c32(logo_border), ui_px(12.0f), 0, ui_px(1.0f));
         draw_local_image(st, st.exe_dir + L"\\branding\\amalgam-logo.png", logo_pos,
-                         ImVec2(logo_h, logo_h), c32(k.sidebar), ImageFit::Contain);
+                         ImVec2(logo_h, logo_h), c32(k.sidebar), ImageFit::ContainMark);
         ImGui::Dummy(ImVec2(logo_h, logo_h));
         ImGui::SameLine();
         ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, logo_pos.y + ui_px(4.0f)));

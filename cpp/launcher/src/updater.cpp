@@ -178,6 +178,19 @@ std::wstring default_manifest_url() {
 bool parse_manifest_text(const std::string& text, UpdateInfo& out, std::string* err) {
     if (err) err->clear();
 
+    // A host that answers with its own web page (unpublished feed, error page,
+    // captive portal) is the common case of a non-JSON body. Naming that says
+    // why no update can be verified; the JSON parser's "unexpected char '<'"
+    // does not. Still fails closed either way.
+    size_t first = text.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
+    if (first != std::string::npos && text[first] == '<') {
+        if (err)
+            *err =
+                "release server returned a web page instead of a signed update "
+                "manifest";
+        return false;
+    }
+
     Json root;
     std::string parse_error;
     root = Json::parse(text, &parse_error);

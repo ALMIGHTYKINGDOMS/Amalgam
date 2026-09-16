@@ -99,6 +99,12 @@ void test_manifest_parsing() {
 
     check(!aml::updater::parse_manifest_text("{not json", info, &err),
           "malformed JSON rejected");
+    // A host that serves its own web page instead of the feed (unpublished
+    // manifest) must be rejected with that reason, not a parser error.
+    check(!aml::updater::parse_manifest_text("\n  <!doctype html><html></html>", info,
+                                             &err) &&
+              err.find("web page") != std::string::npos,
+          "HTML feed body named as a web page");
     check(!aml::updater::parse_manifest_text("[]", info, &err),
           "non-object manifest rejected");
     check(!aml::updater::parse_manifest_text(

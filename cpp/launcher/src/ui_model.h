@@ -167,7 +167,14 @@ inline const char* operation_state_name(OperationState state) {
     return "Unknown";
 }
 
-enum class ImageFit { Cover, Contain };
+enum class ImageFit { Cover, Contain, ContainMark };
+
+// branding/amalgam-logo.png is a stacked lockup: the mark fills the top 74% of
+// the 1332x1181 artwork and the wordmark the remainder. Fitting the whole
+// lockup into a square tile renders that wordmark a few pixels tall, where it
+// reads as a second, garbled "AMALGAM" beside the header's own text, so
+// Contain fits whole artwork and ContainMark fits the mark band only.
+constexpr float kBrandMarkBand = 0.74f;
 
 // Image fitting is a model concern rather than a rendering concern. Keeping
 // it here makes the logo/banner/card behavior deterministic and testable at
@@ -188,10 +195,17 @@ inline ImagePlacement place_image(float x, float y, float width, float height,
     ImagePlacement placement{x, y, width, height};
     if (source_width <= 0 || source_height <= 0 || width <= 0.0f || height <= 0.0f)
         return placement;
+    // ContainMark fits only the source's top band, so the band's own aspect
+    // decides the placement and the band's edge becomes the texture's V limit.
+    float visible_height = 1.0f;
+    if (fit == ImageFit::ContainMark) {
+        visible_height = kBrandMarkBand;
+        placement.uv_max_y = visible_height;
+    }
     const float source_aspect = static_cast<float>(source_width) /
-                                static_cast<float>(source_height);
+                                (static_cast<float>(source_height) * visible_height);
     const float target_aspect = width / height;
-    if (fit == ImageFit::Contain) {
+    if (fit != ImageFit::Cover) {
         if (source_aspect > target_aspect) {
             placement.height = width / source_aspect;
             placement.y += (height - placement.height) * 0.5f;

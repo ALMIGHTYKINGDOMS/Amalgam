@@ -77,6 +77,18 @@ int main() {
                                                     aml::ui_model::ImageFit::Contain);
     assert(near(contain.x, 100.0f) && near(contain.width, 100.0f));
     assert(near(contain.y, 0.0f) && near(contain.height, 100.0f));
+    // ContainMark fits the mark band of the stacked logo, not the wordmark
+    // below it, and keeps the band's own proportions inside a square tile.
+    const auto mark = aml::ui_model::place_image(0.0f, 0.0f, 44.0f, 44.0f, 1332, 1181,
+                                                 aml::ui_model::ImageFit::ContainMark);
+    assert(near(mark.uv_max_y, aml::ui_model::kBrandMarkBand));
+    const float band_aspect = 1332.0f / (1181.0f * aml::ui_model::kBrandMarkBand);
+    assert(near(mark.width, 44.0f) && near(mark.height, 44.0f / band_aspect));
+    assert(near(mark.y, (44.0f - mark.height) * 0.5f));
+    const auto mark_wide = aml::ui_model::place_image(0.0f, 0.0f, 56.0f, 80.0f, 1332, 1181,
+                                                      aml::ui_model::ImageFit::ContainMark);
+    assert(near(mark_wide.width, 56.0f) && mark_wide.height <= 80.0f);
+    assert(near(mark_wide.y, (80.0f - mark_wide.height) * 0.5f));
 
     const float full_actions = aml::ui_model::topbar_action_width(false, 1.0f, 166.0f);
     const float full_start = aml::ui_model::topbar_action_start(100.0f, 900.0f,
