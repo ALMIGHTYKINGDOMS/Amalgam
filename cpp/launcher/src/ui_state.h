@@ -63,6 +63,11 @@ struct UiState {
     std::string selected;
     std::string selected_type;
     std::atomic_bool fetching{true};
+    // ImGui clock time of the last message the user acted with (mouse, keys,
+    // resize). The render loop keeps drawing at the display rate for a moment
+    // after one, so ImGui's own tweens (popup fades, tab scrolls, drags) are
+    // not stepped at the idle tick rate.
+    float last_activity_time = -1000.0f;
 
     std::string ui_base;
     std::string ui_assets;

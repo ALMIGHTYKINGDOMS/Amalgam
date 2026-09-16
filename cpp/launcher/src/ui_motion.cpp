@@ -11,7 +11,23 @@ namespace {
 // theme module directly. The theme_ui module registers its flag here.
 bool g_reduced_motion = false;
 
+// How many easing sweeps are in flight this frame. Written and read on the UI
+// thread only.
+int g_motion_in_flight = 0;
+
 }  // namespace
+
+void begin_motion_frame() {
+    g_motion_in_flight = 0;
+}
+
+void note_motion() {
+    ++g_motion_in_flight;
+}
+
+int motion_in_flight() {
+    return g_motion_in_flight;
+}
 
 void set_reduced_motion(bool enabled) {
     g_reduced_motion = enabled;

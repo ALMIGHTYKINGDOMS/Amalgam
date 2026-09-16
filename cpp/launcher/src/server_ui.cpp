@@ -98,6 +98,14 @@ static void reconcile_local_server_stages(std::vector<server::ServerConfig>& ser
     if (changed) save_local_servers(servers);
 }
 
+// Whether any server on this page is supervised and up. Its console and
+// metrics keep moving while it is, so the render loop keeps drawing for it.
+bool server_ui_has_live_server(UiState& st) {
+    for (const auto& sv : st.servers)
+        if (local_server_supervised(sv)) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // UI state singleton (codebase pattern)
 // ---------------------------------------------------------------------------

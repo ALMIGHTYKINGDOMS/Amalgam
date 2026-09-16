@@ -13881,6 +13881,73 @@ void sync_account_services(bool authenticated) {
     }
 }
 
+// How long the render loop may sit on the message queue while nothing can
+// change on screen. Short enough that any state a worker updates still reaches
+// the window promptly, long enough that an idle launcher is not waking itself
+// up in a hurry to draw a frame it already drew.
+constexpr DWORD kIdleTickMs = 120;
+
+// Pacing while something on screen is moving, and the slower cadence a window
+// behind another one keeps while work still changes its page.
+constexpr int64_t kDisplayFrameUs = 16667;      // ~60 FPS
+constexpr int64_t kBackgroundFrameUs = 250000;  // ~4 FPS
+
+// Work that can still change what is drawn while it runs: a launch, a job, a
+// download, or a provider or AI request.
+static bool work_in_flight(UiState& st) {
+    if (st.running || st.pending_launch || st.mod_installing || st.pack_building ||
+        st.java_installing || st.fetching || st.home_fetching || st.mod_fetching ||
+        st.wizard_resolving || st.project_loading || st.ai_chat_working ||
+        st.ai_vision_working || st.ai_art_working || st.auth_working ||
+        st.readiness_testing || st.pack_update_checking || st.owned_update_checking ||
+        st.project_translation_working || st.curseforge_testing)
+        return true;
+    std::lock_guard<std::mutex> lock(st.jobs_mu);
+    for (const auto& job : st.jobs)
+        if (job.active || job.queued) return true;
+    return false;
+}
+
+// Whether a message means the user did something to the window (or the window
+// itself changed shape) rather than the system's bookkeeping. Treating every
+// message as activity would hold the loop at the display rate whenever Windows
+// sent it one, and it sends some while the user works elsewhere.
+static bool wakes_window(const MSG& m) {
+    switch (m.message) {
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
+        case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+        case WM_ACTIVATE: case WM_SIZE: case WM_DPICHANGED: case WM_SHOWWINDOW:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Whether this iteration must build and present a frame, and how fast:
+//   0 = nothing on screen can change, so wait on the message queue instead
+//   1 = draw at the display rate
+//   2 = draw at the background rate (the window is not in front of the user,
+//       but animation or work is still changing what the page shows)
+// Animation reports itself through the motion counter: easing sweeps and the
+// spinners, shimmering placeholders, indeterminate bars and toasts that run on
+// the clock, none of which the loop can otherwise know about.
+int ui_frame_pacing(UiState& st) {
+    if (!st.capture_path.empty()) return 1;  // a review frame is being awaited
+    // The splash animates itself and owns the window for its first seconds.
+    const bool splash = aml::ui::LoadingScreen::instance().is_visible();
+    if (!splash && aml::ui::motion_in_flight() == 0 &&
+        ImGui::GetTime() - st.last_activity_time >= 0.4f &&
+        !work_in_flight(st) && !server_ui_has_live_server(st))
+        return 0;
+    return (splash || GetForegroundWindow() == st.hwnd) ? 1 : 2;
+}
+
 bool run_window(config::Config* cfg, const RunOptions& options) {
     // Win32 would otherwise bitmap-scale the entire OpenGL surface on a
     // high-DPI display.  That produces blurry text and icons regardless of
@@ -14124,13 +14191,27 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         // one-millisecond sleep still allowed several hundred frames per
         // second on many systems, competing with Minecraft and background
         // downloads for CPU/GPU time.
-        const auto frame_started = std::chrono::steady_clock::now();
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (wakes_window(msg)) st.last_activity_time = static_cast<float>(ImGui::GetTime());
             if (msg.message == WM_QUIT) done = true;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
         if (done) break;
+
+        const int pacing = ui_frame_pacing(st);
+        if (pacing == 0) {
+            // Nothing on screen can change until the user acts or a worker
+            // updates state, so wait on the message queue instead of building
+            // and presenting an identical frame again. Input, a posted wakeup,
+            // and the tick below all bring the loop straight back.
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, kIdleTickMs, QS_ALLINPUT);
+            continue;
+        }
+
+        // Keep the desktop shell responsive without letting an uncapped render
+        // loop consume a full CPU core while the user is idle.
+        const auto frame_started = std::chrono::steady_clock::now();
 
         if (g_pending_ui_scale > 0.0f) {
             const float requested_scale = g_pending_ui_scale;
@@ -14181,6 +14262,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
             }));
         }
 
+        aml::ui::begin_motion_frame();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -14278,9 +14360,10 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         }
         SwapBuffers(hdc);
 
-        constexpr auto kFrameBudget = std::chrono::microseconds(16667); // ~60 FPS
-        const auto remaining = kFrameBudget -
-            (std::chrono::steady_clock::now() - frame_started);
+        const auto frame_budget = std::chrono::microseconds(
+            pacing == 2 ? kBackgroundFrameUs : kDisplayFrameUs);
+        const auto remaining =
+            frame_budget - (std::chrono::steady_clock::now() - frame_started);
         if (remaining > std::chrono::microseconds::zero()) {
             const auto sleep_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
             Sleep(static_cast<DWORD>(std::max<int64_t>(1, sleep_ms)));

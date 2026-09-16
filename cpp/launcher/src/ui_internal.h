@@ -294,6 +294,7 @@ void draw_admin_login(UiState& st);
 // Server V2 UI (defined in server_ui.cpp)
 // ---------------------------------------------------------------------------
 void draw_server_manager(UiState& st);
+bool server_ui_has_live_server(UiState& st);
 void set_fixture_server_mode(int mode);
 void set_fixture_server_detail(int server_index, int tab);
 

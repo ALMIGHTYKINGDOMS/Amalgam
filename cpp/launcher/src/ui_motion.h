@@ -26,6 +26,21 @@ bool motion_enabled();
 // Registered by the theme UI when the user toggles Reduced Motion.
 void set_reduced_motion(bool enabled);
 
+// ---------------------------------------------------------------------------
+// Frames requested by animation
+//
+// Easing sweeps call note_motion() while they are still moving, so the main
+// loop can render at the display rate only while something is actually
+// animating instead of holding a 60 Hz loop open for a window nobody is
+// changing. The loop calls begin_motion_frame() before drawing and reads
+// motion_in_flight() afterwards, which is why the counter is cleared per frame
+// rather than left to drain on its own.
+// ---------------------------------------------------------------------------
+
+void begin_motion_frame();
+void note_motion();
+int motion_in_flight();
+
 // Easing curve: cubic ease-out — fast start, gentle settle. This is the
 // signature curve of the "restrained premium" feel.
 float ease_out_cubic(float t);
@@ -79,6 +94,7 @@ struct AnimFloat {
             return current;
         }
         if (settled()) return current;
+        note_motion();
         const float t = std::clamp(delta_seconds / std::max(0.001f, duration), 0.0f, 1.0f);
         const float eased = ease_out_cubic(t);
         current = motion_lerp(current, target_value, eased);

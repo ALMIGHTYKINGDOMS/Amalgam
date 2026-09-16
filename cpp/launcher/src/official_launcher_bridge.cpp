@@ -49,7 +49,10 @@ std::string utc_timestamp() {
 // Search for the Minecraft Launcher in common desktop and Store locations.
 // NOTE: Microsoft.MinecraftJavaEdition is the game package. The Store
 // launcher package exposes GameLaunchHelper.exe as its full-trust entry point.
-std::wstring find_appx_launcher() {
+// Resolving the Store package costs a PowerShell round trip (hundreds of
+// milliseconds), and the sidebar asks whether the official launcher exists on
+// every frame, so the answer is resolved once per process.
+std::wstring find_appx_launcher_uncached() {
     const std::wstring local = env_path(L"LOCALAPPDATA");
     const wchar_t* package_names[] = {
         L"Microsoft.4297127D64EC6",
@@ -108,6 +111,11 @@ std::wstring find_appx_launcher() {
         if (!candidate.empty()) return candidate;
     }
     return std::wstring();
+}
+
+std::wstring find_appx_launcher() {
+    static const std::wstring resolved = find_appx_launcher_uncached();
+    return resolved;
 }
 
 }  // namespace

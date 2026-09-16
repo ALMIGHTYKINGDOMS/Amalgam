@@ -224,6 +224,7 @@ bool primary_button(const char* label, const ImVec2& size, bool loading, bool di
     }
     
     if (loading && !disabled) {
+        note_motion();  // the spinner keeps turning while it is on screen
         ImVec2 center(bmax.x - ui_px(15.0f), (bmin.y + bmax.y) * 0.5f);
         float radius = ui_px(6.0f);
         float time = static_cast<float>(ImGui::GetTime());
@@ -537,6 +538,7 @@ void progress_bar(float progress, const ImVec2& size, const char* overlay_text,
     
     // Add striped pattern for indeterminate progress
     if (normalized_progress < 0.0f) {
+        note_motion();  // the stripes keep marching while progress is unknown
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 p_min = ImGui::GetItemRectMin();
         ImVec2 p_max = ImGui::GetItemRectMax();
@@ -934,6 +936,7 @@ void draw_status_indicator(const ImVec4& color, const char* label) {
 // ---------------------------------------------------------------------------
 
 void draw_loading_spinner(float size) {
+    note_motion();  // the arc keeps turning while it is on screen
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 center = ImGui::GetCursorScreenPos() + ImVec2(size * 0.5f, size * 0.5f);
     float radius = size * 0.4f;
@@ -1183,6 +1186,7 @@ void draw_toasts() {
     );
     
     if (g_toast_state.toasts.empty()) return;
+    note_motion();  // a toast slides in, then fades and expires on its own
     
     // Draw toasts with entrance animation and accent strip
     float y_offset = ui_px(16.0f);
@@ -1295,6 +1299,7 @@ void draw_search_highlight(const char* text, const char* search_query) {
 // ---------------------------------------------------------------------------
 
 void draw_skeleton_rect(const ImVec2& pos, const ImVec2& size, float rounding) {
+    note_motion();  // the shimmer keeps sweeping while the placeholder stands
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // Subtle pulsing skeleton effect
     const float time = static_cast<float>(ImGui::GetTime());
