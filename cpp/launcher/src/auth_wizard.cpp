@@ -806,7 +806,8 @@ static void draw_fixture_microsoft_login_state(UiState& st) {
     const bool fallback = fixture_case == "dialog-microsoft-sign-in-official-launcher-fallback";
     const bool error = fixture_case == "dialog-microsoft-sign-in-error";
     if (st.microsoft_login_popup_open) ImGui::OpenPopup("Microsoft Sign In");
-    if (!begin_staged_fixture_popup("Microsoft Sign In", 700.0f, 540.0f)) return;
+    const float fixture_height = (fallback || error) ? 430.0f : 540.0f;
+    if (!begin_staged_fixture_popup("Microsoft Sign In", 700.0f, fixture_height)) return;
     draw_wizard_hero(st, "MINECRAFT ACCESS", "Connect Microsoft",
                      "Use Microsoft’s secure browser page, or choose the official Minecraft Launcher when you play.");
     ImGui::Spacing();
@@ -1246,23 +1247,6 @@ void draw_microsoft_login_dialog(UiState& st) {
         ImGui::OpenPopup("Microsoft Sign In");
     }
     bool popup_open = st.microsoft_login_popup_open;
-    position_wizard_modal(700.0f, 540.0f);
-    if (!ImGui::BeginPopupModal("Microsoft Sign In", &popup_open,
-                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
-        return;
-    }
-
-    auto close_login = [&]() {
-        popup_open = false;
-        st.microsoft_login_popup_open = false;
-        st.login_wizard_open = false;
-        ImGui::CloseCurrentPopup();
-    };
-
-    draw_wizard_hero(st, "MINECRAFT ACCESS", "Connect Microsoft",
-                     "Sign in here to play directly, or hand your prepared profile to the Minecraft Launcher instead.");
-    ImGui::Spacing();
-
     int state = 0;
     std::string uri;
     std::string code;
@@ -1278,6 +1262,23 @@ void draw_microsoft_login_dialog(UiState& st) {
         status = st.auth_status;
         account_username = st.account.username;
     }
+    const float preferred_height = state == 3 ? 430.0f : (state == 2 ? 400.0f : 540.0f);
+    position_wizard_modal(700.0f, preferred_height);
+    if (!ImGui::BeginPopupModal("Microsoft Sign In", &popup_open,
+                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+        return;
+    }
+
+    auto close_login = [&]() {
+        popup_open = false;
+        st.microsoft_login_popup_open = false;
+        st.login_wizard_open = false;
+        ImGui::CloseCurrentPopup();
+    };
+
+    draw_wizard_hero(st, "MINECRAFT ACCESS", "Connect Microsoft",
+                     "Sign in here to play directly, or hand your prepared profile to the Minecraft Launcher instead.");
+    ImGui::Spacing();
 
     if (state == 1 && !code.empty()) {
         card_begin("##microsoft_device_code", ImVec2(-1, 0));

@@ -193,3 +193,11 @@ Current hard gates: the EXE-only updater transaction; unbuilt server/diagnostics
 - [x] Correct the stale `play.amalgam-network.com:9564` default to the canonical `play.amalgam-network.com` address supplied by the owner.
 - [x] Add and pass a regression test covering the canonical Amalgam Network name and address.
 - [x] Repeat the audit after rebuilding: native 45/45, runtime-agent 38/38, manifest 12/12, scanner 2/2, Bedrock static 4/4, production schema 66/66, live Supabase verifier PASS, package/runtime validation PASS, candidate scan 0 matches, and visual registry parity PASS.
+
+## 2026-09-24 — Final deep-audit closure
+
+- [x] Rebuilt and bound the latest verification binary after the final responsive modal polish; the active launcher remains untouched because it holds the canonical output open.
+- [x] Re-ran the complete native suite (45/45), launcher preflights (3/3), runtime-agent (38/38), Bedrock static truth/validator (4/4 plus validator), update-manifest (12/12), secret scanner (2/2 plus scoped 287-file scan), Supabase source (26 migrations / 24 Edge Functions), and production schema (66/66).
+- [x] Recaptured and manually inspected the affected Bedrock Coming Soon and Microsoft approval-pending routes at both host-valid responsive tiers; 8/8 captures passed with no nested/horizontal-scroll or modal-spacing defect.
+- [x] Completed a read-only live Supabase audit and classified advisor findings as intentional/non-blocking or owner-configured; no unsafe live schema mutation was made during this final pass.
+- [x] Final repository-resolvable polish is complete for this audit. The remaining checklist is external certification/owner work only: close the running launcher and bind the canonical hash, Microsoft/Xbox approval, trusted signing/timestamping, update hosting/signature, live provider verification, Supabase leaked-password protection, and clean-machine/real Java handoff.
