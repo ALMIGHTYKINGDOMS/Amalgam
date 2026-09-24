@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "suite": "Amalgam launcher visual-QA example",
+  "cases": [
+    {
+      "id": "home-initial",
+      "route": "home",
+      "annotation": "Home page, initial desktop state",
+      "scroll": "top"
+    },
+    {
+      "id": "library-initial",
+      "route": "library",
+      "annotation": "Library page, initial desktop state",
+      "scroll": "top"
+    },
+    {
+      "id": "profile-content-empty",
+      "route": "profile-content",
+      "annotation": "Profile Content, empty-inventory state",
+      "scroll": "top"
+    }
+  ]
+}

@@ -19,11 +19,12 @@ namespace aml::ui {
 // Global gate
 // ---------------------------------------------------------------------------
 
-// Whether animations are enabled at all. Returns false when the user has
-// reduced motion enabled (theme_ui reduced_motion). Cheap to call every frame.
+// Whether animations are enabled at all. Returns false when the persisted
+// reduced-motion preference is active. Cheap to call every frame.
 bool motion_enabled();
 
-// Registered by the theme UI when the user toggles Reduced Motion.
+// Updated by the shared persisted-theme applier at startup, reload, and when
+// the user toggles Reduced Motion.
 void set_reduced_motion(bool enabled);
 
 // ---------------------------------------------------------------------------

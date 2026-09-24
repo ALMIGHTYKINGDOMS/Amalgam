@@ -1,5 +1,6 @@
 #include "services.h"
 
+#include "extract.h"
 #include "json.h"
 
 #include "net.h"
@@ -9,6 +10,7 @@
 #include "java.h"
 
 #include <windows.h>
+#include <psapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -28,6 +30,7 @@
 #include <thread>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "psapi.lib")
 
 namespace aml::services {
 
@@ -364,34 +367,6 @@ services::NodeInfo node_to_info(const aml::servers::Node& n) {
     }
     info.metadata = n.metadata;
     return info;
-}
-
-aml::servers::Node info_to_node(const services::NodeInfo& info) {
-    aml::servers::Node n;
-    n.id = info.id;
-    n.name = info.name;
-    n.host = info.host;
-    n.port = info.port;
-    n.cpu_cores = info.cpu_cores;
-    n.memory_mb = static_cast<int>(info.memory_total / (1024ULL * 1024ULL));
-    n.storage_gb = static_cast<int>(info.storage_capacity / (1024ULL * 1024ULL * 1024ULL));
-    n.status = info.online ? aml::servers::NodeStatus::Online : aml::servers::NodeStatus::Offline;
-    n.last_heartbeat = info.last_heartbeat;
-    n.registered_at = info.last_heartbeat;
-    if (!info.tags.empty()) {
-        std::string tags;
-        for (size_t i = 0; i < info.tags.size(); ++i) {
-            if (i > 0) tags += ",";
-            tags += info.tags[i];
-        }
-        n.metadata["tags"] = tags;
-    }
-    n.metadata["region"] = info.region;
-    n.metadata["zone"] = info.zone;
-    for (const auto& kv : info.metadata) {
-        n.metadata[kv.first] = kv.second;
-    }
-    return n;
 }
 
 services::ClusterInfo cluster_to_info(const aml::servers::Cluster& c, const aml::servers::ServerManager& mgr) {
@@ -1222,6 +1197,8 @@ struct ServerManager::LocalServerTransport {
     std::mutex write_mutex;
     std::mutex output_mutex;
     std::deque<std::string> output_lines;
+    std::chrono::steady_clock::time_point metrics_sample_at{};
+    uint64_t metrics_cpu_100ns = 0;
 };
 
 ServerManager::ServerManager(const ServiceConfig& config) : config_(config) {}
@@ -1296,16 +1273,10 @@ ServerInfo ServerManager::create_server(const ServerCreateRequest& request, std:
     }
     info.id = generate_uuid();
     info.name = request.name;
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    aml::essentials::ServerAddressResolver address_resolver;
     info.alias = request.alias.empty()
         ? aml::essentials::ServerAddressResolver::Generate(request.name)
         : aml::essentials::ServerAddressResolver::NormalizeAlias(request.alias);
     info.address = aml::essentials::ServerAddressResolver::ToAddress(info.alias);
-    if (supabase.is_authenticated() && !address_resolver.IsAvailable(info.alias)) {
-        if (error) *error = "Server address is unavailable or Supabase address migration is missing";
-        return ServerInfo();
-    }
     info.version = request.version;
     info.type = request.type;
     info.motd = request.motd;
@@ -1416,23 +1387,11 @@ ServerInfo ServerManager::create_server(const ServerCreateRequest& request, std:
         return fail_creation(stream_failure(eula_path, "Failed to close EULA after writing"));
     }
     
-    if (supabase.is_authenticated()) {
-        aml::supabase::SupabaseServer remote;
-        remote.id = info.id;
-        remote.name = info.name;
-        remote.alias = info.alias;
-        remote.address = info.address;
-        remote.host = "127.0.0.1";
-        remote.port = info.port;
-        remote.version = info.version;
-        remote.type = info.type;
-        remote.motd = info.motd;
-        remote.max_players = info.max_players;
-        remote.online = false;
-        if (supabase.create_server(remote).id.empty()) {
-            return fail_creation("Server was created locally but could not be registered for its .amalgam address");
-        }
-    }
+    // This service owns local folders and local Java processes only. Cloud
+    // records and public address allocation are explicit control-plane
+    // operations elsewhere, never incidental side effects of creating a
+    // local server. That keeps this synchronous local helper safe to use
+    // without an authenticated remote-session dependency.
     return info;
 }
 
@@ -1552,14 +1511,25 @@ ServerInfo ServerManager::get_server_info(const std::string& server_id, std::str
 
     Json registry;
     std::string registry_error;
-    const std::wstring registry_path = net::get_local_app_data_path() +
-                                       L"\\amalgam\\servers.json";
+    // A probe or test run points the supervisor at a temporary root, and then
+    // the registry has to come from there as well: reading the real one would
+    // make a start depend on a user's own server still holding its port.
+    std::wstring registry_path = net::get_local_app_data_path() +
+                                 L"\\amalgam\\servers.json";
+    wchar_t registry_root[32768]{};
+    const DWORD registry_root_size = GetEnvironmentVariableW(
+        L"AMALGAM_SERVER_ROOT", registry_root,
+        static_cast<DWORD>(std::size(registry_root)));
+    if (registry_root_size > 0 && registry_root_size < std::size(registry_root)) {
+        registry_path = (std::filesystem::path(registry_root) / L"servers.json").wstring();
+    }
     if (json_parse_file(registry_path, registry, &registry_error) && registry.isArray()) {
         for (size_t i = 0; i < registry.size(); ++i) {
             const Json& entry = registry[i];
             if (entry.get("name").as_str() != server_id) continue;
             info.name = entry.get("name").as_str(server_id);
             info.version = entry.get("minecraft_version").as_str("1.20.1");
+            info.software = static_cast<int>(entry.get("software").as_int(0));
             info.port = static_cast<int>(entry.get("port").as_int(25565));
             info.max_players = static_cast<int>(entry.get("max_players").as_int(20));
             info.allocated_ram_mb =
@@ -1655,18 +1625,61 @@ std::vector<ServerInfo> ServerManager::list_servers(std::string* error) {
 }
 
 bool ServerManager::ping_server(const std::string& server_id, ServerInfo* info) {
-    auto it = running_servers_.find(server_id);
-    ServerInfo* target = info ? info : (it != running_servers_.end() ? &it->second : nullptr);
+    // Copy a supervised entry before probing so a stop/restart cannot erase or
+    // replace the map element while this potentially multi-second TCP check is
+    // in flight. The service mutex also keeps a process handle valid while we
+    // make the zero-time liveness check below.
+    ServerInfo local_snapshot;
+    bool has_local_entry = false;
+    bool local_process_not_running = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = running_servers_.find(server_id);
+        has_local_entry = it != running_servers_.end();
+        if (has_local_entry && !info) local_snapshot = it->second;
+
+        const bool target_offline = info
+            ? !info->online
+            : (has_local_entry && !local_snapshot.online);
+        if (has_local_entry && target_offline) {
+            local_process_not_running = !it->second.process_handle ||
+                WaitForSingleObject(it->second.process_handle, 0) == WAIT_OBJECT_0;
+        }
+    }
+
+    ServerInfo* target = info ? info : (has_local_entry ? &local_snapshot : nullptr);
     if (!target) {
         if (info) {
             *info = get_server_info(server_id);
         }
         return false;
     }
-    
-    if (!target->online && (!it->second.process_handle || WaitForSingleObject(it->second.process_handle, 0) == WAIT_OBJECT_0)) {
+
+    // Persist only a probe that still belongs to the same supervised process.
+    // A stop/start can reuse the server id while this function is connecting;
+    // it must not inherit an older process's health result.
+    const DWORD expected_process_id = local_snapshot.process_id;
+    const auto persist_local_probe = [&] {
+        if (info || !has_local_entry) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto current = running_servers_.find(server_id);
+        if (current == running_servers_.end() ||
+            current->second.process_id != expected_process_id) {
+            return;
+        }
+        current->second.online = target->online;
+        current->second.ping_ms = target->ping_ms;
+        current->second.last_ping = target->last_ping;
+    };
+
+    // An explicit probe target may describe a remote/control-plane server
+    // that is not registered with this local process supervisor. Only use a
+    // known local process to short-circuit an offline result; otherwise run
+    // the TCP probe below.
+    if (!target->online && has_local_entry && local_process_not_running) {
         target->online = false;
         target->ping_ms = 0;
+        persist_local_probe();
         return false;
     }
     
@@ -1676,6 +1689,7 @@ bool ServerManager::ping_server(const std::string& server_id, ServerInfo* info) 
     if (sock == INVALID_SOCKET) {
         target->online = false;
         target->ping_ms = 0;
+        persist_local_probe();
         return false;
     }
     
@@ -1701,6 +1715,7 @@ bool ServerManager::ping_server(const std::string& server_id, ServerInfo* info) 
             closesocket(sock);
             target->online = false;
             target->ping_ms = 0;
+            persist_local_probe();
             return false;
         }
     }
@@ -1717,8 +1732,9 @@ bool ServerManager::ping_server(const std::string& server_id, ServerInfo* info) 
         target->online = false;
         target->ping_ms = 0;
     }
-    
+
     closesocket(sock);
+    persist_local_probe();
     return target->online;
 }
 
@@ -1784,6 +1800,67 @@ std::vector<ServerConsoleEntry> ServerManager::get_console_logs(const std::strin
     }
     
     return entries;
+}
+
+LocalServerMetrics ServerManager::get_local_server_metrics(const std::string& server_id,
+                                                           std::string* error) {
+    LocalServerMetrics metrics;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto server_it = running_servers_.find(server_id);
+    const auto transport_it = local_transports_.find(server_id);
+    if (server_it == running_servers_.end() || transport_it == local_transports_.end() ||
+        !transport_it->second || !server_it->second.process_handle) {
+        if (error) *error = "Server process telemetry is unavailable while the server is stopped";
+        return metrics;
+    }
+
+    HANDLE process = server_it->second.process_handle;
+    if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+        if (error) *error = "The supervised server process has exited";
+        return metrics;
+    }
+
+    metrics.valid = true;
+    PROCESS_MEMORY_COUNTERS_EX memory{};
+    if (GetProcessMemoryInfo(process,
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                             sizeof(memory))) {
+        metrics.memory_valid = true;
+        metrics.working_set_bytes = static_cast<uint64_t>(memory.WorkingSetSize);
+    }
+
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+        const auto to_100ns = [](const FILETIME& value) -> uint64_t {
+            ULARGE_INTEGER result{};
+            result.LowPart = value.dwLowDateTime;
+            result.HighPart = value.dwHighDateTime;
+            return static_cast<uint64_t>(result.QuadPart);
+        };
+        const uint64_t process_cpu_100ns = to_100ns(kernel) + to_100ns(user);
+        const auto now = std::chrono::steady_clock::now();
+        auto& transport = *transport_it->second;
+        if (transport.metrics_sample_at.time_since_epoch().count() != 0) {
+            const double elapsed_seconds =
+                std::chrono::duration<double>(now - transport.metrics_sample_at).count();
+            const uint64_t delta_cpu_100ns = process_cpu_100ns >= transport.metrics_cpu_100ns
+                ? process_cpu_100ns - transport.metrics_cpu_100ns : 0;
+            SYSTEM_INFO system_info{};
+            GetSystemInfo(&system_info);
+            const unsigned int processor_count = std::max(1u,
+                static_cast<unsigned int>(system_info.dwNumberOfProcessors));
+            if (elapsed_seconds >= 0.05 && delta_cpu_100ns > 0) {
+                const double process_seconds = static_cast<double>(delta_cpu_100ns) / 10000000.0;
+                metrics.cpu_percent = static_cast<float>(std::clamp(
+                    process_seconds / elapsed_seconds * 100.0 / processor_count,
+                    0.0, 100.0));
+                metrics.cpu_valid = true;
+            }
+        }
+        transport.metrics_sample_at = now;
+        transport.metrics_cpu_100ns = process_cpu_100ns;
+    }
+    return metrics;
 }
 
 bool ServerManager::send_command(const std::string& server_id, const std::string& command, 
@@ -1922,28 +1999,99 @@ bool ServerManager::create_backup(const std::string& server_id, const std::strin
 
 bool ServerManager::restore_backup(const std::string& server_id, const std::string& backup_id, 
                                   std::string* error) {
+    if (!valid_server_identifier(server_id)) {
+        if (error) *error = "Server ID is invalid";
+        return false;
+    }
     if (!valid_server_identifier(backup_id)) {
         if (error) *error = "Backup ID is invalid";
+        return false;
+    }
+    if (is_local_server_running(server_id)) {
+        if (error) *error = "Stop the local server before restoring a backup";
         return false;
     }
     std::filesystem::path backup_dir = std::filesystem::path(net::get_local_app_data_path()) /
                                       L"Amalgam" / L"Backups" / net::to_wide(backup_id);
     std::filesystem::path server_dir = std::filesystem::path(get_server_path(server_id));
-    
     std::error_code ec;
-    std::filesystem::create_directories(server_dir, ec);
-    if (ec) {
-        if (error) *error = "Failed to create server directory";
+
+    if (!std::filesystem::is_directory(backup_dir, ec) || ec) {
+        if (error) *error = "Backup files were not found or cannot be read";
         return false;
     }
-    
-    // Copy backup to server
-    std::filesystem::copy(backup_dir, server_dir, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+
+    // Preserve a complete, visible pre-restore recovery point before touching
+    // the live directory. If that copy cannot be made, there is no restore.
+    const bool has_live_server = std::filesystem::exists(server_dir, ec) && !ec;
+    std::string pre_restore_backup;
+    if (has_live_server) {
+        std::string backup_error;
+        if (!create_backup(server_id, "pre-restore", &pre_restore_backup, &backup_error)) {
+            if (error) {
+                *error = "Could not create a pre-restore backup; the live server was not changed";
+                if (!backup_error.empty()) *error += ": " + backup_error;
+            }
+            return false;
+        }
+    }
+
+    std::filesystem::create_directories(server_dir.parent_path(), ec);
     if (ec) {
-        if (error) *error = "Failed to restore backup files";
+        if (error) *error = "Failed to prepare the server directory";
         return false;
     }
-    
+
+    // Stage the entire replacement next to the live directory. A failed copy
+    // leaves the current server untouched, and sibling renames stay on one
+    // volume when promotion succeeds.
+    const std::wstring op_id = net::to_wide(generate_uuid());
+    std::filesystem::path staging_dir = server_dir;
+    staging_dir += L".restore-staging-" + op_id;
+    std::filesystem::path rollback_dir = server_dir;
+    rollback_dir += L".restore-rollback-" + op_id;
+    std::filesystem::remove_all(staging_dir, ec);
+    ec.clear();
+    std::filesystem::copy(backup_dir, staging_dir, std::filesystem::copy_options::recursive, ec);
+    if (ec) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove_all(staging_dir, cleanup_ec);
+        if (error) *error = "Failed to stage backup files; the live server was not changed";
+        return false;
+    }
+
+    bool moved_live_server = false;
+    if (has_live_server) {
+        std::filesystem::rename(server_dir, rollback_dir, ec);
+        if (ec) {
+            std::error_code cleanup_ec;
+            std::filesystem::remove_all(staging_dir, cleanup_ec);
+            if (error) *error = "Could not prepare the live server for restore; it was not changed";
+            return false;
+        }
+        moved_live_server = true;
+    }
+
+    std::filesystem::rename(staging_dir, server_dir, ec);
+    if (ec) {
+        std::error_code rollback_ec;
+        if (moved_live_server) std::filesystem::rename(rollback_dir, server_dir, rollback_ec);
+        if (error) {
+            *error = rollback_ec
+                ? "Backup promotion failed and the previous server is retained at " +
+                      net::to_utf8(rollback_dir.wstring())
+                : "Backup promotion failed; the previous server was restored";
+        }
+        return false;
+    }
+
+    // The durable pre-restore backup created above remains in the normal
+    // Backups list. The short-lived rollback directory is now redundant; a
+    // cleanup failure is deliberately non-fatal because it is recoverable.
+    if (moved_live_server) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove_all(rollback_dir, cleanup_ec);
+    }
     return true;
 }
 
@@ -2041,11 +2189,74 @@ bool ServerManager::start_local_server(const std::string& server_id, const std::
     forget_local_server(server_id);
     
     std::filesystem::path server_dir = std::filesystem::path(get_server_path(server_id));
-    
-    std::wstring jar_path = (server_dir / "server.jar").wstring();
-    if (!net::file_exists(jar_path)) {
-        if (error) *error = "server.jar not found at " + net::to_utf8(jar_path);
+    const auto software = static_cast<server::ServerSoftware>(info.software);
+    const int memory_mb = ram_mb > 0 ? ram_mb : 2048;
+
+    // What launches this server depends on how it was created: a plain server
+    // jar, a loader whose installer wrote an argument file or a launcher jar,
+    // or Bedrock's own executable. resolve_launch_target is the same answer the
+    // Servers page uses to decide whether the files are installed at all, so a
+    // Start is only offered when this can succeed.
+    server::ServerConfig launch_config;
+    launch_config.software = software;
+    launch_config.server_directory = net::to_utf8(server_dir.wstring());
+    const server::LaunchTarget target = server::resolve_launch_target(launch_config);
+    if (target.kind == server::LaunchTarget::Kind::Missing) {
+        if (error) {
+            *error = std::string(server::server_software_name(software)) +
+                     " is not installed in " + net::to_utf8(server_dir.wstring()) +
+                     ". Use Prepare server files to download it.";
+        }
         return false;
+    }
+
+    std::wstring executable;
+    std::wstring launch_args;
+    if (target.kind == server::LaunchTarget::Kind::NativeExecutable) {
+        executable = target.path.wstring();
+    } else {
+        if (!java_path.empty()) {
+            executable = net::to_wide(java_path);
+        } else {
+            executable = resolve_local_server_java(info.version, error);
+            if (executable.empty()) return false;
+        }
+        if (target.kind == server::LaunchTarget::Kind::LoaderArgs) {
+            // The loader's installer owns its launch arguments; read them at
+            // start time so a repaired install is picked up without a rewrite,
+            // and let this server's memory allocation drive user_jvm_args.txt.
+            const std::wstring jvm_args = server_dir.wstring() + L"\\user_jvm_args.txt";
+            std::ofstream args(std::filesystem::path(jvm_args), std::ios::trunc);
+            if (!args) {
+                if (error) {
+                    *error = "Could not write user_jvm_args.txt in " +
+                             net::to_utf8(server_dir.wstring());
+                }
+                return false;
+            }
+            args << "# Written by Amalgam from this server's memory allocation.\n"
+                 << "-Xms512M\n"
+                 << "-Xmx" << memory_mb << "M\n";
+            args.close();
+            if (!args) {
+                if (error) {
+                    *error = "Could not finish user_jvm_args.txt in " +
+                             net::to_utf8(server_dir.wstring());
+                }
+                return false;
+            }
+            // The loader installer owns its response file; our response file
+            // owns memory settings. Each must stay one command-line argument
+            // when a normal display name creates a path with spaces.
+            launch_args = extract::at_file_argument(jvm_args) + L" " +
+                          extract::at_file_argument(target.path.wstring()) + L" nogui";
+        } else {
+            // Proxies have no console window to suppress and reject arguments
+            // they do not define, so only real servers get `nogui`.
+            launch_args = L"-Xms512M -Xmx" + std::to_wstring(memory_mb) + L"M -jar " +
+                          target.path.filename().wstring() +
+                          (server::is_proxy_software(software) ? L"" : L" nogui");
+        }
     }
 
     // A port another process answers on makes the server exit as soon as it
@@ -2056,16 +2267,8 @@ bool ServerManager::start_local_server(const std::string& server_id, const std::
         return false;
     }
     
-    std::wstring wjava;
-    if (!java_path.empty()) {
-        wjava = net::to_wide(java_path);
-    } else {
-        wjava = resolve_local_server_java(info.version, error);
-        if (wjava.empty()) return false;
-    }
-    const int memory_mb = ram_mb > 0 ? ram_mb : 2048;
-    std::wstring full_cmd = L"\"" + wjava + L"\" -Xms512M -Xmx" +
-                            std::to_wstring(memory_mb) + L"M -jar server.jar nogui";
+    const std::wstring wjava = executable;
+    std::wstring full_cmd = L"\"" + wjava + L"\"" + (launch_args.empty() ? L"" : L" " + launch_args);
 
     SECURITY_ATTRIBUTES pipe_security{};
     pipe_security.nLength = sizeof(pipe_security);
@@ -2174,22 +2377,10 @@ bool ServerManager::start_local_server(const std::string& server_id, const std::
         if (!pending.empty()) publish_line(std::move(pending));
     });
 
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    if (supabase.is_authenticated()) {
-        aml::supabase::SupabaseServer remote;
-        remote.id = info.id;
-        remote.name = info.name;
-        remote.alias = info.alias;
-        remote.address = info.address;
-        remote.host = "127.0.0.1";
-        remote.port = info.port;
-        remote.version = info.version;
-        remote.type = info.type;
-        remote.motd = info.motd;
-        remote.max_players = info.max_players;
-        remote.online = true;
-        supabase.update_server(remote);
-    }
+    // This service owns only the local Java process and its pipes. Remote
+    // control-plane mirroring is intentionally handled by the explicit server
+    // management layer so a local start cannot silently issue an
+    // account-scoped request from whichever UI path invoked it.
     
     std::vector<std::function<void(const std::string&)>> started_callbacks;
     {
@@ -2238,16 +2429,8 @@ bool ServerManager::stop_local_server(const std::string& server_id, std::string*
     forget_local_server(server_id);
 
     server.online = false;
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    if (supabase.is_authenticated()) {
-        aml::supabase::SupabaseServer remote;
-        remote.id = server.id;
-        remote.name = server.name;
-        remote.alias = server.alias;
-        remote.address = server.address;
-        remote.online = false;
-        supabase.update_server(remote);
-    }
+    // Keep this process supervisor local-only. The caller may explicitly
+    // mirror an intentional state transition through its scoped provider path.
     std::vector<std::function<void(const std::string&)>> stopped_callbacks;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2348,23 +2531,23 @@ std::string NodeService::build_auth_header() const {
 }
 
 NodeInfo NodeService::register_node(const NodeInfo& node, std::string* error) {
-    auto& mgr = aml::servers::ServerManager::instance();
-    aml::servers::Node n = info_to_node(node);
-    n = mgr.register_node(n);
-    if (n.id.empty()) {
-        if (error) *error = "Failed to register node";
-        return NodeInfo();
+    (void)node;
+    // This adapter is deliberately read-only. Node registration changes the
+    // remote control plane and must travel through the signed-in Admin
+    // workflow, which owns confirmation, authorization, and its serialized
+    // account-scoped worker.
+    if (error) {
+        *error = "Node registration is available only through the approved Admin workflow";
     }
-    return node_to_info(n);
+    return NodeInfo();
 }
 
 bool NodeService::deregister_node(const std::string& node_id, std::string* error) {
-    auto& mgr = aml::servers::ServerManager::instance();
-    if (!mgr.deregister_node(node_id)) {
-        if (error) *error = "Failed to deregister node";
-        return false;
+    (void)node_id;
+    if (error) {
+        *error = "Node deregistration is available only through the approved Admin workflow";
     }
-    return true;
+    return false;
 }
 
 NodeInfo NodeService::get_node(const std::string& node_id, std::string* error) {
@@ -2403,22 +2586,12 @@ std::vector<NodeInfo> NodeService::list_nodes(const std::string& region,
 }
 
 bool NodeService::update_node(const std::string& node_id, const NodeInfo& updates, std::string* error) {
-    auto& mgr = aml::servers::ServerManager::instance();
-    aml::servers::Node n = mgr.get_node(node_id);
-    if (n.id.empty()) {
-        if (error) *error = "Node not found";
-        return false;
+    (void)node_id;
+    (void)updates;
+    if (error) {
+        *error = "Node updates are available only through the approved Admin workflow";
     }
-    if (!updates.name.empty()) n.name = updates.name;
-    if (!updates.host.empty()) n.host = updates.host;
-    if (updates.port > 0) n.port = updates.port;
-    n.metadata["region"] = updates.region;
-    n.metadata["zone"] = updates.zone;
-    if (!mgr.update_node(n)) {
-        if (error) *error = "Failed to update node";
-        return false;
-    }
-    return true;
+    return false;
 }
 
 bool NodeService::ping_node(const std::string& node_id, int* latency_ms, std::string* error) {
@@ -2757,4 +2930,3 @@ std::map<ServiceType, bool> ServiceManager::service_status() const {
 }
 
 }  // namespace aml::services
-

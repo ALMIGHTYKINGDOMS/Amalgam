@@ -1,18 +1,22 @@
 // Secret-category scanner for Amalgam.
 //
-// Scans a path (default: repository root) for secret-like material across
+// Scans one or more paths (default: repository root) for secret-like material across
 // several categories. NEVER prints the matched value: only the category,
 // location, whether the hit is expected, and the recommended action.
 //
 // Usage:
-//   node tools/secret-scan.mjs [path]
+//   node tools/secret-scan.mjs [path ...]
 //
 // Exit code 0 = no HIGH findings; 1 = HIGH findings present.
 
 import fs from "node:fs";
 import path from "node:path";
 
-const root = process.argv[2] ? path.resolve(process.argv[2]) : process.cwd();
+const rootArgs = process.argv.slice(2);
+const roots = [...new Set(
+  (rootArgs.length ? rootArgs : [process.cwd()])
+    .map((root) => path.resolve(root))
+)];
 
 // Categories: regex, severity, expected-locations note.
 const CATEGORIES = [
@@ -98,9 +102,9 @@ const EXPECTED_FIXTURES = [
 const findings = [];
 let scanned = 0;
 const files = [];
-walk(root, files);
+for (const root of roots) walk(root, files);
 
-for (const file of files) {
+for (const file of new Set(files)) {
   let stat;
   try {
     stat = fs.statSync(file);
@@ -121,7 +125,7 @@ for (const file of files) {
       findings.push({
         type: cat.name,
         severity: cat.severity,
-        location: path.relative(root, file),
+        location: path.relative(process.cwd(), file),
       });
     }
   }
@@ -138,7 +142,7 @@ const unique = findings.filter((f) => {
 
 const high = unique.filter((f) => f.severity === "HIGH");
 const unexpected = high.filter((f) => !EXPECTED_FIXTURES.some((fx) => fx.re.test(f.location)));
-console.log(`Scanned ${scanned} text files under ${root}`);
+console.log(`Scanned ${scanned} text files under ${roots.join(", ")}`);
 if (unique.length === 0) {
   console.log("No secret-category matches.");
 } else {

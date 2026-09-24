@@ -11,10 +11,12 @@
 #include "provider_config.h"
 
 #include <algorithm>
+#include <exception>
 #include <filesystem>
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <utility>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -75,6 +77,13 @@ std::wstring inst_dir_parent_w(const instances::Instance& inst) {
     fs::path p(inst.directory);
     return p.parent_path().wstring();
 }
+
+struct JoinJobRunGuard {
+    std::atomic_bool& running;
+    ~JoinJobRunGuard() {
+        running.store(false, std::memory_order_release);
+    }
+};
 
 }  // namespace
 
@@ -319,14 +328,23 @@ bool ProfileSync::cleanup_temporary_profile(const std::string& profile_id) {
 // ---------------------------------------------------------------------------
 
 JoinManager& JoinManager::instance() {
-    static JoinManager s;
-    return s;
+    // A guest bridge can deliberately remain alive while the game is open.
+    // Keep this process-owned coordinator alive until Windows tears down the
+    // process rather than allowing C++ static destruction to race that guest
+    // task.  The task never captures UiState or an ImGui object.
+    static JoinManager* s = new JoinManager();
+    return *s;
 }
 
 JoinResult JoinManager::analyze_and_prepare(const std::string& session_id,
                                              const std::string& join_token) {
     JoinResult r;
     r.session_id = session_id;
+
+    if (join_job_running_.load(std::memory_order_acquire)) {
+        r.error = "A session join is already in progress or still finalizing";
+        return r;
+    }
 
     auto& supa = supabase::SupabaseManager::instance();
     if (!supa.is_authenticated()) {
@@ -365,152 +383,268 @@ JoinResult JoinManager::analyze_and_prepare(const std::string& session_id,
     if (!best) best = &locals.front();
 
     auto& ps = ProfileSync::instance();
-    compat_ = ps.check_compatibility(*best, manifest);
-    if (compat_.version_level == CompatibilityLevel::Incompatible ||
-        compat_.loader_level == CompatibilityLevel::MajorMismatch) {
+    CompatCheck compat = ps.check_compatibility(*best, manifest);
+    if (compat.version_level == CompatibilityLevel::Incompatible ||
+        compat.loader_level == CompatibilityLevel::MajorMismatch) {
         r.error = "This Minecraft profile is incompatible with the host";
         return r;
     }
-    sync_plan_ = ps.build_sync_plan(*best, manifest, SyncMode::TemporaryProfile);
+    SyncPlan sync_plan = ps.build_sync_plan(*best, manifest, SyncMode::TemporaryProfile);
 
-    host_user_id_ = manifest.host_user_id;
-    source_profile_id_ = best->id;
+    {
+        std::lock_guard<std::mutex> lock(prepared_mu_);
+        compat_ = std::move(compat);
+        sync_plan_ = std::move(sync_plan);
+        host_user_id_ = manifest.host_user_id;
+        source_profile_id_ = best->id;
+        session_id_ = session_id;
+        join_token_ = join_token;
+    }
     r.success = true;
     r.connection_type = ConnectionType::None;
-    session_id_ = session_id;
-    join_token_ = join_token;
     return r;
 }
 
-SyncPlan JoinManager::get_current_sync_plan() const { return sync_plan_; }
-CompatCheck JoinManager::get_current_compat() const { return compat_; }
+SyncPlan JoinManager::get_current_sync_plan() const {
+    std::lock_guard<std::mutex> lock(prepared_mu_);
+    return sync_plan_;
+}
+
+CompatCheck JoinManager::get_current_compat() const {
+    std::lock_guard<std::mutex> lock(prepared_mu_);
+    return compat_;
+}
+
+bool JoinManager::is_active_generation(uint64_t generation) const {
+    return joining_.load(std::memory_order_acquire) &&
+           join_generation_.load(std::memory_order_acquire) == generation;
+}
+
+bool JoinManager::report_progress(uint64_t generation, float progress,
+                                  const std::string& status) {
+    if (!is_active_generation(generation)) return false;
+    std::lock_guard<std::mutex> lock(progress_mu_);
+    if (!is_active_generation(generation)) return false;
+    progress_generation_ = generation;
+    progress_ = std::clamp(progress, 0.0f, 1.0f);
+    status_text_ = status;
+    completed_ = false;
+    succeeded_ = false;
+    return true;
+}
+
+void JoinManager::finish_join(uint64_t generation, bool success,
+                              const std::string& status) {
+    if (!is_active_generation(generation)) return;
+    {
+        std::lock_guard<std::mutex> lock(progress_mu_);
+        if (!is_active_generation(generation)) return;
+        progress_generation_ = generation;
+        progress_ = success ? 1.0f : progress_;
+        status_text_ = status;
+        completed_ = true;
+        succeeded_ = success;
+    }
+    joining_.store(false, std::memory_order_release);
+}
 
 bool JoinManager::execute_join(const std::function<void(float, const std::string&)>& on_progress) {
-    if (joining_) return false;
-    joining_ = true;
-    progress_ = 0.0f;
-    status_text_ = "Preparing join...";
+    bool job_expected = false;
+    if (!join_job_running_.compare_exchange_strong(job_expected, true,
+                                                    std::memory_order_acq_rel)) {
+        return false;
+    }
+    bool expected = false;
+    if (!joining_.compare_exchange_strong(expected, true,
+                                          std::memory_order_acq_rel)) {
+        join_job_running_.store(false, std::memory_order_release);
+        return false;
+    }
 
-    std::thread([this, on_progress]() {
-        auto& ps = ProfileSync::instance();
-        const SyncPlan plan = sync_plan_;
-        const std::string source_profile_id = source_profile_id_;
-        const std::string session_id = session_id_;
-        const std::string host_user_id = host_user_id_;
-        if (plan.mode == SyncMode::TemporaryProfile &&
-            (!plan.mods_to_download.empty() || !plan.mods_to_update.empty())) {
-            status_text_ = "Synchronizing host profile...";
-            progress_ = 0.3f;
-            if (on_progress) on_progress(progress_, status_text_);
-            if (!ps.execute_sync(plan, on_progress)) {
-                status_text_ = "Profile synchronization failed";
-                joining_ = false;
-                return;
-            }
-        }
-        if (!joining_) { status_text_ = "Cancelled"; return; }
+    const uint64_t generation =
+        join_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    SyncPlan plan;
+    std::string source_profile_id;
+    std::string session_id;
+    std::string host_user_id;
+    {
+        std::lock_guard<std::mutex> lock(prepared_mu_);
+        plan = sync_plan_;
+        source_profile_id = source_profile_id_;
+        session_id = session_id_;
+        host_user_id = host_user_id_;
+    }
+    report_progress(generation, 0.0f, "Preparing join...");
 
-        // Create the temporary profile from the profile selected during analysis.
-        std::string target_id = source_profile_id;
-        if (plan.mode == SyncMode::TemporaryProfile) {
-            status_text_ = "Creating synced profile...";
-            progress_ = 0.6f;
-            if (on_progress) on_progress(progress_, status_text_);
-            auto base = net::get_local_app_data_path() + L"\\instances";
-            auto locals = instances::scan(base, nullptr);
-            auto source = std::find_if(locals.begin(), locals.end(),
-                [&source_profile_id](const instances::Instance& inst) {
-                    return inst.id == source_profile_id;
-                });
-            if (source == locals.end()) {
-                status_text_ = "The selected Minecraft profile disappeared";
-                joining_ = false;
-                return;
-            }
-            std::string err;
-            target_id = ps.create_synced_profile(*source, plan, &err);
-            if (target_id.empty()) {
-                status_text_ = "Failed to create profile: " + err;
-                joining_ = false;
-                return;
-            }
-        }
-        if (!joining_) { status_text_ = "Cancelled"; return; }
+    try {
+        std::thread([this, generation, plan = std::move(plan),
+                     source_profile_id = std::move(source_profile_id),
+                     session_id = std::move(session_id),
+                     host_user_id = std::move(host_user_id),
+                     on_progress]() mutable {
+            JoinJobRunGuard job_guard{join_job_running_};
+            const auto report = [this, generation, &on_progress](
+                                    float progress, const std::string& status) {
+                if (!report_progress(generation, progress, status)) return false;
+                if (on_progress) on_progress(progress, status);
+                return true;
+            };
+            const auto cancelled = [this, generation] {
+                return !is_active_generation(generation);
+            };
 
-        // Step 3: Establish the local TCP adapter before launching Minecraft.
-        status_text_ = "Setting up relay...";
-        progress_ = 0.7f;
-        if (on_progress) on_progress(progress_, status_text_);
-        bridge_ = std::make_unique<TcpDataChannelBridge>();
-        if (!bridge_->start_guest(session_id, host_user_id)) {
-            status_text_ = "Relay setup failed: " + bridge_->error();
-            joining_ = false;
-            return;
-        }
-        if (!joining_) { bridge_->stop(); bridge_.reset(); status_text_ = "Cancelled"; return; }
+            try {
+                auto& ps = ProfileSync::instance();
+                if (plan.mode == SyncMode::TemporaryProfile &&
+                    (!plan.mods_to_download.empty() || !plan.mods_to_update.empty())) {
+                    if (!report(0.3f, "Synchronizing host profile...")) return;
+                    if (!ps.execute_sync(plan, [&report](float sync_progress,
+                                                         const std::string& status) {
+                            report(0.3f + 0.3f * std::clamp(sync_progress, 0.0f, 1.0f),
+                                   status);
+                        })) {
+                        finish_join(generation, false, "Profile synchronization failed");
+                        return;
+                    }
+                }
+                if (cancelled()) return;
 
-        status_text_ = "Launching Minecraft...";
-        progress_ = 0.8f;
-        if (on_progress) on_progress(progress_, status_text_);
+                // Create the temporary profile from the profile selected during analysis.
+                std::string target_id = source_profile_id;
+                if (plan.mode == SyncMode::TemporaryProfile) {
+                    if (!report(0.6f, "Creating synced profile...")) return;
+                    auto base = net::get_local_app_data_path() + L"\\instances";
+                    auto locals = instances::scan(base, nullptr);
+                    auto source = std::find_if(locals.begin(), locals.end(),
+                        [&source_profile_id](const instances::Instance& inst) {
+                            return inst.id == source_profile_id;
+                        });
+                    if (source == locals.end()) {
+                        finish_join(generation, false,
+                                    "The selected Minecraft profile disappeared");
+                        return;
+                    }
+                    std::string err;
+                    target_id = ps.create_synced_profile(*source, plan, &err);
+                    if (target_id.empty()) {
+                        finish_join(generation, false, "Failed to create profile: " + err);
+                        return;
+                    }
+                }
+                if (cancelled()) return;
 
-        auto base = net::get_local_app_data_path() + L"\\instances";
-        auto locals = instances::scan(base, nullptr);
-        bool launched = false;
-        for (auto& inst : locals) {
-            if (inst.id == target_id) {
-                launch::Options opt;
-                opt.mc_id = inst.minecraft_version;
-                opt.loader = inst.loader;
-                opt.instance_dir = inst.directory;
-                opt.test_server = net::to_wide(
-                    "127.0.0.1:" + std::to_string(bridge_->local_port()));
-                opt.wait_for_exit = true;
-
-                std::wstring dll_path = L"amalgam.dll";
-                opt.dll_path = dll_path;
-
-                std::string launch_err;
-                launch::Result result;
-                auto log_fn = [](const std::wstring&) {};
-                if (!launch::run(opt, log_fn, &result, &launch_err)) {
-                    status_text_ = "Launch failed: " + launch_err;
-                    bridge_->stop();
-                    bridge_.reset();
-                    joining_ = false;
+                // The guest bridge belongs to this long-running join job, not
+                // to the transient Essentials dialog or the rendering thread.
+                if (!report(0.7f, "Setting up relay...")) return;
+                auto bridge = std::make_unique<TcpDataChannelBridge>();
+                if (!bridge->start_guest(session_id, host_user_id)) {
+                    finish_join(generation, false,
+                                "Relay setup failed: " + bridge->error());
                     return;
                 }
-                launched = true;
-                break;
+                if (cancelled()) {
+                    bridge->stop();
+                    return;
+                }
+
+                if (!report(0.8f, "Starting Minecraft and maintaining the session...")) {
+                    bridge->stop();
+                    return;
+                }
+
+                auto base = net::get_local_app_data_path() + L"\\instances";
+                auto locals = instances::scan(base, nullptr);
+                bool launched = false;
+                for (auto& inst : locals) {
+                    if (inst.id != target_id) continue;
+                    launch::Options opt;
+                    opt.mc_id = inst.minecraft_version;
+                    opt.loader = inst.loader;
+                    opt.instance_dir = inst.directory;
+                    opt.test_server = net::to_wide(
+                        "127.0.0.1:" + std::to_string(bridge->local_port()));
+                    // The bridge must remain available for the live Minecraft
+                    // session, so this task intentionally lasts until the game
+                    // exits.  It owns no UiState and publishes only the guarded
+                    // JoinProgressSnapshot above.
+                    opt.wait_for_exit = true;
+                    opt.dll_path = L"amalgam.dll";
+
+                    std::string launch_err;
+                    launch::Result result;
+                    const auto log_fn = [](const std::wstring&) {};
+                    if (!launch::run(opt, log_fn, &result, &launch_err)) {
+                        bridge->stop();
+                        finish_join(generation, false, "Launch failed: " + launch_err);
+                        return;
+                    }
+                    launched = true;
+                    break;
+                }
+
+                if (!launched) {
+                    bridge->stop();
+                    finish_join(generation, false,
+                                "The synchronized Minecraft profile disappeared");
+                    return;
+                }
+
+                bridge->stop();
+                finish_join(generation, true, "Minecraft session ended.");
+            } catch (const std::exception&) {
+                finish_join(generation, false,
+                            "The join task ended unexpectedly. Please retry.");
+            } catch (...) {
+                finish_join(generation, false,
+                            "The join task ended unexpectedly. Please retry.");
             }
-        }
-
-        if (!launched) {
-            status_text_ = "The synchronized Minecraft profile disappeared";
-            bridge_->stop();
-            bridge_.reset();
-            joining_ = false;
-            return;
-        }
-
-        progress_ = 1.0f;
-        status_text_ = "Joined!";
-        bridge_->stop();
-        bridge_.reset();
-        joining_ = false;
-    }).detach();
+        }).detach();
+    } catch (const std::exception&) {
+        join_job_running_.store(false, std::memory_order_release);
+        finish_join(generation, false, "Could not start the join task. Please retry.");
+        return false;
+    }
 
     return true;
 }
 
 void JoinManager::cancel_join() {
-    joining_ = false;
-    status_text_ = "Cancelled";
+    if (!joining_.exchange(false, std::memory_order_acq_rel)) return;
+    const uint64_t generation =
+        join_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::lock_guard<std::mutex> lock(progress_mu_);
+    progress_generation_ = generation;
     progress_ = 0.0f;
+    status_text_ = "Join cancelled.";
+    completed_ = true;
+    succeeded_ = false;
 }
 
-bool JoinManager::is_joining() const { return joining_; }
-float JoinManager::get_progress() const { return progress_; }
-std::string JoinManager::get_status_text() const { return status_text_; }
+bool JoinManager::is_joining() const {
+    return joining_.load(std::memory_order_acquire);
+}
+
+JoinProgressSnapshot JoinManager::get_progress_snapshot() const {
+    JoinProgressSnapshot snapshot;
+    std::lock_guard<std::mutex> lock(progress_mu_);
+    snapshot.generation = progress_generation_;
+    snapshot.active = joining_.load(std::memory_order_acquire) &&
+                      join_generation_.load(std::memory_order_acquire) ==
+                          progress_generation_;
+    snapshot.completed = completed_;
+    snapshot.success = succeeded_;
+    snapshot.progress = progress_;
+    snapshot.status = status_text_;
+    return snapshot;
+}
+
+float JoinManager::get_progress() const {
+    return get_progress_snapshot().progress;
+}
+
+std::string JoinManager::get_status_text() const {
+    return get_progress_snapshot().status;
+}
 
 // ---------------------------------------------------------------------------
 // WorldHost

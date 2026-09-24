@@ -7,6 +7,9 @@ import {
   signString,
   verifyString,
   verifyManifest,
+  verifyPayload,
+  validatePayloadSize,
+  MAX_PAYLOAD_BYTES,
   sha256File,
 } from "./update-manifest.mjs";
 import fs from "node:fs";
@@ -113,6 +116,31 @@ test("sha256File matches crypto", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("payload validation binds size, digest, and payload signature", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "amal-manifest-payload-"));
+  const payload = path.join(dir, "payload.zip");
+  fs.writeFileSync(payload, "final payload");
+  const { publicKey, privateKey } = keypair();
+  const manifest = {
+    ...SAMPLE,
+    size: fs.statSync(payload).size,
+    sha256: sha256File(payload),
+    signature: crypto.sign("sha256", fs.readFileSync(payload), privateKey).toString("base64"),
+  };
+  assert.equal(verifyPayload(manifest, payload, publicKey).ok, true);
+  assert.equal(verifyPayload({ ...manifest, size: manifest.size + 1 }, payload, publicKey).ok, false);
+  assert.equal(verifyPayload({ ...manifest, sha256: "b".repeat(64) }, payload, publicKey).ok, false);
+  assert.equal(verifyPayload({ ...manifest, signature: "not-a-signature" }, payload, publicKey).ok, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("payload sizes reject placeholder, fractional, and oversized values", () => {
+  for (const value of [-1, 0, "NaN", 1.5, Number.MAX_SAFE_INTEGER, MAX_PAYLOAD_BYTES + 1]) {
+    assert.equal(validatePayloadSize(value).ok, false, `expected ${value} to reject`);
+  }
+  assert.deepEqual(validatePayloadSize(1234), { ok: true, size: 1234, error: null });
+});
+
 // Regression: the CLI parsed kebab-case flags (--private-key) but the handlers
 // read camelCase (privateKey), silently dropping the key and writing UNSIGNED
 // manifests. Drive the real CLI end-to-end so the parse/write path stays
@@ -120,18 +148,30 @@ test("sha256File matches crypto", () => {
 test("CLI accepts kebab-case flags and signs the manifest", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "amal-manifest-cli-"));
   const key = path.join(dir, "k.pem");
+  const payload = path.join(dir, "payload.zip");
   fs.writeFileSync(key, keypair().privateKey);
+  fs.writeFileSync(payload, "payload for signed manifest");
   const out = path.join(dir, "manifest.json");
   const script = path.join(import.meta.dirname, "update-manifest.mjs");
   execFileSync(process.execPath, [script, "generate",
     "--version", "1.2.3", "--channel", "stable",
     "--url", "https://cdn.example.com/x.zip",
-    "--sha256", "a".repeat(64), "--min-version", "1.0",
+    "--file", payload, "--min-version", "1.0",
     "--private-key", key, "--out", out]);
   const manifest = JSON.parse(fs.readFileSync(out, "utf8"));
   assert.ok(manifest.manifest_signature, "kebab-case --private-key was dropped");
   assert.equal(manifest.min_version, "1.0");
   assert.equal(verifyManifest(manifest, keypair().publicKey, { requireSigned: true }).ok,
     false, "signature must not verify against the wrong key");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("CLI rejects an unsigned or size-less production manifest", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "amal-manifest-cli-reject-"));
+  const script = path.join(import.meta.dirname, "update-manifest.mjs");
+  const common = [script, "generate", "--version", "1.2.3", "--channel", "stable",
+    "--url", "https://cdn.example.com/x.zip", "--sha256", "a".repeat(64)];
+  assert.throws(() => execFileSync(process.execPath, common, { stdio: "pipe" }));
+  assert.throws(() => execFileSync(process.execPath, [...common, "--size", "1234"], { stdio: "pipe" }));
   fs.rmSync(dir, { recursive: true, force: true });
 });

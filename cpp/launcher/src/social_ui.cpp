@@ -12,9 +12,16 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <utility>
 
 namespace aml::ui {
 
@@ -30,6 +37,7 @@ struct SocialUIState {
     int friend_sort = 0; // 0=username, 1=status, 2=last seen
     std::string friend_search;
     bool friend_requests_open = false;
+    bool close_add_friend_popup = false;
     
     // Messages
     std::string selected_friend_id;
@@ -44,6 +52,7 @@ struct SocialUIState {
     std::string party_name;
     std::string party_invite_code;
     bool party_creating = false;
+    bool close_create_party_popup = false;
     
     // Settings
     bool notifications_enabled = true;
@@ -262,11 +271,277 @@ static std::vector<Friend> load_social_friends() {
     return result;
 }
 
+static std::vector<Party> load_social_parties() {
+    std::vector<Party> parties;
+    auto& supabase = aml::supabase::SupabaseManager::instance();
+    for (const auto& source : supabase.get_parties()) {
+        Party party;
+        party.id = source.id;
+        party.name = source.name;
+        party.owner_id = source.owner_id;
+        party.owner_name = source.owner_username;
+        party.max_members = source.max_members;
+        party.is_public = source.is_public;
+        party.invite_code = source.invite_code;
+        party.created_at = source.created_at;
+        for (const auto& member : supabase.get_party_members(source.id)) {
+            party.member_ids.push_back(member.user_id);
+            party.member_names.push_back(member.username);
+        }
+        parties.push_back(std::move(party));
+    }
+    return parties;
+}
+
+// The legacy social surface used Supabase getters while ImGui was drawing,
+// including a party-members request for every visible party.  Keep a bounded
+// read snapshot instead.  It lives for the process so a joined launcher worker
+// can never race static destruction during shutdown.
+struct SocialRemoteSnapshot {
+    std::vector<Friend> friends;
+    std::vector<aml::supabase::SupabaseFriendRequest> requests;
+    std::vector<Party> parties;
+    bool loaded = false;
+    bool refreshing = false;
+    std::string error;
+};
+
+struct SocialRemoteCache {
+    std::mutex mu;
+    std::atomic_bool refreshing{false};
+    uint64_t generation = 0;
+    uint64_t refreshed_at_ms = 0;
+    bool authenticated = false;
+    SocialRemoteSnapshot snapshot;
+};
+
+static SocialRemoteCache& get_social_remote_cache() {
+    static SocialRemoteCache* cache = new SocialRemoteCache();
+    return *cache;
+}
+
+static uint64_t social_now_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static SocialRemoteSnapshot snapshot_social_remote_cache() {
+    auto& cache = get_social_remote_cache();
+    std::lock_guard<std::mutex> lock(cache.mu);
+    SocialRemoteSnapshot snapshot = cache.snapshot;
+    snapshot.refreshing = cache.refreshing.load();
+    return snapshot;
+}
+
+static void mark_social_remote_cache_dirty() {
+    auto& cache = get_social_remote_cache();
+    std::lock_guard<std::mutex> lock(cache.mu);
+    // Invalidate a refresh that began before an account mutation.  Without
+    // this generation bump, that stale read can win the race after a successful
+    // mutation and suppress the correcting refresh for the normal interval.
+    ++cache.generation;
+    cache.refreshed_at_ms = 0;
+}
+
+static void request_social_remote_cache_refresh(UiState& st, bool force = false) {
+    if (st.fixture_mode || st.shutting_down.load()) return;
+    auto& cache = get_social_remote_cache();
+    const uint64_t now = social_now_ms();
+    // Authentication state is local, not a network request.  Clear a prior
+    // account's snapshot before rendering if the player signed out, rather
+    // than leaving friends or messages visible for the refresh interval.
+    const bool authenticated = aml::supabase::SupabaseManager::instance().is_authenticated();
+    {
+        std::lock_guard<std::mutex> lock(cache.mu);
+        if (cache.authenticated != authenticated) {
+            cache.authenticated = authenticated;
+            ++cache.generation;
+            cache.refreshed_at_ms = 0;
+            cache.snapshot = {};
+        }
+        constexpr uint64_t kRefreshIntervalMs = 15000;
+        if (!force && cache.refreshed_at_ms != 0 &&
+            now - cache.refreshed_at_ms < kRefreshIntervalMs) {
+            return;
+        }
+    }
+
+    bool expected = false;
+    if (!cache.refreshing.compare_exchange_strong(expected, true)) return;
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(cache.mu);
+        generation = ++cache.generation;
+    }
+
+    spawn_worker(st, std::thread([&cache, generation] {
+        SocialRemoteSnapshot fetched;
+        auto& supabase = aml::supabase::SupabaseManager::instance();
+        if (!supabase.is_authenticated()) {
+            fetched.error = "Sign in to load friends, messages, and parties.";
+        } else {
+            try {
+                fetched.friends = load_social_friends();
+                fetched.requests = supabase.get_friend_requests();
+                fetched.parties = load_social_parties();
+                fetched.loaded = true;
+            } catch (const std::exception&) {
+                fetched.error = "Social data could not be refreshed. Please retry.";
+            } catch (...) {
+                fetched.error = "Social data could not be refreshed. Please retry.";
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(cache.mu);
+            if (cache.generation == generation) {
+                cache.snapshot = std::move(fetched);
+                cache.refreshed_at_ms = social_now_ms();
+            }
+        }
+        cache.refreshing = false;
+    }));
+}
+
+static bool social_request_is_working(const UiState& st, const std::string& action) {
+    const auto snapshot = snapshot_async_ui_request(st.social_async_request);
+    return snapshot.working && snapshot.action == action;
+}
+
+static bool social_request_lane_busy(const UiState& st) {
+    return snapshot_async_ui_request(st.social_async_request).working;
+}
+
+static bool social_request_failed(const UiState& st, const std::string& action) {
+    const auto snapshot = snapshot_async_ui_request(st.social_async_request);
+    return !snapshot.working && snapshot.has_result &&
+           snapshot.action == action && !snapshot.result.success;
+}
+
+static bool social_action_starts_with(const std::string& action, const char* prefix) {
+    const size_t length = std::strlen(prefix);
+    return action.size() >= length && action.compare(0, length, prefix) == 0;
+}
+
+static void draw_social_request_feedback(const UiState& st, const std::string& action,
+                                         const char* working_label) {
+    const auto snapshot = snapshot_async_ui_request(st.social_async_request);
+    if (snapshot.action != action) return;
+    if (snapshot.working) {
+        ImGui::TextColored(k.muted, "%s", working_label);
+    } else if (snapshot.has_result && !snapshot.result.success &&
+               !snapshot.result.detail.empty()) {
+        ImGui::TextColored(k.red, "%s", snapshot.result.detail.c_str());
+    }
+}
+
+static bool start_social_request(UiState& st, const std::string& action,
+                                 std::function<AsyncUiRequestResult()> work) {
+    uint64_t generation = 0;
+    if (!begin_async_ui_request(st.social_async_request, action, &generation)) {
+        return false;
+    }
+    spawn_worker(st, std::thread([&st, action, generation,
+                                  work = std::move(work)]() mutable {
+        AsyncUiRequestResult result;
+        try {
+            result = work();
+        } catch (const std::exception&) {
+            result.success = false;
+            result.title = "Social request failed";
+            result.detail = "The request ended unexpectedly. Please try again.";
+        } catch (...) {
+            result.success = false;
+            result.title = "Social request failed";
+            result.detail = "The request ended unexpectedly. Please try again.";
+        }
+        if (!st.shutting_down.load()) {
+            complete_async_ui_request(st.social_async_request, action,
+                                      generation, std::move(result));
+        }
+    }));
+    return true;
+}
+
+static void consume_social_request_result(UiState& st) {
+    AsyncUiRequestSnapshot completed;
+    if (!take_async_ui_request_result(st.social_async_request, &completed)) return;
+
+    auto& social_ui = get_social_ui_state();
+    const auto& result = completed.result;
+    if (result.success) {
+        if (completed.action == "social-conversation-load") {
+            // A user may have selected somebody else while this request was
+            // in flight.  Never replace their newer conversation with stale
+            // messages from the prior selection.
+            if (social_ui.selected_friend_id == result.payload_a) {
+                social_ui.selected_conversation_id = result.payload_b;
+                social_ui.message_history = result.items;
+            }
+        } else if (completed.action == "social-message-send") {
+            if (social_ui.selected_friend_id == result.payload_a &&
+                social_ui.selected_conversation_id == result.payload_b) {
+                social_ui.message_history.push_back("You\n" + result.payload_c);
+                social_ui.message_input.clear();
+            }
+        } else if (completed.action == "social-add-friend") {
+            social_ui.friend_search.clear();
+            social_ui.close_add_friend_popup = true;
+        } else if (completed.action == "social-party-join-code") {
+            if (social_ui.party_invite_code == result.payload_a) {
+                social_ui.party_invite_code.clear();
+            }
+        } else if (completed.action == "social-party-create") {
+            social_ui.party_name.clear();
+            social_ui.party_creating = false;
+            social_ui.close_create_party_popup = true;
+        }
+
+        if (social_action_starts_with(completed.action, "social-add-friend") ||
+            social_action_starts_with(completed.action, "social-friend-") ||
+            social_action_starts_with(completed.action, "social-party-")) {
+            mark_social_remote_cache_dirty();
+        }
+        if (!result.title.empty()) {
+            push_notice(st, result.warning ? ui_model::NoticeLevel::Warning
+                                            : ui_model::NoticeLevel::Success,
+                        result.title, result.detail);
+        }
+    } else if (!result.title.empty()) {
+        push_notice(st, ui_model::NoticeLevel::Error, result.title,
+                    result.detail.empty() ? "Please try again." : result.detail);
+    }
+}
+
+static void draw_social_cache_status(UiState& st, const SocialRemoteSnapshot& snapshot) {
+    if (snapshot.refreshing) {
+        ImGui::TextColored(k.muted, "Refreshing social data...");
+    } else if (!snapshot.error.empty()) {
+        ImGui::TextColored(k.red, "%s", snapshot.error.c_str());
+        ImGui::SameLine();
+        if (ghost_button("Retry", ImVec2(ui_px(72.0f), ui_px(24.0f)))) {
+            request_social_remote_cache_refresh(st, true);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Friends Tab
 // ---------------------------------------------------------------------------
 
 void draw_social_friends(UiState& st) {
+    if (st.fixture_mode) {
+        page_title("Friends", "Local visual fixture");
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: no account or social service is used.");
+        card_begin("##fixture_social_friends");
+        ImGui::TextUnformatted("Friends are available after sign-in in the live launcher.");
+        card_end();
+        return;
+    }
+    consume_social_request_result(st);
+    request_social_remote_cache_refresh(st);
+    const auto remote = snapshot_social_remote_cache();
     auto& social_ui = get_social_ui_state();
     
     page_title("Friends", "Manage your friends list and social connections");
@@ -316,43 +591,62 @@ void draw_social_friends(UiState& st) {
     }
     
     card_end();
+    draw_social_cache_status(st, remote);
     
     ImGui::Spacing();
     
     // Add friend popup
     if (ImGui::BeginPopup("##add_friend_popup")) {
+        if (social_ui.close_add_friend_popup) {
+            social_ui.close_add_friend_popup = false;
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::TextUnformatted("Add Friend");
         ImGui::Separator();
         ImGui::Spacing();
         
         ImGui::TextUnformatted("Username or Email");
         ImGui::SetNextItemWidth(ui_px(300.0f));
+        const bool adding_friend = social_request_is_working(st, "social-add-friend");
+        const bool social_busy = social_request_lane_busy(st);
+        ImGui::BeginDisabled(social_busy);
         ImGui::InputText("##add_friend_input", &social_ui.friend_search);
+        ImGui::EndDisabled();
         
         ImGui::Spacing();
         
-        if (primary_button("Send Request", ImVec2(ui_px(120.0f), ui_px(32.0f)))) {
+        const bool retry_add = social_request_failed(st, "social-add-friend");
+        if (primary_button(adding_friend ? "Sending..." :
+                           (retry_add ? "Retry Request" : "Send Request"),
+                           ImVec2(ui_px(120.0f), ui_px(32.0f)), adding_friend, social_busy)) {
             if (!social_ui.friend_search.empty()) {
-                auto& supabase = aml::supabase::SupabaseManager::instance();
-                const auto users = supabase.search_users(social_ui.friend_search, 1);
-                if (users.empty()) {
-                    push_notice(st, ui_model::NoticeLevel::Warning, "User Not Found", "No matching public account was found");
-                } else if (supabase.send_friend_request(users.front().user_id)) {
-                    push_notice(st, ui_model::NoticeLevel::Success, "Request Sent", "Friend request sent");
-                    social_ui.friend_search.clear();
-                    ImGui::CloseCurrentPopup();
-                } else {
-                    push_notice(st, ui_model::NoticeLevel::Error, "Request Failed", "The friend request could not be sent");
-                }
+                const std::string query = social_ui.friend_search;
+                start_social_request(st, "social-add-friend", [query] {
+                    auto& supabase = aml::supabase::SupabaseManager::instance();
+                    const auto users = supabase.search_users(query, 1);
+                    AsyncUiRequestResult result;
+                    if (users.empty()) {
+                        result.title = "User not found";
+                        result.detail = "No matching public account was found. Check the name and retry.";
+                    } else {
+                        result.success = supabase.send_friend_request(users.front().user_id);
+                        result.title = result.success ? "Friend request sent" : "Request failed";
+                        result.detail = result.success
+                            ? "Waiting for the other player to accept."
+                            : "The friend request could not be sent. You can retry.";
+                    }
+                    return result;
+                });
             }
         }
         
         ImGui::SameLine();
         
-        if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)))) {
+        if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)), social_busy)) {
             social_ui.friend_search.clear();
             ImGui::CloseCurrentPopup();
         }
+        draw_social_request_feedback(st, "social-add-friend", "Sending friend request...");
         
         ImGui::EndPopup();
     }
@@ -364,20 +658,51 @@ void draw_social_friends(UiState& st) {
         ImGui::Separator();
         ImGui::Spacing();
         
-        auto requests = aml::supabase::SupabaseManager::instance().get_friend_requests();
+        const auto& requests = remote.requests;
         if (requests.empty()) {
             ImGui::TextColored(k.muted, "No pending friend requests");
         } else {
             for (const auto& request : requests) {
                 ImGui::Text("%s", request.sender_username.c_str());
                 ImGui::SameLine();
-                if (primary_button(("Accept##" + request.id).c_str(), ImVec2(ui_px(75.0f), ui_px(25.0f)))) {
-                    if (aml::supabase::SupabaseManager::instance().accept_friend_request(request.id))
-                        push_notice(st, ui_model::NoticeLevel::Success, "Friend Added", request.sender_username);
+                const std::string accept_action = "social-friend-accept:" + request.id;
+                const std::string reject_action = "social-friend-reject:" + request.id;
+                const bool request_busy = social_request_lane_busy(st);
+                const bool accepting = social_request_is_working(st, accept_action);
+                if (primary_button(accepting ? "Accepting..." : "Accept",
+                                   ImVec2(ui_px(75.0f), ui_px(25.0f)), accepting,
+                                   request_busy)) {
+                    const std::string request_id = request.id;
+                    const std::string username = request.sender_username;
+                    start_social_request(st, accept_action, [request_id, username] {
+                        AsyncUiRequestResult result;
+                        result.success = aml::supabase::SupabaseManager::instance()
+                            .accept_friend_request(request_id);
+                        result.title = result.success ? "Friend added" : "Could not accept request";
+                        result.detail = result.success
+                            ? username + " is now your friend."
+                            : "The request remains pending. You can retry.";
+                        return result;
+                    });
                 }
                 ImGui::SameLine();
-                if (ghost_button(("Reject##" + request.id).c_str(), ImVec2(ui_px(75.0f), ui_px(25.0f))))
-                    aml::supabase::SupabaseManager::instance().reject_friend_request(request.id);
+                const bool rejecting = social_request_is_working(st, reject_action);
+                if (ghost_button(rejecting ? "Rejecting..." : "Reject",
+                                 ImVec2(ui_px(75.0f), ui_px(25.0f)), request_busy)) {
+                    const std::string request_id = request.id;
+                    start_social_request(st, reject_action, [request_id] {
+                        AsyncUiRequestResult result;
+                        result.success = aml::supabase::SupabaseManager::instance()
+                            .reject_friend_request(request_id);
+                        result.title = result.success ? "Friend request rejected" : "Could not reject request";
+                        result.detail = result.success
+                            ? "The request was declined."
+                            : "The request remains pending. You can retry.";
+                        return result;
+                    });
+                }
+                draw_social_request_feedback(st, accept_action, "Accepting friend request...");
+                draw_social_request_feedback(st, reject_action, "Rejecting friend request...");
             }
         }
         
@@ -385,7 +710,7 @@ void draw_social_friends(UiState& st) {
         ImGui::Spacing();
     }
     
-    auto friends = load_social_friends();
+    auto friends = remote.friends;
     
     if (friends.empty()) {
         empty_state("No Friends", "Add friends to start chatting and playing together.", "F");
@@ -470,17 +795,40 @@ void draw_social_friends(UiState& st) {
                 social_ui.profile_open = true;
             }
             
-            if (ImGui::MenuItem("Remove Friend", nullptr, false, true)) {
-                if (aml::supabase::SupabaseManager::instance().remove_friend(friend_.id))
-                    push_notice(st, ui_model::NoticeLevel::Success, "Friend Removed", friend_.username);
+            const std::string remove_action = "social-friend-remove:" + friend_.id;
+            const std::string block_action = "social-friend-block:" + friend_.id;
+            const bool friend_action_busy = social_request_lane_busy(st);
+            if (ImGui::MenuItem("Remove Friend", nullptr, false, !friend_action_busy)) {
+                const std::string friend_id = friend_.id;
+                const std::string username = friend_.username;
+                start_social_request(st, remove_action, [friend_id, username] {
+                    AsyncUiRequestResult result;
+                    result.success = aml::supabase::SupabaseManager::instance()
+                        .remove_friend(friend_id);
+                    result.title = result.success ? "Friend removed" : "Could not remove friend";
+                    result.detail = result.success
+                        ? username + " has been removed."
+                        : "The friend relationship was not changed. You can retry.";
+                    return result;
+                });
             }
 
-            if (ImGui::MenuItem("Block User", nullptr, false, true)) {
-                if (aml::supabase::SupabaseManager::instance().block_user(friend_.id))
-                    push_notice(st, ui_model::NoticeLevel::Success, "User Blocked", friend_.username);
-                else
-                    push_notice(st, ui_model::NoticeLevel::Error, "Block Failed", "The user could not be blocked");
+            if (ImGui::MenuItem("Block User", nullptr, false, !friend_action_busy)) {
+                const std::string friend_id = friend_.id;
+                const std::string username = friend_.username;
+                start_social_request(st, block_action, [friend_id, username] {
+                    AsyncUiRequestResult result;
+                    result.success = aml::supabase::SupabaseManager::instance()
+                        .block_user(friend_id);
+                    result.title = result.success ? "User blocked" : "Could not block user";
+                    result.detail = result.success
+                        ? username + " has been blocked."
+                        : "The user was not blocked. You can retry.";
+                    return result;
+                });
             }
+            draw_social_request_feedback(st, remove_action, "Removing friend...");
+            draw_social_request_feedback(st, block_action, "Blocking user...");
             
             ImGui::EndPopup();
         }
@@ -512,10 +860,87 @@ void draw_social_friends(UiState& st) {
 // Messages Tab
 // ---------------------------------------------------------------------------
 
+// Visual-review captures must never hydrate a real account or poll the social
+// service.  These compact, representative facades also keep the Messages and
+// Parties routes useful in a fresh fixture process, where there is deliberately
+// no signed-in user.
+static void draw_fixture_social_messages(UiState&) {
+    static std::string fixture_draft;
+    page_title("Messages", "A representative local conversation layout");
+    ImGui::TextColored(k.brand_hov,
+                       "Visual fixture: local sample data only; no account or message service is used.");
+    ImGui::Spacing();
+
+    const bool narrow = ImGui::GetContentRegionAvail().x < ui_px(760.0f);
+    ImGui::BeginChild("##fixture_social_friend_list",
+                      ImVec2(narrow ? -1.0f : ui_px(250.0f),
+                             narrow ? ui_px(168.0f) : ui_px(322.0f)), true);
+    ImGui::PushFont(f_bold);
+    ImGui::TextUnformatted("Friends");
+    ImGui::PopFont();
+    ImGui::TextColored(k.green, "2 online");
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PushFont(f_bold);
+    ImGui::TextUnformatted("AveryStone");
+    ImGui::PopFont();
+    ImGui::TextColored(k.green, "Online - Lobby");
+    ImGui::Spacing();
+    ImGui::PushFont(f_bold);
+    ImGui::TextUnformatted("MiraBuilds");
+    ImGui::PopFont();
+    ImGui::TextColored(k.green, "Online - Survival");
+    ImGui::Spacing();
+    ImGui::TextColored(k.muted, "NoraRedstone - Offline");
+    ImGui::EndChild();
+
+    if (!narrow) ImGui::SameLine();
+    else ImGui::Spacing();
+
+    ImGui::BeginChild("##fixture_social_message_area",
+                      ImVec2(-1, narrow ? ui_px(248.0f) : ui_px(322.0f)), true);
+    ImGui::PushFont(f_bold);
+    ImGui::TextUnformatted("AveryStone");
+    ImGui::PopFont();
+    ImGui::TextColored(k.green, "Online now");
+    ImGui::Separator();
+    ImGui::Spacing();
+    card_begin("##fixture_social_message_inbound");
+    ImGui::TextColored(k.brand, "AveryStone");
+    ImGui::TextWrapped("The new profile is ready. Want to test the world seed together?");
+    card_end();
+    ImGui::Spacing();
+    card_begin("##fixture_social_message_outbound");
+    ImGui::TextColored(k.brand_hov, "You");
+    ImGui::TextWrapped("Absolutely - I will join after this visual review pass.");
+    card_end();
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    card_begin("##fixture_social_message_input");
+    ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(-ui_px(94.0f));
+    ImGui::InputTextWithHint("##fixture_social_message_draft", "Messaging is disabled in visual fixtures",
+                             &fixture_draft);
+    ImGui::SameLine();
+    primary_button("Send", ImVec2(ui_px(80.0f), ui_px(32.0f)), false, true);
+    ImGui::EndDisabled();
+    card_end();
+}
+
 void draw_social_messages(UiState& st) {
+    if (st.fixture_mode) {
+        draw_fixture_social_messages(st);
+        return;
+    }
+    consume_social_request_result(st);
+    request_social_remote_cache_refresh(st);
+    const auto remote = snapshot_social_remote_cache();
     auto& social_ui = get_social_ui_state();
     
     page_title("Messages", "Chat with your friends");
+    draw_social_cache_status(st, remote);
+    draw_social_request_feedback(st, "social-conversation-load", "Loading conversation...");
     
     // Friend list sidebar. At narrow widths, stack the list above the
     // conversation so message bubbles and the composer retain usable space.
@@ -530,7 +955,7 @@ void draw_social_messages(UiState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     
-    auto friends = load_social_friends();
+    auto friends = remote.friends;
     int online_count = 0;
     for (auto& f : friends) if (f.is_online) ++online_count;
     ImGui::TextColored(k.muted, "%d online", online_count);
@@ -584,14 +1009,32 @@ void draw_social_messages(UiState& st) {
         if (ImGui::IsItemHovered())
             dl->AddRect(row_min, row_min + ImVec2(ImGui::GetContentRegionAvail().x, row_h),
                         c32(k.border), ui_px(8.0f), 0, ui_px(1.0f));
-        if (ImGui::IsItemClicked()) {
+        const bool retry_selected_friend =
+            social_request_failed(st, "social-conversation-load") &&
+            social_ui.selected_friend_id == friend_.id;
+        if (ImGui::IsItemClicked() && !social_request_lane_busy(st) &&
+            (social_ui.selected_friend_id != friend_.id || retry_selected_friend)) {
             social_ui.selected_friend_id = friend_.id;
             social_ui.message_history.clear();
-            auto& supabase = aml::supabase::SupabaseManager::instance();
-            const auto conversation = supabase.get_or_create_conversation(friend_.id);
-            social_ui.selected_conversation_id = conversation.id;
-            for (const auto& message : supabase.get_messages(conversation.id))
-                social_ui.message_history.push_back(message.sender_username + "\n" + message.content);
+            social_ui.selected_conversation_id.clear();
+            const std::string friend_id = friend_.id;
+            start_social_request(st, "social-conversation-load", [friend_id] {
+                auto& supabase = aml::supabase::SupabaseManager::instance();
+                const auto conversation = supabase.get_or_create_conversation(friend_id);
+                AsyncUiRequestResult result;
+                if (conversation.id.empty()) {
+                    result.title = "Could not open conversation";
+                    result.detail = "The conversation is unavailable. You can select the friend again to retry.";
+                    return result;
+                }
+                result.success = true;
+                result.payload_a = friend_id;
+                result.payload_b = conversation.id;
+                for (const auto& message : supabase.get_messages(conversation.id)) {
+                    result.items.push_back(message.sender_username + "\n" + message.content);
+                }
+                return result;
+            });
         }
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         
@@ -614,7 +1057,8 @@ void draw_social_messages(UiState& st) {
         // Display messages as bubbles
         ImGui::BeginChild("##social_message_history", ImVec2(-1, -1), false);
         
-        const char* self_name = player_display_name(st).empty() ? "You" : player_display_name(st).c_str();
+        const std::string player_name = player_display_name(st);
+        const char* self_name = player_name.empty() ? "You" : player_name.c_str();
         for (auto& message : social_ui.message_history) {
             const size_t sep = message.find('\n');
             const std::string sender = sep == std::string::npos ? "" : message.substr(0, sep);
@@ -643,7 +1087,9 @@ void draw_social_messages(UiState& st) {
             ImGui::Dummy(ImVec2(avail, bubble_h + ui_px(6.0f)));
         }
         
-        if (social_ui.message_history.empty()) {
+        if (social_request_is_working(st, "social-conversation-load")) {
+            ImGui::TextColored(k.muted, "Loading messages...");
+        } else if (social_ui.message_history.empty()) {
             ImGui::TextColored(k.muted, "No messages yet. Start a conversation!");
         }
         
@@ -657,29 +1103,42 @@ void draw_social_messages(UiState& st) {
         ImGui::Spacing();
         
         card_begin("##social_message_input");
+        const bool sending_message = social_request_is_working(st, "social-message-send");
+        const bool messaging_busy = social_request_lane_busy(st);
+        const bool retry_message = social_request_failed(st, "social-message-send");
         ImGui::SetNextItemWidth(-ui_px(100.0f));
+        ImGui::BeginDisabled(messaging_busy || social_ui.selected_conversation_id.empty());
         ImGui::InputText("##social_message_input_text", &social_ui.message_input,
                        ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::EndDisabled();
         
         ImGui::SameLine();
         
-        if (primary_button("Send", ImVec2(ui_px(80.0f), ui_px(32.0f)))) {
+        if (primary_button(sending_message ? "Sending..." :
+                           (retry_message ? "Retry" : "Send"),
+                           ImVec2(ui_px(80.0f), ui_px(32.0f)), sending_message,
+                           messaging_busy || social_ui.selected_conversation_id.empty())) {
             if (!social_ui.message_input.empty()) {
-                auto& supabase = aml::supabase::SupabaseManager::instance();
-                if (social_ui.selected_conversation_id.empty()) {
-                    const auto conversation = supabase.get_or_create_conversation(social_ui.selected_friend_id);
-                    social_ui.selected_conversation_id = conversation.id;
-                }
-                const auto sent = supabase.send_message(social_ui.selected_conversation_id,
-                                                        social_ui.message_input);
-                if (!sent.id.empty()) {
-                    social_ui.message_history.push_back(std::string("You\n") + social_ui.message_input);
-                    social_ui.message_input.clear();
-                } else {
-                    push_notice(st, ui_model::NoticeLevel::Error, "Message Failed", "The message could not be sent");
-                }
+                const std::string friend_id = social_ui.selected_friend_id;
+                const std::string conversation_id = social_ui.selected_conversation_id;
+                const std::string content = social_ui.message_input;
+                start_social_request(st, "social-message-send",
+                    [friend_id, conversation_id, content] {
+                        AsyncUiRequestResult result;
+                        const auto sent = aml::supabase::SupabaseManager::instance()
+                            .send_message(conversation_id, content);
+                        result.success = !sent.id.empty();
+                        result.title = result.success ? "" : "Message failed";
+                        result.detail = result.success ? ""
+                            : "The message was not sent. You can retry.";
+                        result.payload_a = friend_id;
+                        result.payload_b = conversation_id;
+                        result.payload_c = content;
+                        return result;
+                    });
             }
         }
+        draw_social_request_feedback(st, "social-message-send", "Sending message...");
         
         card_end();
     }
@@ -689,18 +1148,78 @@ void draw_social_messages(UiState& st) {
 // Parties Tab
 // ---------------------------------------------------------------------------
 
+static void draw_fixture_social_parties(UiState&) {
+    static std::string fixture_invite_code;
+    page_title("Parties", "Representative local party availability");
+    ImGui::TextColored(k.brand_hov,
+                       "Visual fixture: local sample data only; no account or party service is used.");
+    ImGui::Spacing();
+
+    card_begin("##fixture_social_parties_header");
+    ImGui::PushFont(f_bold);
+    ImGui::TextUnformatted("Parties");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::TextColored(k.muted, "2 available");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(150.0f));
+    ImGui::BeginDisabled();
+    primary_button("+ Create Party", ImVec2(ui_px(140.0f), ui_px(32.0f)), false, true);
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(ui_px(240.0f));
+    ImGui::InputTextWithHint("##fixture_social_party_code", "Invite code", &fixture_invite_code);
+    ImGui::SameLine();
+    ghost_button("Join", ImVec2(ui_px(80.0f), ui_px(32.0f)));
+    ImGui::EndDisabled();
+    card_end();
+
+    struct FixtureParty { const char* name; const char* owner; const char* members; const char* privacy; };
+    static constexpr FixtureParty kParties[] = {
+        {"Redstone Builders", "AveryStone", "3 / 8 members", "Public"},
+        {"Weekend Survival", "MiraBuilds", "2 / 6 members", "Invite only"},
+    };
+    for (const auto& party : kParties) {
+        ImGui::Spacing();
+        card_begin((std::string("##fixture_social_party_") + party.name).c_str());
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted(party.name);
+        ImGui::PopFont();
+        ImGui::TextColored(k.muted, "Owner: %s", party.owner);
+        ImGui::TextColored(k.blue, "%s", party.members);
+        ImGui::SameLine();
+        ImGui::TextColored(std::string(party.privacy) == "Public" ? k.green : k.muted,
+                           "%s", party.privacy);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(82.0f));
+        ImGui::BeginDisabled();
+        primary_button("Join", ImVec2(ui_px(72.0f), ui_px(28.0f)), false, true);
+        ImGui::EndDisabled();
+        card_end();
+    }
+}
+
 void draw_social_parties(UiState& st) {
+    if (st.fixture_mode) {
+        draw_fixture_social_parties(st);
+        return;
+    }
+    consume_social_request_result(st);
+    request_social_remote_cache_refresh(st);
+    const auto remote = snapshot_social_remote_cache();
     auto& social_ui = get_social_ui_state();
     auto& account_manager = aml::account::AccountManager::instance();
     
     page_title("Parties", "Create and join parties with friends");
+    draw_social_cache_status(st, remote);
     
     card_begin("##social_parties_header");
     
     ImGui::TextUnformatted("Parties");
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(200.0f));
     
-    if (primary_button("+ Create Party", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
+    const bool social_action_busy = social_request_lane_busy(st);
+    if (primary_button("+ Create Party", ImVec2(ui_px(150.0f), ui_px(32.0f)), false,
+                       social_action_busy)) {
         social_ui.party_creating = true;
         request_popup("##create_party_popup");
     }
@@ -709,20 +1228,31 @@ void draw_social_parties(UiState& st) {
     
     // Join party input
     ImGui::SetNextItemWidth(ui_px(240.0f));
+    ImGui::BeginDisabled(social_action_busy);
     input_text_hint("##social_party_join", "Enter invite code...", &social_ui.party_invite_code);
+    ImGui::EndDisabled();
     ImGui::SameLine();
     
-    if (ghost_button("Join", ImVec2(ui_px(80.0f), ui_px(32.0f)))) {
+    const bool joining_by_code = social_request_is_working(st, "social-party-join-code");
+    const bool retry_join_by_code = social_request_failed(st, "social-party-join-code");
+    if (ghost_button(joining_by_code ? "Joining..." :
+                     (retry_join_by_code ? "Retry" : "Join"),
+                     ImVec2(ui_px(80.0f), ui_px(32.0f)), social_action_busy)) {
         if (!social_ui.party_invite_code.empty()) {
-            if (aml::supabase::SupabaseManager::instance().join_party(social_ui.party_invite_code)) {
-                push_notice(st, ui_model::NoticeLevel::Success, "Party Joined",
-                            "Successfully joined party");
-                social_ui.party_invite_code.clear();
-            } else {
-                push_notice(st, ui_model::NoticeLevel::Error, "Join Failed", "Invalid or expired invite code");
-            }
+            const std::string invite_code = social_ui.party_invite_code;
+            start_social_request(st, "social-party-join-code", [invite_code] {
+                AsyncUiRequestResult result;
+                result.success = aml::supabase::SupabaseManager::instance().join_party(invite_code);
+                result.title = result.success ? "Party joined" : "Could not join party";
+                result.detail = result.success
+                    ? "You are now in the party."
+                    : "The invite code is invalid or expired. You can retry.";
+                result.payload_a = invite_code;
+                return result;
+            });
         }
     }
+    draw_social_request_feedback(st, "social-party-join-code", "Joining party...");
     
     card_end();
     
@@ -730,12 +1260,17 @@ void draw_social_parties(UiState& st) {
     
     // Create party popup
     if (ImGui::BeginPopup("##create_party_popup")) {
+        if (social_ui.close_create_party_popup) {
+            social_ui.close_create_party_popup = false;
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::TextUnformatted("Create Party");
         ImGui::Separator();
         ImGui::Spacing();
         
         ImGui::TextUnformatted("Party Name");
         ImGui::SetNextItemWidth(ui_px(300.0f));
+        ImGui::BeginDisabled(social_action_busy);
         ImGui::InputText("##create_party_name", &social_ui.party_name);
         
         ImGui::Spacing();
@@ -745,53 +1280,46 @@ void draw_social_parties(UiState& st) {
             social_ui.is_public = true;
         if (ImGui::RadioButton("Private (Invite only)", !social_ui.is_public))
             social_ui.is_public = false;
+        ImGui::EndDisabled();
         
         ImGui::Spacing();
         
-        if (primary_button("Create", ImVec2(ui_px(120.0f), ui_px(32.0f)))) {
+        const bool creating_party = social_request_is_working(st, "social-party-create");
+        const bool retry_create = social_request_failed(st, "social-party-create");
+        if (primary_button(creating_party ? "Creating..." :
+                           (retry_create ? "Retry Create" : "Create"),
+                           ImVec2(ui_px(120.0f), ui_px(32.0f)), creating_party,
+                           social_action_busy)) {
             if (!social_ui.party_name.empty()) {
-                auto party = aml::supabase::SupabaseManager::instance().create_party(
-                    social_ui.party_name, social_ui.is_public);
-                if (!party.id.empty()) {
-                    push_notice(st, ui_model::NoticeLevel::Success, "Party Created",
-                                "Party '" + social_ui.party_name + "' created successfully");
-                    social_ui.party_name.clear();
-                    social_ui.party_creating = false;
-                    ImGui::CloseCurrentPopup();
-                } else {
-                    push_notice(st, ui_model::NoticeLevel::Error, "Party Failed", "The party could not be created");
-                }
+                const std::string party_name = social_ui.party_name;
+                const bool is_public = social_ui.is_public;
+                start_social_request(st, "social-party-create", [party_name, is_public] {
+                    AsyncUiRequestResult result;
+                    const auto party = aml::supabase::SupabaseManager::instance()
+                        .create_party(party_name, is_public);
+                    result.success = !party.id.empty();
+                    result.title = result.success ? "Party created" : "Could not create party";
+                    result.detail = result.success
+                        ? "Party '" + party_name + "' is ready for friends."
+                        : "The party was not created. You can retry.";
+                    return result;
+                });
             }
         }
         
         ImGui::SameLine();
         
-        if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)))) {
+        if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)), social_action_busy)) {
             social_ui.party_name.clear();
             social_ui.party_creating = false;
             ImGui::CloseCurrentPopup();
         }
+        draw_social_request_feedback(st, "social-party-create", "Creating party...");
         
         ImGui::EndPopup();
     }
     
-    std::vector<Party> parties;
-    for (const auto& source : aml::supabase::SupabaseManager::instance().get_parties()) {
-        Party party;
-        party.id = source.id;
-        party.name = source.name;
-        party.owner_id = source.owner_id;
-        party.owner_name = source.owner_username;
-        party.max_members = source.max_members;
-        party.is_public = source.is_public;
-        party.invite_code = source.invite_code;
-        party.created_at = source.created_at;
-        for (const auto& member : aml::supabase::SupabaseManager::instance().get_party_members(source.id)) {
-            party.member_ids.push_back(member.user_id);
-            party.member_names.push_back(member.username);
-        }
-        parties.push_back(std::move(party));
-    }
+    const auto& parties = remote.parties;
     
     if (parties.empty()) {
         empty_state("No Parties", "Create or join a party to play with friends.", "P");
@@ -849,22 +1377,49 @@ void draw_social_parties(UiState& st) {
         // Join/Leave button
         bool is_member = std::find(party.member_ids.begin(), party.member_ids.end(), 
                                    account_manager.get_current_session().id) != party.member_ids.end();
+        const std::string leave_action = "social-party-leave:" + party.id;
+        const std::string join_action = "social-party-join:" + party.id;
+        const std::string disband_action = "social-party-disband:" + party.id;
+        const bool party_action_busy = social_request_lane_busy(st);
         
         if (is_member) {
-            if (ghost_button("Leave", ImVec2(ui_px(80.0f), ui_px(28.0f)))) {
-                if (aml::supabase::SupabaseManager::instance().leave_party(party.id))
-                    push_notice(st, ui_model::NoticeLevel::Success, "Party Left", party.name);
-                else
-                    push_notice(st, ui_model::NoticeLevel::Error, "Leave Failed", "Could not leave the party");
+            const bool leaving = social_request_is_working(st, leave_action);
+            const bool retry_leave = social_request_failed(st, leave_action);
+            if (ghost_button(leaving ? "Leaving..." : (retry_leave ? "Retry" : "Leave"),
+                             ImVec2(ui_px(80.0f), ui_px(28.0f)), party_action_busy)) {
+                const std::string party_id = party.id;
+                const std::string party_name = party.name;
+                start_social_request(st, leave_action, [party_id, party_name] {
+                    AsyncUiRequestResult result;
+                    result.success = aml::supabase::SupabaseManager::instance().leave_party(party_id);
+                    result.title = result.success ? "Party left" : "Could not leave party";
+                    result.detail = result.success
+                        ? party_name + " is no longer in your party list."
+                        : "You are still in the party. You can retry.";
+                    return result;
+                });
             }
         } else {
-            if (primary_button("Join", ImVec2(ui_px(80.0f), ui_px(28.0f)))) {
-                if (aml::supabase::SupabaseManager::instance().join_party(party.invite_code))
-                    push_notice(st, ui_model::NoticeLevel::Success, "Party Joined", party.name);
-                else
-                    push_notice(st, ui_model::NoticeLevel::Error, "Join Failed", "Could not join the party");
+            const bool joining = social_request_is_working(st, join_action);
+            const bool retry_join = social_request_failed(st, join_action);
+            if (primary_button(joining ? "Joining..." : (retry_join ? "Retry" : "Join"),
+                               ImVec2(ui_px(80.0f), ui_px(28.0f)), joining,
+                               party_action_busy)) {
+                const std::string invite_code = party.invite_code;
+                const std::string party_name = party.name;
+                start_social_request(st, join_action, [invite_code, party_name] {
+                    AsyncUiRequestResult result;
+                    result.success = aml::supabase::SupabaseManager::instance().join_party(invite_code);
+                    result.title = result.success ? "Party joined" : "Could not join party";
+                    result.detail = result.success
+                        ? "You joined " + party_name + "."
+                        : "The party could not be joined. You can retry.";
+                    return result;
+                });
             }
         }
+        draw_social_request_feedback(st, leave_action, "Leaving party...");
+        draw_social_request_feedback(st, join_action, "Joining party...");
         
         ImGui::SameLine();
         
@@ -897,12 +1452,21 @@ void draw_social_parties(UiState& st) {
             }
             
             const bool is_owner = party.owner_id == account_manager.get_current_session().id;
-            if (ImGui::MenuItem("Disband Party", nullptr, false, is_owner)) {
-                if (aml::supabase::SupabaseManager::instance().disband_party(party.id))
-                    push_notice(st, ui_model::NoticeLevel::Success, "Party Disbanded", party.name);
-                else
-                    push_notice(st, ui_model::NoticeLevel::Error, "Disband Failed", "Could not disband the party");
+            if (ImGui::MenuItem("Disband Party", nullptr, false,
+                                is_owner && !party_action_busy)) {
+                const std::string party_id = party.id;
+                const std::string party_name = party.name;
+                start_social_request(st, disband_action, [party_id, party_name] {
+                    AsyncUiRequestResult result;
+                    result.success = aml::supabase::SupabaseManager::instance().disband_party(party_id);
+                    result.title = result.success ? "Party disbanded" : "Could not disband party";
+                    result.detail = result.success
+                        ? party_name + " has been disbanded."
+                        : "The party is still active. You can retry.";
+                    return result;
+                });
             }
+            draw_social_request_feedback(st, disband_action, "Disbanding party...");
             
             ImGui::EndPopup();
         }

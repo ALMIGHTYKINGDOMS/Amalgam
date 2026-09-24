@@ -1,13 +1,11 @@
 import { world } from "@minecraft/server";
 import { getState, setLoaded } from "./util/state.js";
-import { loadClientSettings } from "./settings.js";
 import { info, error } from "./util/logger.js";
 
 export function bootstrap() {
   try {
-    loadClientSettings();
     setLoaded(true);
-    info("bootstrap", `loaded ${getState().version}`);
+    info("bootstrap", `loaded ${getState().version} (${getState().channel})`);
     return true;
   } catch (e) {
     error("bootstrap", `load failed: ${e}`);

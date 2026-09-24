@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "ui_internal.h"
+#include "ui_async_request.h"
 #include "ui_motion.h"
 #include "loading_screen.h"
 
@@ -34,12 +35,14 @@
 #include "import_pack.h"
 #include "launch.h"
 #include "official_launcher_bridge.h"
+#include "official_launcher_guard.h"
 #include "online_config.h"
 #include "model.h"
 #include "mods.h"
 #include "provider_config.h"
 #include "net.h"
 #include "performance.h"
+#include "profile_handoff.h"
 #include "readiness.h"
 #include "entitlements.h"
 #include "ui_model.h"
@@ -71,6 +74,7 @@
 #pragma comment(lib, "iphlpapi.lib")
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -139,6 +143,26 @@ ImFont* f_mono = nullptr;   // version ids / log
 float g_ui_scale = 1.0f;
 float g_pending_ui_scale = 0.0f;
 Theme k;
+
+namespace {
+
+// Keep the requested accessibility text scale separate from the per-monitor
+// DPI scale.  A newly built atlas uses it at native resolution; changing the
+// preference mid-session uses ImGui's safe global scale until the next atlas
+// rebuild/restart.
+float g_theme_font_scale = 1.0f;
+float g_font_atlas_scale = 1.0f;
+
+}  // namespace
+
+void set_theme_font_size(float base_size) {
+    const float scale = std::clamp(base_size / 14.0f, 12.0f / 14.0f, 20.0f / 14.0f);
+    g_theme_font_scale = scale;
+    if (ImGui::GetCurrentContext()) {
+        ImGui::GetIO().FontGlobalScale = g_theme_font_scale /
+            std::max(0.001f, g_font_atlas_scale);
+    }
+}
 
 void init_theme() {
     // Reference palette: almost-black navy foundations, cool slate panels,
@@ -238,6 +262,10 @@ void apply_theme() {
 // biggest startup cost.  We defer it until after the first frame renders so
 // the launcher appears instantly; CJK glyphs appear on the next frame.
 static bool g_cjk_deferred_pending = false;
+// Fixture captures intentionally avoid optional host-font discovery. The
+// primary UI typeface still follows the Windows desktop rendering contract,
+// but CJK fallback probes/merges are not needed for the ASCII review matrix.
+static bool g_fixture_font_mode = false;
 
 void build_font_atlas() {
     ImGuiIO& io = ImGui::GetIO();
@@ -249,7 +277,11 @@ void build_font_atlas() {
     // imgui.h:3596 ("Pixels != 0").  ClearFonts() avoids this by only clearing
     // font objects and input data, leaving texture lifecycle to Build().
     io.Fonts->ClearFonts();
+    g_font_atlas_scale = g_theme_font_scale;
     io.FontGlobalScale = 1.0f;
+    const auto font_px = [](float logical_size) {
+        return logical_size * g_ui_scale * g_font_atlas_scale;
+    };
 
     ImFontConfig sharp_font;
     sharp_font.OversampleH = 2;
@@ -284,9 +316,9 @@ void build_font_atlas() {
         builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
         builder.BuildRanges(&cjk_ranges);
     }
-    const bool cjk_font_available =
+    const bool cjk_font_available = !g_fixture_font_mode &&
         GetFileAttributesW(L"C:\\Windows\\Fonts\\msyh.ttc") != INVALID_FILE_ATTRIBUTES;
-    const bool cjk_bold_font_available =
+    const bool cjk_bold_font_available = !g_fixture_font_mode &&
         GetFileAttributesW(L"C:\\Windows\\Fonts\\msyhbd.ttc") != INVALID_FILE_ATTRIBUTES;
     auto merge_cjk_fallback = [&](float pixels, bool bold) {
         if (!cjk_font_available) return;
@@ -301,35 +333,35 @@ void build_font_atlas() {
     };
     io.FontDefault = io.Fonts->AddFontDefault(&sharp_font);
     f_body = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf",
-                                           16.0f * g_ui_scale, &sharp_font,
+                                           font_px(16.0f), &sharp_font,
                                            extended_ranges.Data);
     // Defer CJK merge: skip on first launch for instant appearance.
     // The expensive 19 MB msyh.ttc rasterization happens after the first
     // frame renders so the window appears immediately.
     if (!g_cjk_deferred_pending) {
-        merge_cjk_fallback(16.0f * g_ui_scale, false);
+        merge_cjk_fallback(font_px(16.0f), false);
     }
     if (f_body) io.FontDefault = f_body;
     f_bold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf",
-                                           16.0f * g_ui_scale, &sharp_font,
+                                           font_px(16.0f), &sharp_font,
                                            extended_ranges.Data);
     if (!g_cjk_deferred_pending) {
-        merge_cjk_fallback(16.0f * g_ui_scale, true);
+        merge_cjk_fallback(font_px(16.0f), true);
     }
     f_title = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf",
-                                            26.0f * g_ui_scale, &sharp_font,
-                                            extended_ranges.Data);
+                                            font_px(26.0f), &sharp_font,
+                                           extended_ranges.Data);
     if (!g_cjk_deferred_pending) {
-        merge_cjk_fallback(26.0f * g_ui_scale, true);
+        merge_cjk_fallback(font_px(26.0f), true);
     }
     f_h2 = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf",
-                                        18.0f * g_ui_scale, &sharp_font,
+                                        font_px(18.0f), &sharp_font,
                                         extended_ranges.Data);
     f_small = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf",
-                                           13.0f * g_ui_scale, &sharp_font,
+                                           font_px(13.0f), &sharp_font,
                                            extended_ranges.Data);
     f_mono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf",
-                                          14.0f * g_ui_scale, &sharp_font,
+                                          font_px(14.0f), &sharp_font,
                                           extended_ranges.Data);
     if (!f_bold) f_bold = f_body ? f_body : io.FontDefault;
     if (!f_title) f_title = f_bold;
@@ -346,6 +378,7 @@ void build_font_atlas() {
 // will repack on the next frame.
 void merge_cjk_deferred_fonts() {
     ImGuiIO& io = ImGui::GetIO();
+    if (g_fixture_font_mode) return;
     const bool cjk_font_available =
         GetFileAttributesW(L"C:\\Windows\\Fonts\\msyh.ttc") != INVALID_FILE_ATTRIBUTES;
     const bool cjk_bold_font_available =
@@ -372,12 +405,12 @@ void merge_cjk_deferred_fonts() {
         io.Fonts->AddFontFromFileTTF(path, size, &fallback, cjk_ranges.Data);
         fallback.DstFont = nullptr;
     };
-    add_merge(f_body, 16.0f * g_ui_scale, false);
-    add_merge(f_bold, 16.0f * g_ui_scale, true);
-    add_merge(f_title, 26.0f * g_ui_scale, true);
-    add_merge(f_h2, 18.0f * g_ui_scale, true);
-    add_merge(f_small, 13.0f * g_ui_scale, false);
-    add_merge(f_mono, 14.0f * g_ui_scale, false);
+    add_merge(f_body, 16.0f * g_ui_scale * g_font_atlas_scale, false);
+    add_merge(f_bold, 16.0f * g_ui_scale * g_font_atlas_scale, true);
+    add_merge(f_title, 26.0f * g_ui_scale * g_font_atlas_scale, true);
+    add_merge(f_h2, 18.0f * g_ui_scale * g_font_atlas_scale, true);
+    add_merge(f_small, 13.0f * g_ui_scale * g_font_atlas_scale, false);
+    add_merge(f_mono, 14.0f * g_ui_scale * g_font_atlas_scale, false);
 }
 
 void rebuild_dpi_resources(float scale) {
@@ -410,18 +443,42 @@ void navigate_to(UiState& st, int sidebar_item, int tab, int provider_tab) {
     if (provider_tab >= 0) st.provider_tab = provider_tab;
 }
 
+// Keep high-traffic navigation in named helpers rather than duplicating raw
+// sidebar/tab integers at each button and notice action. This prevents a
+// visually plausible control from landing on an unrelated surface.
+void open_downloads_surface(UiState& st) {
+    navigate_to(st, 4, 17);
+    st.downloads_open = true;
+}
+
+void request_microsoft_connect_surface(UiState& st) {
+    // Opening the consent dialog lets the player decide when to begin the
+    // external Microsoft device-code flow. It is not a navigation to an
+    // unrelated launcher page.
+    st.ms_connect_popup_open = true;
+}
+
 void seed_visual_fixture(UiState& st) {
     // Never call this from the normal launcher. It exists solely so release
     // review can exercise the complete responsive shell without network data,
     // a Microsoft account, or a user's own profiles.
     const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    // Snapshot data belongs beside the evidence output, never beside the
+    // launcher executable or a reviewer-owned profile.  The fallback keeps
+    // older programmatic fixture callers working while the CLI always passes
+    // an explicit isolated root.
+    const std::wstring fixture_root = st.fixture_root.empty()
+        ? st.exe_dir + L"\\visual-fixture"
+        : st.fixture_root;
     st.selected = "1.21.1";
     st.fetching = false;
     st.home_fetching = false;
-    st.account.username = "Visual Review";
-    st.account.uuid = "visual-fixture";
+    // Visual-review snapshots deliberately model a signed-out player.  Keeping
+    // a fixture name here made Home say "Welcome back" while it also offered
+    // a sign-in action, which is confusing evidence for reviewers.
+    st.account = {};
     st.auth_checked = true;
-    st.auth_status = "Visual-review fixture";
+    st.auth_status = "Visual-review fixture: signed out";
 
     instances::Instance first;
     first.id = "fixture-astral";
@@ -433,7 +490,7 @@ void seed_visual_fixture(UiState& st) {
     first.pack_version = "fixture-a";
     first.favorite = true;
     first.last_played = now - 60 * 38;
-    first.directory = st.exe_dir + L"\\visual-fixture\\astral-frontier";
+    first.directory = (std::filesystem::path(fixture_root) / L"astral-frontier").wstring();
 
     instances::Instance second;
     second.id = "fixture-forge";
@@ -444,7 +501,7 @@ void seed_visual_fixture(UiState& st) {
     second.pack_project = "fixture-forge";
     second.pack_version = "fixture-b";
     second.last_played = now - 60 * 60 * 24;
-    second.directory = st.exe_dir + L"\\visual-fixture\\forge-fables";
+    second.directory = (std::filesystem::path(fixture_root) / L"forge-fables").wstring();
 
     instances::Instance third;
     third.id = "fixture-custom";
@@ -453,7 +510,7 @@ void seed_visual_fixture(UiState& st) {
     third.loader = "neoforge";
     third.performance_profile = "performance";
     third.last_played = now - 60 * 60 * 24 * 4;
-    third.directory = st.exe_dir + L"\\visual-fixture\\creative-workshop";
+    third.directory = (std::filesystem::path(fixture_root) / L"creative-workshop").wstring();
     st.instance_list = {first, second, third};
     st.instances_loaded = true;
     st.selected_instance = first;
@@ -471,6 +528,42 @@ void seed_visual_fixture(UiState& st) {
             std::filesystem::path(instance.directory) / L".amalgam-install.json",
             std::ios::binary);
         if (install_marker) install_marker << "{}";
+    }
+    // Screenshot-grid cases intentionally reuse a bundled visual asset as a
+    // local fixture image. This exercises actual image decoding and grid/list
+    // layout without copying or inspecting any player screenshots.
+    if (st.fixture_case == "screenshots" || st.fixture_case == "screenshots-grid" ||
+        st.fixture_case == "screenshots-list" ||
+        st.fixture_case == "screenshots-filtered-empty" ||
+        st.fixture_case == "screenshots-context-menu" ||
+        st.fixture_case == "profile-screenshots") {
+        const std::filesystem::path source =
+            std::filesystem::path(st.exe_dir) / L"branding" / L"amalgam-cover-portal.png";
+        if (std::filesystem::exists(source)) {
+            for (size_t i = 0; i < st.instance_list.size(); ++i) {
+                std::error_code copy_error;
+                const std::filesystem::path target =
+                    std::filesystem::path(st.instance_list[i].directory) / L"screenshots" /
+                    (L"fixture-screenshot-" + std::to_wstring(i + 1) + L".png");
+                std::filesystem::copy_file(source, target,
+                                           std::filesystem::copy_options::skip_existing,
+                                           copy_error);
+            }
+        }
+    }
+
+    // The profile Worlds tab is a real directory-driven view. Seed one
+    // disposable, local-only save folder for its populated visual fixture so
+    // its evidence demonstrates the useful state rather than an empty alias.
+    if (st.fixture_case == "profile-worlds" && !st.instance_list.empty()) {
+        std::error_code world_error;
+        const std::filesystem::path world =
+            std::filesystem::path(st.instance_list.front().directory) / L"saves" / L"Aurora Basin";
+        std::filesystem::create_directories(world, world_error);
+        if (!world_error) {
+            std::ofstream level_marker(world / L"level.dat", std::ios::binary);
+            if (level_marker) level_marker << "fixture-world";
+        }
     }
 
     auto project = [](const char* slug, const char* title, const char* description,
@@ -506,6 +599,34 @@ void seed_visual_fixture(UiState& st) {
     std::vector<mods::SearchResult> combined = st.home_packs;
     combined.insert(combined.end(), st.home_mods.begin(), st.home_mods.end());
     st.home_screen.accept(request_id, std::move(combined), true);
+
+    // Deep Discover captures use a completed local catalog.  Without this,
+    // the regular auto-search path would make a visual fixture depend on a
+    // provider request (and could display a different result on every run).
+    {
+        std::lock_guard<std::mutex> lock(st.mod_mu);
+        st.mod_results = st.home_packs;
+        st.mod_results.insert(st.mod_results.end(), st.home_mods.begin(), st.home_mods.end());
+        mods::SearchResult shader = st.home_mods[2];
+        shader.slug = "complementary-reimagined";
+        shader.title = "Complementary Reimagined";
+        shader.description = "Cinematic lighting for a stable Minecraft setup.";
+        shader.type = mods::ProjectType::Shader;
+        st.mod_results.push_back(std::move(shader));
+        mods::SearchResult resource = st.home_mods[3];
+        resource.slug = "fresh-animations";
+        resource.title = "Fresh Animations";
+        resource.description = "Expressive models and polished world detail.";
+        resource.type = mods::ProjectType::ResourcePack;
+        st.mod_results.push_back(std::move(resource));
+        st.modrinth_result_count = 5;
+        st.curseforge_result_count = 1;
+        const uint64_t catalog_request = st.next_request_id.fetch_add(1);
+        st.mod_screen.begin(catalog_request);
+        st.mod_screen.accept(catalog_request, st.mod_results, true);
+    }
+    st.browse_initial_request_sent = true;
+    st.browse_grid_view = true;
 
     UiState::DownloadJob completed;
     completed.id = st.next_job_id++;
@@ -574,6 +695,35 @@ void seed_visual_fixture(UiState& st) {
     // captures exercise the recovery card without scrolling.
     st.jobs.insert(st.jobs.begin() + 1, std::move(failed_download));
 
+    // A small mixed log set gives every deterministic Log Source capture a
+    // meaningful, non-sensitive body without reading the reviewer's logs.
+    {
+        std::lock_guard<std::mutex> lock(st.log_mu);
+        st.logs = {
+            "[info] [launcher] Visual fixture started safely.",
+            "[ok] [profile] Astral Frontier content index is healthy.",
+            "[info] [mods] Sodium update check completed with no action needed.",
+            "[warn] [game] A shader option will apply after the next game launch.",
+            "[info] [debug] Fixture route selected for visual QA."
+        };
+        // Give the page-level fixture viewer a realistic, deterministic event
+        // timeline. This is in-memory sample text only; it lets the legitimate
+        // middle/bottom evidence positions show different log regions without
+        // reading a player's live launcher or game logs.
+        constexpr const char* fixture_log_sources[] = {
+            "launcher", "profile", "mods", "game", "debug"
+        };
+        for (int checkpoint = 1; checkpoint <= 30; ++checkpoint) {
+            const char* source = fixture_log_sources[(checkpoint - 1) % 5];
+            const char* level = checkpoint % 11 == 0 ? "[warn]" :
+                                checkpoint % 7 == 0 ? "[ok]" : "[info]";
+            st.logs.push_back(std::string(level) + " [" + source +
+                              "] Visual QA timeline checkpoint " +
+                              std::to_string(checkpoint) + " is review-only.");
+        }
+        st.log_revision.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // ── Server fixture ────────────────────────────────────────────
     // Give the Servers page realistic local + cloud data so release review
     // can exercise the detail panel, cards, and cloud views.
@@ -585,8 +735,8 @@ void seed_visual_fixture(UiState& st) {
         local.allocated_ram_mb = 8192;
         local.max_players = 20;
         local.port = 25565;
-        local.server_directory =
-            aml::net::to_utf8(st.exe_dir) + "\\visual-fixture\\server-forsaken";
+        local.server_directory = aml::net::to_utf8(
+            (std::filesystem::path(fixture_root) / L"server-forsaken").wstring());
         local.stage = server::ServerStage::Running;
         local.status_message = "02:31:42 uptime";
 
@@ -597,8 +747,8 @@ void seed_visual_fixture(UiState& st) {
         stopped.allocated_ram_mb = 4096;
         stopped.max_players = 10;
         stopped.port = 25566;
-        stopped.server_directory =
-            aml::net::to_utf8(st.exe_dir) + "\\visual-fixture\\server-creative";
+        stopped.server_directory = aml::net::to_utf8(
+            (std::filesystem::path(fixture_root) / L"server-creative").wstring());
         stopped.stage = server::ServerStage::Stopped;
         st.servers = {local, stopped};
 
@@ -621,18 +771,25 @@ void seed_visual_fixture(UiState& st) {
         }
 
         st.server_metrics.valid = true;
+        st.server_metrics.cpu_valid = true;
+        st.server_metrics.ram_valid = true;
+        st.server_metrics.tps_valid = true;
+        st.server_metrics.players_valid = true;
         st.server_metrics.ram_mb = 3277;
         st.server_metrics.ram_percent = 40.0f;
         st.server_metrics.cpu_percent = 14.0f;
         st.server_metrics.players_online = 4;
         st.server_metrics.tps = 19.8f;
 
-        // Console log fixture for the console tab
-        st.server_console_log.push_back({"[12:00:01]", "[Server thread/INFO]: Starting minecraft server version 1.20.1"});
-        st.server_console_log.push_back({"[12:00:02]", "[Server thread/INFO]: Loading properties"});
-        st.server_console_log.push_back({"[12:00:03]", "[Server thread/INFO]: Preparing level \"world\""});
-        st.server_console_log.push_back({"[12:00:04]", "[Server thread/INFO]: Done (1.234s)! For help, type \"help\""});
-        st.server_console_log.push_back({"[12:00:05]", "[Server thread/INFO]: Player connected: Alex"});
+        // Console log fixture for the console tab.  Assignment, rather than
+        // appending, keeps repeated named captures byte-for-byte stable.
+        st.server_console_log = {
+            {"[12:00:01]", "[Server thread/INFO]: Starting minecraft server version 1.20.1"},
+            {"[12:00:02]", "[Server thread/INFO]: Loading properties"},
+            {"[12:00:03]", "[Server thread/INFO]: Preparing level \"world\""},
+            {"[12:00:04]", "[Server thread/INFO]: Done (1.234s)! For help, type \"help\""},
+            {"[12:00:05]", "[Server thread/INFO]: Player connected: Alex"},
+        };
 
         // ── Essentials fixture ────────────────────────────────────
         // Visual-review only: gives the AAA social hub real-looking rows so
@@ -697,6 +854,746 @@ void seed_visual_fixture(UiState& st) {
             };
             ess::SessionManager::instance().seed_fixture_notifications(fixture_notifs);
         }
+    }
+}
+
+// Every token below has a deterministic state mapping in
+// apply_visual_fixture_case().  The registry intentionally rejects arbitrary
+// flags so a visual capture cannot accidentally inherit player data or open an
+// unsupported/ambiguous route.  Keep this as the single canonical collection:
+// --ui-snapshot validates against it, while --list-ui-fixtures serializes the
+// same collection for the release evidence runner.
+const std::set<std::string>& visual_fixture_cases() {
+    static const std::set<std::string> kCases = {
+        "home",
+        "discover", "discover-loading", "discover-error", "discover-empty",
+        "discover-modpacks", "discover-mods", "discover-shaders",
+        "discover-resource-packs", "discover-data-packs",
+        "library", "library-modpacks", "library-worlds", "library-worlds-populated",
+        "library-collections",
+        "library-group-create-for-profile", "library-group-rename", "library-group-delete",
+        "library-move-to-group-menu",
+        "profile", "profile-overview", "profile-content", "profile-content-empty",
+        "profile-content-ready", "profile-content-filtered", "profile-content-loading",
+        "profile-content-error", "profile-worlds", "profile-screenshots",
+        "profile-versions", "profile-logs", "profile-settings", "profile-ai",
+        "profile-move-recovery-confirm", "profile-move-recovery-working",
+        "profile-move-recovery-error", "profile-restore-latest-confirm",
+        "profile-restore-latest-error", "profile-delete-restore-point-confirm",
+        "profile-delete-restore-point-error", "profile-restore-options-confirm",
+        "profile-restore-options-error", "profile-change-version-confirm",
+        "profile-change-version-no-backup", "profile-change-loader-confirm",
+        "profile-creator-update-confirm", "profile-creator-update-copy-confirm",
+        "profile-actions-menu",
+        "project", "project-loading", "project-error", "project-info", "project-content",
+        "project-changelog", "project-versions",
+        "project-content-install-confirm", "project-content-install-conflict",
+        "downloads", "downloads-active", "downloads-queued", "downloads-completed",
+        "downloads-failed", "downloads-empty", "screenshots", "screenshots-empty",
+        "screenshots-grid", "screenshots-list", "screenshots-filtered-empty",
+        "screenshots-context-menu", "instances",
+        "profiles", "play", "notice-center", "downloads-panel", "quick-search",
+        "account-dropdown", "microsoft-connect",
+        "settings", "settings-general", "settings-account", "settings-minecraft",
+        "settings-launcher", "settings-update-idle", "settings-update-checking",
+        "settings-update-up-to-date", "settings-update-available", "settings-update-mandatory",
+        "settings-update-offline", "settings-update-error", "settings-downloads", "settings-modpacks",
+        "settings-java",
+        "settings-modpacks-ai-installing", "settings-modpacks-ai-verifying",
+        "settings-modpacks-ai-component-error",
+        "settings-performance", "settings-notifications", "settings-privacy",
+        "settings-advanced", "settings-translation", "settings-admin",
+        "settings-admin-password-change", "settings-diagnostics", "settings-diagnostics-results",
+        "account", "account-portal", "account-overview", "account-profile",
+        "account-settings", "account-security", "account-sessions", "account-activity",
+        "account-profile-edit", "account-profile-edit-error",
+        "account-security-password-validation", "account-security-password-working",
+        "account-security-password-error",
+        "servers", "server-detail", "server-overview", "server-console", "server-files",
+        "server-players", "server-plugins", "server-properties", "server-world",
+        "server-create", "server-file-delete-confirm", "server-file-delete-error",
+        "server-file-preview", "server-file-context-menu", "server-create-validation",
+        "server-create-error", "server-backup-restore-confirm", "server-backup-restore-error",
+        "server-remove-confirm", "server-remove-error", "cloud",
+        "bedrock", "bedrock-overview", "bedrock-not-installed", "bedrock-profiles",
+        "bedrock-worlds", "bedrock-backups", "bedrock-addons", "bedrock-addons-installed",
+        "bedrock-addons-discover", "bedrock-addons-import", "bedrock-create-profile",
+        "bedrock-create-profile-version", "bedrock-create-profile-review",
+        "bedrock-create-profile-validation", "bedrock-create-profile-error",
+        "bedrock-edit-profile", "bedrock-edit-profile-validation", "bedrock-edit-profile-error",
+        "bedrock-profile-actions-menu",
+        "bedrock-profile-metadata-remove-confirm", "bedrock-profile-metadata-remove-working",
+        "bedrock-profile-metadata-remove-error", "bedrock-world-delete-confirm",
+        "bedrock-world-delete-working", "bedrock-world-delete-error",
+        "bedrock-backup-restore-confirm", "bedrock-backup-restore-working",
+        "bedrock-backup-restore-error", "bedrock-backup-delete-confirm",
+        "bedrock-backup-delete-working", "bedrock-backup-delete-error",
+        "bedrock-addon-delete-confirm", "bedrock-addon-delete-working",
+        "bedrock-addon-delete-error",
+        "essentials", "social", "essentials-friends", "essentials-invites",
+        "essentials-sessions", "essentials-notifications", "essentials-messages",
+        "essentials-parties", "essentials-host-dialog", "essentials-invite-dialog",
+        "essentials-join-dialog", "essentials-session-manager",
+        "essentials-host-dialog-working", "essentials-host-dialog-error",
+        "essentials-invite-dialog-working", "essentials-invite-dialog-error",
+        "essentials-join-dialog-checking", "essentials-join-dialog-error",
+        "essentials-join-dialog-incompatible", "essentials-join-dialog-syncing",
+        "essentials-session-manager-working", "essentials-session-manager-error",
+        "essentials-friend-context-menu", "essentials-friend-profile",
+        "essentials-friend-profile-remove-working", "essentials-friend-profile-remove-error",
+        "essentials-friend-profile-block-working", "essentials-friend-profile-block-error",
+        "mods", "mod-manager-installed", "mod-manager-installed-menu", "mod-manager-browse",
+        "mod-manager-browse-menu", "mod-manager-updates", "mod-manager-operation-working",
+        "mod-manager-update-check-working", "mod-manager-update-check-error",
+        "mod-manager-dependencies", "mod-manager-settings", "mod-manager-publish",
+        "mod-manager-move-recovery-confirm", "mod-manager-move-recovery-working",
+        "mod-manager-move-recovery-error", "mod-manager-details",
+        "mod-manager-dependency-graph",
+        "performance", "performance-monitor", "performance-monitor-gpu-loading",
+        "performance-monitor-gpu-error", "performance-cache", "performance-cache-loading",
+        "performance-cache-cleanup-working", "performance-cache-error", "performance-offline",
+        "performance-offline-syncing", "performance-offline-sync-complete",
+        "performance-offline-sync-error", "performance-settings", "performance-clear-cache-confirm",
+        "theme", "theme-themes", "theme-colors", "theme-fonts",
+        "theme-accessibility", "theme-accessibility-high-contrast",
+        "theme-accessibility-color-vision", "theme-accessibility-reduced-motion",
+        "theme-localization", "theme-localization-12-hour",
+        "admin", "admin-login", "admin-dashboard", "admin-users", "admin-servers",
+        "admin-nodes", "admin-storage", "admin-settings", "admin-project-review",
+        "admin-feedback", "admin-delete-server-confirm", "admin-project-reject-confirm",
+        "admin-delete-server-error", "admin-stop-server-confirm", "admin-stop-server-error",
+        "admin-restart-server-confirm", "admin-restart-server-error",
+        "admin-deregister-node-confirm", "admin-deregister-node-error",
+        "admin-check-all-nodes-confirm", "admin-project-approve-confirm",
+        "admin-project-approve-error", "admin-project-reject-error",
+        "admin-project-takedown-confirm", "admin-project-takedown-error",
+        "admin-server-actions-menu", "admin-node-actions-menu", "admin-storage-bucket-menu",
+        "java", "java-managed-install-dialog", "java-managed-install-working",
+        "java-managed-remove-confirm", "java-runtime-actions",
+        "backups", "backups-populated", "logs", "logs-latest", "logs-profile", "logs-launcher",
+        "logs-game", "logs-debug", "config", "config-theme-picker",
+        "theme-shell-default-light", "theme-shell-midnight",
+        "theme-shell-solarized", "theme-shell-dracula",
+        "toast-success", "toast-error", "toast-stack", "tooltip-nav",
+        "wizard-profile-source", "wizard-profile-source-vanilla", "wizard-profile-source-modrinth",
+         "wizard-profile-source-curseforge", "wizard-profile-source-ai", "wizard-profile-source-import",
+         "wizard-profile-source-validation", "wizard-profile-target",
+         "wizard-profile-target-unsupported", "wizard-profile-performance",
+         "wizard-profile-performance-loader-unsupported", "wizard-profile-review",
+        "wizard-profile-resolve-loading", "wizard-profile-resolve-error", "dialog-recovery", "dialog-known-issues", "dialog-feedback",
+        "dialog-local-feedback", "dialog-sign-in", "dialog-sign-in-validation",
+        "dialog-sign-in-working", "dialog-sign-in-error", "dialog-register",
+        "wizard-account-welcome", "wizard-account-create", "wizard-account-create-validation",
+        "wizard-account-verify-email", "wizard-account-connect-minecraft",
+        "wizard-account-complete", "wizard-account-error", "wizard-account-working",
+        "dialog-password-reset", "wizard-password-reset-email", "wizard-password-reset-code",
+        "wizard-password-reset-new-password", "wizard-password-reset-working",
+        "wizard-password-reset-error", "wizard-password-reset-success",
+        "dialog-microsoft-sign-in", "dialog-microsoft-sign-in-starting",
+        "dialog-microsoft-sign-in-code", "dialog-microsoft-sign-in-waiting",
+        "dialog-microsoft-sign-in-connected", "dialog-microsoft-sign-in-error",
+        "dialog-microsoft-sign-in-official-launcher-fallback",
+        "dialog-amalgam-signout-this-device", "dialog-remove-local-remembered-session",
+        "dialog-remove-local-accounts", "dialog-remove-local-accounts-ready",
+        "dialog-minecraft-disconnect", "dialog-account-action-state-changed",
+        "dialog-account-action-local-error"
+    };
+    return kCases;
+}
+
+bool is_visual_fixture_case(const std::string& fixture_case) {
+    const auto& cases = visual_fixture_cases();
+    return cases.find(fixture_case) != cases.end();
+}
+
+static bool is_profile_data_fixture_case_name(const std::string& fixture_case) {
+    return fixture_case == "profile-move-recovery-confirm" ||
+           fixture_case == "profile-move-recovery-working" ||
+           fixture_case == "profile-move-recovery-error" ||
+           fixture_case == "profile-restore-latest-confirm" ||
+           fixture_case == "profile-restore-latest-error" ||
+           fixture_case == "profile-delete-restore-point-confirm" ||
+           fixture_case == "profile-delete-restore-point-error" ||
+           fixture_case == "profile-restore-options-confirm" ||
+           fixture_case == "profile-restore-options-error";
+}
+
+static bool is_profile_recovery_fixture_case(const UiState& st) {
+    return st.fixture_mode && is_profile_data_fixture_case_name(st.fixture_case);
+}
+
+static void apply_visual_fixture_case(UiState& st) {
+    // Reset every route-local selection before selecting the requested state.
+    // A snapshot executable captures one case then exits, but this also keeps
+    // programmatic review runs deterministic if they reuse the UI process.
+    st.active_tab = 0;
+    st.sidebar_item = 0;
+    st.provider_tab = 0;
+    st.library_section = 0;
+    st.settings_section = 0;
+    st.discover_sub_tab = 0;
+    st.browse_category = 0;
+    st.content_filter = 0;
+    st.content_search.clear();
+    st.operation_filter = 0;
+    st.screenshot_search.clear();
+    st.instance_search.clear();
+    st.instance_sort = 0;
+    st.instance_filter_idx = 0;
+    st.backup_filter.clear();
+    st.log_filter.clear();
+    st.instance_detail_open = false;
+    st.instance_detail_tab = 0;
+    st.profile_data_confirm_open = false;
+    st.profile_data_confirm_action = 0;
+    st.profile_data_confirm_instance = {};
+    st.profile_data_confirm_path.clear();
+    st.profile_data_confirm_label.clear();
+    st.profile_data_confirm_error.clear();
+    st.install_confirm_open = false;
+    st.install_confirm_modpack = false;
+    st.install_confirm_project = {};
+    st.install_confirm_target = {};
+    st.install_confirm_dependencies.clear();
+    st.install_confirm_conflict_files.clear();
+    st.install_confirm_conflicts = 0;
+    st.pack_update_confirm_open = false;
+    st.pack_update_confirm_copy = false;
+    st.pack_update_confirm_version.clear();
+    st.pack_update_confirm_target = {};
+    st.version_change_kind = 0;
+    st.version_change_backup = true;
+    st.version_change_backup_error.clear();
+    st.new_group_name.clear();
+    st.group_target.clear();
+    st.rename_group_target.clear();
+    st.delete_group_target.clear();
+    st.admin_password.clear();
+    st.admin_password_confirm.clear();
+    st.admin_status.clear();
+    st.fixture_theme_selector_open = false;
+    clear_toasts();
+    // Reset the profile-only identity as well as its selected tab.  Otherwise
+    // an in-process capture of profile-ai can make the next normal profile
+    // look AI-enabled.
+    st.selected_instance.is_ai_profile = false;
+    st.selected_instance.ai_mode = 0;
+    st.project_detail_open = false;
+    st.project_detail_tab = 0;
+    st.project_detail = {};
+    st.project_loading = false;
+    {
+        std::lock_guard<std::mutex> lock(st.project_mu);
+        st.project_info = {};
+        st.project_error.clear();
+        st.project_screen = {};
+    }
+    st.update_status.state.store(updater::CheckState::Idle);
+    st.update_status.available_version.clear();
+    st.update_status.error.clear();
+    st.update_status.notes.clear();
+    st.update_status.staged.store(false);
+    st.update_status.signature_verified.store(false);
+    st.update_status.manifest_signed.store(false);
+    st.update_check_started.store(false);
+    st.ui_diagnostics_results.clear();
+    st.ui_diagnostics_ran = false;
+    st.admin_unlocked = false;
+    st.wizard_open = false;
+    st.wizard_step = 0;
+    st.wizard_source = 0;
+    st.wizard_project.clear();
+    st.wizard_last_project.clear();
+    st.wizard_resolving = false;
+    {
+        std::lock_guard<std::mutex> lock(st.wizard_resolve_mu);
+        st.wizard_resolve_error.clear();
+        st.wizard_resolved_loaders.clear();
+        st.wizard_resolved_versions.clear();
+        st.wizard_resolved_title.clear();
+        st.wizard_resolved_icon.clear();
+    }
+    st.login_popup_open = false;
+    st.register_popup_open = false;
+    st.password_reset_popup_open = false;
+    st.microsoft_login_popup_open = false;
+    st.login_wizard_open = false;
+    st.feedback_open = false;
+    st.local_feedback_open = false;
+    st.known_issues_open = false;
+    st.recovery_dialog_open = false;
+    st.notice_center_open = false;
+    st.downloads_open = false;
+    st.account_dropdown_open = false;
+    st.ms_connect_popup_open = false;
+    {
+        std::lock_guard<std::mutex> lock(st.readiness_mu);
+        st.readiness_checked = true;
+        st.readiness_report = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(st.home_readiness.mu);
+        st.home_readiness.ready_profiles = 2;
+        st.home_readiness.attention_profiles = 1;
+        st.home_readiness.first_issue = "Aurora Frontier: optional updates are available";
+    }
+    st.home_readiness.computing.store(false);
+    st.home_readiness.dirty.store(false);
+    reset_fixture_server_state();
+    set_fixture_server_create_open(false);
+
+    const std::string& c = st.fixture_case;
+    if (c == "notice-center") {
+        st.notice_center_open = true;
+    } else if (c == "downloads-panel") {
+        st.downloads_open = true;
+    } else if (c == "quick-search") {
+        reset_quick_search_fixture_state();
+        open_quick_search();
+    } else if (c == "account-dropdown") {
+        st.account_dropdown_open = true;
+    } else if (c == "microsoft-connect") {
+        st.ms_connect_popup_open = true;
+    } else if (c == "discover" || c.rfind("discover-", 0) == 0) {
+        st.active_tab = 16;
+        st.sidebar_item = 2;
+        if (c == "discover-loading" || c == "discover-error" || c == "discover-empty") {
+            std::lock_guard<std::mutex> lock(st.mod_mu);
+            st.home_packs.clear();
+            st.home_mods.clear();
+            st.home_error = c == "discover-error"
+                                ? "The catalog could not be loaded. Check your connection and try again."
+                                : "";
+            st.home_fetching = c == "discover-loading";
+            const uint64_t request_id = st.next_request_id.fetch_add(1);
+            st.home_screen.begin(request_id);
+            if (c == "discover-error") {
+                st.home_screen.fail(request_id, st.home_error, true);
+            } else if (c == "discover-empty") {
+                st.home_screen.accept(request_id, {}, false);
+            }
+        } else if (c == "discover-modpacks") { st.discover_sub_tab = 1; st.browse_category = 1; }
+        else if (c == "discover-mods") { st.discover_sub_tab = 2; st.browse_category = 0; }
+        else if (c == "discover-shaders") { st.discover_sub_tab = 3; st.browse_category = 2; }
+        else if (c == "discover-resource-packs") { st.discover_sub_tab = 4; st.browse_category = 3; }
+        else if (c == "discover-data-packs") { st.discover_sub_tab = 5; st.browse_category = 4; }
+    } else if (c == "library" || c == "library-modpacks" || c == "library-worlds" ||
+               c == "library-worlds-populated" ||
+               c == "library-collections" || c.rfind("library-group-", 0) == 0 ||
+               c == "library-move-to-group-menu") {
+        st.active_tab = 6;
+        st.sidebar_item = 3;
+        if (c == "library-worlds" || c == "library-worlds-populated") st.library_section = 1;
+        else if (c == "library-collections" || c == "library-group-rename" ||
+                 c == "library-group-delete") st.library_section = 2;
+    } else if (c == "profile" || c.rfind("profile-", 0) == 0) {
+        st.active_tab = 6;
+        st.sidebar_item = 3;
+        st.instance_detail_open = true;
+        if (c == "profile-content" || c.rfind("profile-content-", 0) == 0) {
+            st.instance_detail_tab = 1;
+            if (c == "profile-content-filtered") st.content_filter = 3;
+        } else if (c == "profile-worlds") st.instance_detail_tab = 2;
+        else if (c == "profile-screenshots") st.instance_detail_tab = 3;
+        else if (c == "profile-versions") st.instance_detail_tab = 4;
+        else if (c == "profile-logs") st.instance_detail_tab = 5;
+        else if (c == "profile-settings") st.instance_detail_tab = 6;
+        else if (is_profile_data_fixture_case_name(c)) st.instance_detail_tab = 6;
+        else if (c == "profile-change-version-confirm" ||
+                 c == "profile-change-version-no-backup" ||
+                 c == "profile-change-loader-confirm") st.instance_detail_tab = 4;
+        else if (c == "profile-creator-update-confirm" ||
+                 c == "profile-creator-update-copy-confirm") st.instance_detail_tab = 0;
+        else if (c == "profile-ai") {
+            st.instance_detail_tab = 7;
+            st.selected_instance.is_ai_profile = true;
+            st.selected_instance.ai_mode = 0;
+        }
+    } else if (c == "project" || c.rfind("project-", 0) == 0) {
+        st.active_tab = 1;
+        st.sidebar_item = 2;
+        st.project_detail_open = true;
+        if (c == "project-loading" || c == "project-error") {
+            // Stage the same retained-information composition as a live
+            // project request, but never create a provider worker from a
+            // visual-review snapshot.
+            st.project_detail = st.home_packs.empty() ? mods::SearchResult{} : st.home_packs.front();
+            if (st.project_detail.slug.empty()) {
+                st.project_detail.slug = "aurora-frontier-fixture";
+                st.project_detail.title = "Aurora Frontier";
+                st.project_detail.description = "A deterministic local project preview.";
+                st.project_detail.source = "modrinth";
+                st.project_detail.type = mods::ProjectType::Modpack;
+                st.project_detail.downloads = 12400000;
+            }
+            mods::ModInfo retained;
+            retained.slug = st.project_detail.slug;
+            retained.title = st.project_detail.title;
+            retained.description = st.project_detail.description;
+            retained.body = "Representative project information remains visible while release details recover.";
+            retained.author = "Amalgam Visual Review";
+            retained.type = st.project_detail.type;
+            retained.loaders = {"fabric", "forge"};
+            mods::FileInfo release;
+            release.id = "fixture-retained-release";
+            release.filename = "aurora-frontier-1.21.1.mrpack";
+            release.version_name = "1.21.1 Release";
+            release.version_number = "1.21.1";
+            release.game_versions = {"1.21.1"};
+            release.loaders = {"fabric"};
+            release.primary = true;
+            retained.files = {std::move(release)};
+            st.project_loading = c == "project-loading";
+            const uint64_t request_id = st.next_request_id.fetch_add(1);
+            std::lock_guard<std::mutex> lock(st.project_mu);
+            st.project_info = std::move(retained);
+            st.project_error.clear();
+            st.project_screen.begin(request_id);
+            if (c == "project-error") {
+                st.project_screen.fail(
+                    request_id,
+                    "The provider could not load release details. Your current project information is still available.",
+                    true);
+            }
+        } else if (c == "project-content" || c.rfind("project-content-install-", 0) == 0)
+            st.project_detail_tab = 1;
+        else if (c == "project-changelog") st.project_detail_tab = 2;
+        else if (c == "project-versions") st.project_detail_tab = 3;
+    } else if (c == "downloads" || c.rfind("downloads-", 0) == 0) {
+        st.active_tab = 17;
+        st.sidebar_item = 4;
+        if (c == "downloads-active") st.operation_filter = 1;
+        else if (c == "downloads-queued") st.operation_filter = 2;
+        else if (c == "downloads-completed") st.operation_filter = 3;
+        else if (c == "downloads-failed") st.operation_filter = 4;
+        else if (c == "downloads-empty") {
+            std::lock_guard<std::mutex> lock(st.jobs_mu);
+            st.jobs.clear();
+        }
+    } else if (c == "screenshots") {
+        st.active_tab = 9;
+        st.sidebar_item = 3;
+    } else if (c == "screenshots-empty" || c == "screenshots-grid" ||
+               c == "screenshots-list" || c == "screenshots-filtered-empty" ||
+               c == "screenshots-context-menu") {
+        st.active_tab = 9;
+        st.sidebar_item = 3;
+        if (c == "screenshots-filtered-empty") st.screenshot_search = "no-match";
+    } else if (c == "instances") {
+        st.active_tab = 7;
+        st.sidebar_item = 3;
+    } else if (c == "profiles") {
+        st.active_tab = 10;
+        st.sidebar_item = 3;
+    } else if (c == "play") {
+        st.active_tab = 5;
+        // Play is a focused task surface, not a Home subsection.  Keeping the
+        // rail neutral avoids falsely marking Home while this route is shown.
+        st.sidebar_item = -1;
+    } else if (c == "settings" || c.rfind("settings-", 0) == 0) {
+        st.active_tab = 4;
+        st.sidebar_item = 12;
+        if (c == "settings" || c == "settings-launcher" ||
+            c.rfind("settings-update-", 0) == 0) st.settings_section = 3;
+        else if (c == "settings-account") st.settings_section = 1;
+        else if (c == "settings-minecraft") st.settings_section = 2;
+        else if (c == "settings-downloads") st.settings_section = 4;
+        else if (c == "settings-modpacks" || c.rfind("settings-modpacks-ai-", 0) == 0)
+            st.settings_section = 5;
+        else if (c == "settings-java") st.settings_section = 6;
+        else if (c == "settings-performance") st.settings_section = 7;
+        else if (c == "settings-notifications") st.settings_section = 8;
+        else if (c == "settings-privacy") st.settings_section = 9;
+        else if (c == "settings-advanced") st.settings_section = 10;
+        else if (c == "settings-translation") st.settings_section = 11;
+        else if (c == "settings-admin" || c == "settings-admin-password-change") st.settings_section = 12;
+        else if (c == "settings-diagnostics" || c == "settings-diagnostics-results") {
+            st.settings_section = 13;
+        }
+        if (c.rfind("settings-update-", 0) == 0) {
+            if (c == "settings-update-checking") {
+                st.update_status.state.store(updater::CheckState::Checking);
+            } else if (c == "settings-update-up-to-date") {
+                st.update_status.state.store(updater::CheckState::UpToDate);
+            } else if (c == "settings-update-available") {
+                st.update_status.state.store(updater::CheckState::Available);
+                st.update_status.available_version = "1.0.1";
+                st.update_status.notes = "A signed launcher update is available. The download is verified before installation.";
+                st.update_status.manifest_signed.store(true);
+            } else if (c == "settings-update-mandatory") {
+                st.update_status.state.store(updater::CheckState::Mandatory);
+                st.update_status.available_version = "1.0.1";
+                st.update_status.notes = "This compatible update is required before the next online service session.";
+                st.update_status.manifest_signed.store(true);
+            } else if (c == "settings-update-offline") {
+                st.update_status.state.store(updater::CheckState::Offline);
+            } else if (c == "settings-update-error") {
+                st.update_status.state.store(updater::CheckState::Error);
+                st.update_status.error = "The update manifest could not be verified. Your installed launcher remains unchanged.";
+            }
+        }
+        if (c == "settings-diagnostics-results") {
+            // Never call run_all() from a visual fixture. Production diagnostics
+            // intentionally checks local machine facts, including Bedrock
+            // installation state, while screenshots must stay deterministic and
+            // completely detached from the reviewer machine.
+            st.ui_diagnostics_results = {
+                {"Launcher", "Binary integrity", aml::diagnostics::CheckStatus::PASS,
+                 "Fixture release identity is present; no executable was inspected."},
+                {"Java", "Runtime detection", aml::diagnostics::CheckStatus::PASS,
+                 "Representative managed Java runtime is available in this local preview."},
+                {"Backend", "Local configuration", aml::diagnostics::CheckStatus::WARN,
+                 "No backend is configured in this fixture; no remote service was contacted."},
+                {"AI", "Local runtime", aml::diagnostics::CheckStatus::WARN,
+                 "Representative local runtime is not installed in this preview."},
+                {"Providers", "External availability", aml::diagnostics::CheckStatus::WARN,
+                 "External providers are deliberately not contacted by Diagnostics."},
+                {"Essentials", "Local prerequisites", aml::diagnostics::CheckStatus::WARN,
+                 "A local account session is not present in this fixture."},
+                {"Updater", "Signed manifest policy", aml::diagnostics::CheckStatus::PASS,
+                 "The in-process signed-manifest policy is represented as enabled."},
+                {"Disk", "Free space", aml::diagnostics::CheckStatus::PASS,
+                 "Representative storage capacity is sufficient in this local preview."},
+                {"Bedrock", "Runtime scope", aml::diagnostics::CheckStatus::WARN,
+                 "Not inspected in this fixture; no Bedrock detection or launch occurred."}
+            };
+            st.ui_diagnostics_ran = true;
+        }
+    } else if (c == "account" || c == "account-portal" || c.rfind("account-", 0) == 0) {
+        st.active_tab = 15;
+        // Account is reached from the account affordance, rather than being a
+        // Settings subsection. Leave the rail neutral instead of presenting a
+        // misleading Settings selection in deterministic account captures.
+        st.sidebar_item = -1;
+    } else if (c == "servers" || c == "server-detail" || c.rfind("server-", 0) == 0 ||
+               c == "cloud") {
+        st.active_tab = 8;
+        st.sidebar_item = 8;
+        if (c == "cloud") set_fixture_server_mode(1);
+        else if (c == "server-create") set_fixture_server_create_open(true);
+        else if (c == "server-file-delete-confirm" || c == "server-file-delete-error" ||
+                 c == "server-file-preview" || c == "server-file-context-menu" ||
+                 c == "server-create-validation" || c == "server-create-error" ||
+                 c == "server-backup-restore-confirm" ||
+                 c == "server-backup-restore-error" || c == "server-remove-confirm" ||
+                 c == "server-remove-error") {
+            set_fixture_server_destructive_overlay(c);
+        }
+        else if (c == "server-detail" || c == "server-overview") set_fixture_server_detail(0, 0);
+        else if (c == "server-console") set_fixture_server_detail(0, 1);
+        else if (c == "server-files") set_fixture_server_detail(0, 2);
+        else if (c == "server-players") set_fixture_server_detail(0, 3);
+        else if (c == "server-plugins") set_fixture_server_detail(0, 4);
+        else if (c == "server-properties") set_fixture_server_detail(0, 5);
+        else if (c == "server-world") set_fixture_server_detail(0, 6);
+    } else if (c == "bedrock" || c.rfind("bedrock-", 0) == 0) {
+        st.active_tab = 3;
+        st.sidebar_item = 17;
+    } else if (c == "essentials" || c == "social" || c.rfind("essentials-", 0) == 0) {
+        st.active_tab = 23;
+        st.sidebar_item = 23;
+    } else if (c == "mods" || c.rfind("mod-manager-", 0) == 0) {
+        st.active_tab = 20;
+        st.sidebar_item = 2;
+    } else if (c == "performance" || c.rfind("performance-", 0) == 0) {
+        st.active_tab = 21;
+        st.sidebar_item = 12;
+    } else if ((c == "theme" || c.rfind("theme-", 0) == 0) &&
+               c.rfind("theme-shell-", 0) != 0) {
+        st.active_tab = 22;
+        st.sidebar_item = 12;
+    } else if (c == "admin" || c.rfind("admin-", 0) == 0) {
+        st.active_tab = 18;
+        st.sidebar_item = 12;
+        st.admin_unlocked = c != "admin-login";
+    } else if (c == "java" || c == "java-runtime-actions" ||
+               c.rfind("java-managed-", 0) == 0) {
+        st.active_tab = 11;
+        st.sidebar_item = 12;
+    } else if (c == "backups" || c == "backups-populated") {
+        st.active_tab = 12;
+        st.sidebar_item = 12;
+    } else if (c == "logs" || c.rfind("logs-", 0) == 0) {
+        st.active_tab = 13;
+        st.sidebar_item = 12;
+    } else if (c == "config" || c == "config-theme-picker") {
+        st.active_tab = 14;
+        st.sidebar_item = 12;
+        st.fixture_theme_selector_open = c == "config-theme-picker";
+    } else if (c == "theme-shell-default-light" || c == "theme-shell-midnight" ||
+               c == "theme-shell-solarized" || c == "theme-shell-dracula") {
+        st.active_tab = 0;
+        st.sidebar_item = 0;
+        if (c == "theme-shell-default-light") st.cfg->theme = "default_light";
+        else if (c == "theme-shell-midnight") st.cfg->theme = "midnight";
+        else if (c == "theme-shell-solarized") st.cfg->theme = "solarized_dark";
+        else st.cfg->theme = "dracula";
+        apply_configured_theme(*st.cfg);
+    } else if (c == "toast-success" || c == "toast-error" || c == "toast-stack" ||
+               c == "tooltip-nav") {
+        st.active_tab = 0;
+        st.sidebar_item = 0;
+        if (c == "toast-success") {
+            show_toast("Profile ready", "Aurora Frontier is ready to play. All files were verified before launch.", k.green, 120.0f);
+        } else if (c == "toast-error") {
+            show_toast("Update paused", "The signed update could not be downloaded. Your installed launcher is unchanged.", k.red, 120.0f);
+        } else if (c == "toast-stack") {
+            show_toast("Profile ready", "Aurora Frontier is ready to play.", k.green, 120.0f);
+            show_toast("Download complete", "Sodium 0.6.13 is available in your profile.", k.blue, 120.0f);
+            show_toast("Heads up", "One optional shader update will apply after the next launch.", k.yellow, 120.0f);
+        }
+    } else if (c.rfind("wizard-profile-", 0) == 0) {
+        st.wizard_open = true;
+        st.wizard_name = "Aurora Frontier";
+        st.wizard_loader = "fabric";
+        st.wizard_version = "1.21.1";
+        if (c == "wizard-profile-source-modrinth") st.wizard_source = 1;
+        else if (c == "wizard-profile-source-curseforge") st.wizard_source = 2;
+        else if (c == "wizard-profile-source-ai") st.wizard_source = 3;
+        else if (c == "wizard-profile-source-import") st.wizard_source = 4;
+        if (c == "wizard-profile-source-validation") {
+            // Preserve the real validation composition without starting a
+            // resolver: a missing name and project keep the local Next action
+            // visibly disabled in this deterministic fixture.
+            st.wizard_name.clear();
+            st.wizard_source = 1;
+        } else if (c == "wizard-profile-target" ||
+                   c == "wizard-profile-target-unsupported") {
+            st.wizard_step = 1;
+            if (c == "wizard-profile-target-unsupported") {
+                // This is intentional sample state only. draw_pack_wizard()
+                // preserves it only for this named fixture so the production
+                // wizard continues to normalize unsupported choices.
+                // A future/non-catalog target exercises the real maintained
+                // target validation.  1.12.2 is intentionally available for
+                // the supported legacy Forge path and is therefore not an
+                // unsupported-target fixture.
+                st.wizard_version = "1.22.0";
+            }
+        } else if (c == "wizard-profile-performance" ||
+                   c == "wizard-profile-performance-loader-unsupported") {
+            st.wizard_step = 2;
+            if (c == "wizard-profile-performance-loader-unsupported") {
+                st.wizard_loader = "neoforge";
+                st.wizard_version = "1.20.1";
+            }
+        }
+        else if (c == "wizard-profile-review") st.wizard_step = 3;
+        else if (c == "wizard-profile-resolve-loading" ||
+                 c == "wizard-profile-resolve-error") {
+            // The named resolver states deliberately use a local project
+            // identifier, but never start a provider worker.  That makes the
+            // loading/error labels themselves visible in evidence without
+            // making a network request from a screenshot fixture.
+            st.wizard_source = 1;
+            st.wizard_project = "aurora-frontier-fixture";
+            st.wizard_last_project = st.wizard_project;
+            if (c == "wizard-profile-resolve-loading") {
+                st.wizard_resolving = true;
+            } else {
+                std::lock_guard<std::mutex> lock(st.wizard_resolve_mu);
+                st.wizard_resolve_error =
+                    "The catalog could not confirm this template. Try again when you are online.";
+            }
+        }
+    } else if (c == "dialog-recovery") {
+        st.recovery_dialog_open = true;
+    } else if (c == "dialog-known-issues") {
+        st.known_issues_open = true;
+    } else if (c == "dialog-feedback") {
+        st.feedback_open = true;
+    } else if (c == "dialog-local-feedback") {
+        st.local_feedback_open = true;
+    } else if (c == "dialog-sign-in" || c == "dialog-sign-in-validation" ||
+               c == "dialog-sign-in-working" || c == "dialog-sign-in-error") {
+        st.login_popup_open = true;
+    } else if (c == "dialog-register" || c == "wizard-account-welcome" ||
+               c == "wizard-account-create" || c == "wizard-account-create-validation" ||
+               c == "wizard-account-verify-email" || c == "wizard-account-connect-minecraft" ||
+               c == "wizard-account-complete" || c == "wizard-account-error" ||
+               c == "wizard-account-working") {
+        st.register_popup_open = true;
+    } else if (c == "dialog-password-reset" || c == "wizard-password-reset-email" ||
+               c == "wizard-password-reset-code" || c == "wizard-password-reset-new-password" ||
+               c == "wizard-password-reset-working" || c == "wizard-password-reset-error" ||
+               c == "wizard-password-reset-success") {
+        st.password_reset_popup_open = true;
+    } else if (c == "dialog-microsoft-sign-in" || c == "dialog-microsoft-sign-in-starting" ||
+               c == "dialog-microsoft-sign-in-code" || c == "dialog-microsoft-sign-in-waiting" ||
+               c == "dialog-microsoft-sign-in-connected" || c == "dialog-microsoft-sign-in-error" ||
+               c == "dialog-microsoft-sign-in-official-launcher-fallback") {
+        st.login_wizard_open = true;
+        st.microsoft_login_popup_open = true;
+    } else if (c == "dialog-amalgam-signout-this-device" ||
+               c == "dialog-remove-local-remembered-session" ||
+               c == "dialog-remove-local-accounts" ||
+               c == "dialog-remove-local-accounts-ready" ||
+               c == "dialog-minecraft-disconnect" ||
+               c == "dialog-account-action-state-changed" ||
+               c == "dialog-account-action-local-error") {
+        st.active_tab = 15;
+        st.sidebar_item = -1;
+    }
+
+    // Fixture-specific modal state is staged only after the owning page route
+    // has been selected.  The presentation data is local and deterministic;
+    // every associated action renderer still has its own fixture-mode guard.
+    if (c == "project-content-install-confirm" || c == "project-content-install-conflict") {
+        st.install_confirm_open = true;
+        st.install_confirm_modpack = false;
+        st.install_confirm_project = {};
+        st.install_confirm_project.slug = "sodium";
+        st.install_confirm_project.title = "Sodium";
+        st.install_confirm_project.description =
+            "A representative local performance-mod install preview.";
+        st.install_confirm_project.source = "modrinth";
+        st.install_confirm_project.type = mods::ProjectType::Mod;
+        st.install_confirm_target = st.selected_instance;
+        st.install_confirm_dependencies = {
+            {"fabric-api", "fixture-fabric-api", true},
+            {"indium", "fixture-indium", false},
+        };
+        if (c == "project-content-install-conflict") {
+            st.install_confirm_conflicts = 1;
+            st.install_confirm_conflict_files = {"sodium-fabric-fixture.jar (managed by a prior sample)"};
+        }
+        request_popup("Confirm content install");
+    }
+
+    if (c == "profile-change-version-confirm" ||
+        c == "profile-change-version-no-backup" ||
+        c == "profile-change-loader-confirm") {
+        st.version_change_kind = c == "profile-change-loader-confirm" ? 2 : 1;
+        st.version_change_backup = c != "profile-change-version-no-backup";
+        st.version_change_backup_error.clear();
+    }
+
+    if (c == "profile-creator-update-confirm" || c == "profile-creator-update-copy-confirm") {
+        st.pack_update_confirm_open = true;
+        st.pack_update_confirm_copy = c == "profile-creator-update-copy-confirm";
+        st.pack_update_confirm_version = "2.4.0";
+        st.pack_update_confirm_target = st.selected_instance;
+        request_popup("Confirm creator update");
+    }
+
+    if (c == "library-group-create-for-profile") {
+        st.new_group_name = "Weekend Builds";
+        st.group_target = st.selected_instance.id;
+        request_popup("New Group##new_group_modal");
+    } else if (c == "library-group-rename") {
+        for (size_t i = 0; i < std::min<size_t>(2, st.instance_list.size()); ++i)
+            st.instance_list[i].group = "Weekend Builds";
+        st.new_group_name = "Community Builds";
+        st.rename_group_target = "Weekend Builds";
+        request_popup("Rename Group##rename_group_modal");
+    } else if (c == "library-group-delete") {
+        for (size_t i = 0; i < std::min<size_t>(2, st.instance_list.size()); ++i)
+            st.instance_list[i].group = "Weekend Builds";
+        st.delete_group_target = "Weekend Builds";
+        request_popup("Delete Group##delete_group_modal");
+    } else if (c == "library-move-to-group-menu") {
+        for (size_t i = 0; i < std::min<size_t>(2, st.instance_list.size()); ++i)
+            st.instance_list[i].group = "Weekend Builds";
     }
 }
 
@@ -803,6 +1700,10 @@ void dismiss_notice(UiState& st, uint64_t id) {
 }
 
 bool save_ui_config(UiState& st) {
+    if (st.fixture_mode) {
+        set_settings_status(st, "Visual fixture: configuration writes are disabled");
+        return false;
+    }
     sync_ui_config(st);
     if (!config::save(st.exe_dir + L"\\launcher.json", *st.cfg)) {
         const char* detail = st.cfg->has_unreadable_secrets
@@ -1602,6 +2503,7 @@ void start_microsoft_login(UiState& st) {
         st.microsoft_login_popup_open = true;
         return;
     }
+    const uint64_t login_generation = st.auth_operation_generation.fetch_add(1) + 1;
     {
         std::lock_guard<std::mutex> lock(st.auth_mu);
         st.login_wizard_state = 0;
@@ -1613,15 +2515,17 @@ void start_microsoft_login(UiState& st) {
         st.microsoft_login_popup_open = true;
     }
 
-    spawn_worker(st, std::thread([&st, client_id]() {
+    spawn_worker(st, std::thread([&st, client_id, login_generation]() {
         auth::Account account;
         std::string error;
         const bool ok = auth::login_device(
             account, client_id,
             [&st](const std::wstring& message) { log_line(st, message); },
             &error,
-            [&st](const auth::DeviceLoginPrompt& prompt) {
+            [&st, login_generation](const auth::DeviceLoginPrompt& prompt) {
+                if (st.auth_operation_generation.load() != login_generation) return;
                 std::lock_guard<std::mutex> lock(st.auth_mu);
+                if (st.auth_operation_generation.load() != login_generation) return;
                 st.login_wizard_state = 1;
                 st.login_verification_uri = prompt.verification_uri;
                 st.login_user_code = prompt.user_code;
@@ -1629,6 +2533,10 @@ void start_microsoft_login(UiState& st) {
             }, false);
 
         std::lock_guard<std::mutex> lock(st.auth_mu);
+        // A destructive credential action or a newer login may have replaced
+        // this flow while its worker was waiting on Microsoft. Never persist
+        // or surface an account result from an obsolete generation.
+        if (st.auth_operation_generation.load() != login_generation) return;
         st.auth_working = false;
         if (ok) {
             st.account = std::move(account);
@@ -2218,6 +3126,17 @@ void fetch_home_catalog(UiState& st) {
                                       : L"[browse] catalog failed: " + net::to_wide(pack_error));
 }
 
+// The Discover landing page has a dedicated single-flight retry lane.  A
+// provider failure should offer an honest recovery action without allowing
+// duplicate requests to pile up or making the render thread wait on network.
+static bool retry_home_catalog(UiState& st) {
+    if (st.fixture_mode) return false;
+    bool expected = false;
+    if (!st.home_fetching.compare_exchange_strong(expected, true)) return false;
+    spawn_worker(st, std::thread(fetch_home_catalog, std::ref(st)));
+    return true;
+}
+
 static uint16_t find_integrated_server_port(DWORD process_id) {
     ULONG size = 0;
     if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0)
@@ -2372,16 +3291,7 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
         }
     }
 
-    if (!dry_run && loaded_profile && opt.addon) {
-        std::string bridge_error;
-        if (!prepare_client_bridge_for_profile(snapshot, loaded_instance, &bridge_error)) {
-            log_line(st, L"[client] profile sync warning: " + net::to_wide(bridge_error));
-            push_notice(st, ui_model::NoticeLevel::Warning, "Client sync needs attention",
-                        bridge_error + ". Minecraft can still launch, but some in-game client pages may be empty.");
-        } else {
-            log_line(st, L"[client] profile data synchronized");
-        }
-    }    // Launch routing.  "official_launcher" prepares the profile, loader,
+    // Launch routing.  "official_launcher" prepares the profile, loader,
     // and client bridge, then hands off to the official Minecraft Launcher,
     // which signs the player in with its own Microsoft account.  "microsoft"
     // uses the player's Amalgam-connected Microsoft account and starts the
@@ -2393,16 +3303,64 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
                                      launch_account.expires_at > std::time(nullptr);
     const bool handoff = !dry_run && loaded_profile &&
         (snapshot.launch_mode != "microsoft" || !microsoft_signed_in);
+    if (handoff && !official_launcher::IsOfficialLauncherInstalled()) {
+        if (loading.is_visible()) loading.hide();
+        st.running = false;
+        push_notice(st, ui_model::NoticeLevel::Warning,
+                    "Minecraft Launcher Not Found",
+                    "Amalgam prepares your profile and hands it over; the Minecraft\n"
+                    "Launcher signs you in. Install it to play.",
+                    "Get Minecraft Launcher", "get_mc_launcher");
+        return;
+    }
     if (handoff) {
-        if (!official_launcher::IsOfficialLauncherInstalled()) {
+        // A handoff eventually writes the official launcher's profile file and
+        // selects the Amalgam installation.  Do not race an already-open Java
+        // game or official launcher; this check happens before loader/profile
+        // work so an unsafe attempt leaves the selected profile untouched.
+        std::wstring handoff_guard_error;
+        if (!official_launcher::CanPrepareOfficialLauncherHandoff(&handoff_guard_error)) {
             if (loading.is_visible()) loading.hide();
             st.running = false;
-            push_notice(st, ui_model::NoticeLevel::Warning,
-                        "Minecraft Launcher Not Found",
-                        "Install the official Minecraft Launcher from minecraft.net\n"
-                        "to sign in and play. It handles authentication automatically.");
+            push_notice(st, ui_model::NoticeLevel::Warning, "Minecraft is still active",
+                        handoff_guard_error.empty()
+                            ? "Close Minecraft and the official Minecraft Launcher before preparing a profile."
+                            : net::to_utf8(handoff_guard_error));
             return;
         }
+        // Wizard-created modded profiles intentionally start with a concrete
+        // loader choice but may not have an exact loader build yet. Resolve
+        // and persist it before either the bridge metadata or the official
+        // launcher profile is assembled; InstallLoader requires this exact
+        // value and must never receive an empty version.
+        std::string loader_version_error;
+        if (!profile_handoff::ensure_loader_version(loaded_instance, &loader_version_error)) {
+            if (loading.is_visible()) loading.hide();
+            st.running = false;
+            push_notice(st, ui_model::NoticeLevel::Error, "Loader version unavailable",
+                        loader_version_error.empty()
+                            ? "Amalgam could not resolve an exact version for this mod loader."
+                            : loader_version_error);
+            return;
+        }
+        if (!loaded_instance.loader_version.empty()) {
+            opt.loader = loaded_instance.loader;
+            opt.loader_version = net::to_wide(loaded_instance.loader_version);
+            log_line(st, L"[launch] pinned " + net::to_wide(loaded_instance.loader) +
+                         L" loader " + net::to_wide(loaded_instance.loader_version));
+        }
+    }
+    if (!dry_run && loaded_profile && opt.addon) {
+        std::string bridge_error;
+        if (!prepare_client_bridge_for_profile(snapshot, loaded_instance, &bridge_error)) {
+            log_line(st, L"[client] profile sync warning: " + net::to_wide(bridge_error));
+            push_notice(st, ui_model::NoticeLevel::Warning, "Client sync needs attention",
+                        bridge_error + ". Minecraft can still launch, but some in-game client pages may be empty.");
+        } else {
+            log_line(st, L"[client] profile data synchronized");
+        }
+    }
+    if (handoff) {
         const int java_major = model::default_java_major(model::rank(loaded_instance.minecraft_version));
         auto prepared = official_launcher::FromInstance(loaded_instance, java_major);
         prepared.native_agent_path = opt.addon && net::file_exists(opt.dll_path)
@@ -2529,7 +3487,7 @@ void do_launch(UiState& st, const std::string& mc_id, const config::Config& snap
     if (!ok) {
         log_line(st, L"[launch] FAILED: " + net::to_wide(err));
         push_notice(st, ui_model::NoticeLevel::Error, "Minecraft could not launch",
-                    err.empty() ? "Review the launch log and preflight checks." : err,
+                    err.empty() ? "Review the launch log in Downloads for details." : err,
                     "Open Downloads", "downloads", true);
         return;
     }
@@ -2607,10 +3565,427 @@ void duplicate_profile(UiState& st, const instances::Instance& instance) {
                 "A separate copy is ready in your Library.", "Open Library", "library");
 }
 
+enum class ProfileDataAction {
+    None = 0,
+    RestoreLatest = 1,
+    DeleteRestorePoint = 2,
+    RestoreGameOptions = 3,
+    MoveToRecovery = 4,
+};
+
+constexpr const char* kProfileRecoveryMoveAction = "profile-move-to-recovery";
+
+// The visible confirmation state belongs to UiState, while this process-owned
+// lane serializes the filesystem move itself.  Its worker is still owned by
+// UiState through spawn_worker(), so shutdown joins it before the launcher
+// tears down.  Keeping the result hand-off separate avoids a detached worker
+// and prevents an old modal from publishing a stale outcome.
+struct ProfileRecoveryMoveLane {
+    AsyncUiRequestState request;
+    std::atomic_bool library_refresh_needed{false};
+};
+
+static ProfileRecoveryMoveLane& profile_recovery_move_lane() {
+    static ProfileRecoveryMoveLane lane;
+    return lane;
+}
+
+static AsyncUiRequestResult profile_recovery_move_result(
+    const instances::Instance& target, bool success, std::string detail) {
+    AsyncUiRequestResult result;
+    result.success = success;
+    result.payload_a = target.id;
+    if (success) {
+        result.title = "Profile moved to recovery";
+        result.detail = "The complete \"" + (target.name.empty() ? target.id : target.name) +
+            "\" profile folder left the active Library and was moved to the local "
+            ".amalgam-profile-recovery folder beside it.";
+    } else {
+        result.title = "Profile could not be moved to recovery";
+        result.detail = detail.empty()
+            ? "Amalgam could not finish the recovery move. Check the active Library and "
+              "local recovery folder before retrying."
+            : std::move(detail);
+    }
+    return result;
+}
+
+static bool start_profile_recovery_move(UiState& st, const instances::Instance& target,
+                                        std::string* start_error) {
+    // A visual fixture may use this composition to prove the warning and
+    // recovery wording, but it must never create a worker or touch its sample
+    // profile even if an interactive reviewer manages to invoke this entry.
+    if (st.fixture_mode) {
+        if (start_error)
+            *start_error = "Visual fixture: profile recovery is preview-only; no files were changed.";
+        return false;
+    }
+    auto& lane = profile_recovery_move_lane();
+    uint64_t generation = 0;
+    if (!begin_async_ui_request(lane.request, kProfileRecoveryMoveAction, &generation)) {
+        if (start_error) {
+            *start_error =
+                "A previous recovery move is still finishing. Wait for it to complete before retrying.";
+        }
+        return false;
+    }
+
+    const instances::Instance request_target = target;
+    spawn_worker(st, std::thread([request_target, generation]() {
+        std::string error;
+        bool moved = false;
+        try {
+            moved = instances::remove(request_target, &error);
+        } catch (const std::exception& ex) {
+            error = std::string("unexpected recovery move error: ") + ex.what();
+        } catch (...) {
+            error = "unexpected recovery move error";
+        }
+        auto result = profile_recovery_move_result(request_target, moved, std::move(error));
+        if (moved) {
+            // A hidden dialog must not publish a stale toast, but the Library
+            // still needs to reflect an already-completed real filesystem move.
+            profile_recovery_move_lane().library_refresh_needed.store(true);
+        }
+        complete_async_ui_request(profile_recovery_move_lane().request,
+                                  kProfileRecoveryMoveAction, generation, std::move(result));
+    }));
+    return true;
+}
+
+static void hide_profile_recovery_move_result() {
+    auto& lane = profile_recovery_move_lane();
+    const auto snapshot = snapshot_async_ui_request(lane.request);
+    if (snapshot.action == kProfileRecoveryMoveAction)
+        invalidate_async_ui_request(lane.request);
+}
+
+static void request_profile_data_confirmation(UiState& st, ProfileDataAction action,
+                                              const instances::Instance& instance,
+                                              std::string label = {},
+                                              std::wstring path = {}) {
+    st.profile_data_confirm_action = static_cast<int>(action);
+    st.profile_data_confirm_instance = instance;
+    st.profile_data_confirm_label = std::move(label);
+    st.profile_data_confirm_path = std::move(path);
+    st.profile_data_confirm_error.clear();
+    st.profile_data_confirm_open = true;
+}
+
+static void clear_profile_data_confirmation(UiState& st) {
+    st.profile_data_confirm_open = false;
+    st.profile_data_confirm_action = static_cast<int>(ProfileDataAction::None);
+    st.profile_data_confirm_instance = instances::Instance{};
+    st.profile_data_confirm_label.clear();
+    st.profile_data_confirm_path.clear();
+    st.profile_data_confirm_error.clear();
+}
+
+static void draw_profile_data_confirmation(UiState& st) {
+    // This runs even when the dialog has been hidden. A hidden result never
+    // turns into a toast, but a completed move must not leave a stale profile
+    // card in the active Library.
+    if (profile_recovery_move_lane().library_refresh_needed.exchange(false)) {
+        st.instances_loaded = false;
+        st.home_readiness.dirty = true;
+    }
+    const bool fixture_data_route = is_profile_recovery_fixture_case(st);
+    // Keep a fixture preview genuinely dismissible for a human reviewer. A new
+    // fixture token naturally receives a fresh presentation, while a close on
+    // the current token cannot be undone by the next render frame.
+    static std::string dismissed_fixture_case;
+    if (!fixture_data_route) dismissed_fixture_case.clear();
+    if (fixture_data_route && !st.profile_data_confirm_open &&
+        dismissed_fixture_case != st.fixture_case) {
+        // This assembles the same confirmation composition used in production,
+        // but never starts a worker or touches the fixture profile's files.
+        ProfileDataAction fixture_action = ProfileDataAction::MoveToRecovery;
+        std::string fixture_label;
+        std::wstring fixture_path;
+        std::string fixture_error;
+        const std::string& fixture_case = st.fixture_case;
+        if (fixture_case == "profile-restore-latest-confirm" ||
+            fixture_case == "profile-restore-latest-error") {
+            fixture_action = ProfileDataAction::RestoreLatest;
+            if (fixture_case == "profile-restore-latest-error")
+                fixture_error = "The latest sample backup could not be read. The active profile was not changed.";
+        } else if (fixture_case == "profile-delete-restore-point-confirm" ||
+                   fixture_case == "profile-delete-restore-point-error") {
+            fixture_action = ProfileDataAction::DeleteRestorePoint;
+            fixture_label = "2026-09-23 08:45 — before visual review";
+            fixture_path = (std::filesystem::path(st.selected_instance.directory) /
+                            L".amalgam-restore" / L"fixture-restore-point").wstring();
+            if (fixture_case == "profile-delete-restore-point-error")
+                fixture_error = "The sample restore point could not be removed. It remains available and no files were changed.";
+        } else if (fixture_case == "profile-restore-options-confirm" ||
+                   fixture_case == "profile-restore-options-error") {
+            fixture_action = ProfileDataAction::RestoreGameOptions;
+            if (fixture_case == "profile-restore-options-error")
+                fixture_error = "The sample options backup could not be applied. Current game options were not changed.";
+        } else if (fixture_case == "profile-move-recovery-error") {
+            fixture_error = "The sample recovery target was unavailable. No profile files were moved.";
+        }
+        request_profile_data_confirmation(st, fixture_action, st.selected_instance,
+                                          std::move(fixture_label), std::move(fixture_path));
+        st.profile_data_confirm_error = std::move(fixture_error);
+    }
+    if (!st.profile_data_confirm_open) return;
+    const auto action = static_cast<ProfileDataAction>(st.profile_data_confirm_action);
+    if (action == ProfileDataAction::None || st.profile_data_confirm_instance.directory.empty()) {
+        clear_profile_data_confirmation(st);
+        return;
+    }
+
+    const instances::Instance& target = st.profile_data_confirm_instance;
+    const std::string profile_name = target.name.empty() ? target.id : target.name;
+    const char* title = "Confirm profile change";
+    const char* primary = "Continue";
+    const char* detail = "";
+    const bool move_to_recovery = action == ProfileDataAction::MoveToRecovery;
+    const bool fixture_move_working = st.fixture_mode &&
+        st.fixture_case == "profile-move-recovery-working";
+    const bool fixture_move_error = st.fixture_mode &&
+        st.fixture_case == "profile-move-recovery-error";
+    switch (action) {
+        case ProfileDataAction::RestoreLatest:
+            title = "Restore latest profile backup";
+            primary = "Restore profile";
+            detail = "This replaces current profile files with the latest restore point. Amalgam creates recovery data for the rollback path, but recent changes can be replaced.";
+            break;
+        case ProfileDataAction::DeleteRestorePoint:
+            title = "Delete restore point";
+            primary = "Delete backup";
+            detail = "This permanently removes this recovery point. It cannot be restored after deletion.";
+            break;
+        case ProfileDataAction::RestoreGameOptions:
+            title = "Restore original game options";
+            primary = "Restore options";
+            detail = "This replaces the current options.txt with Amalgam's original-options backup. Your current options are copied to .amalgam-backups first.";
+            break;
+        case ProfileDataAction::MoveToRecovery:
+            title = "Move profile to recovery";
+            primary = "Move to recovery";
+            detail = "This moves the complete profile folder out of the active Library into the local .amalgam-profile-recovery folder beside it. It is not permanently deleted.";
+            break;
+        case ProfileDataAction::None:
+            return;
+    }
+
+    ImGui::OpenPopup("Confirm profile data change##profile_data");
+    set_next_adaptive_window(560.0f, 0.0f, 340.0f, 0.0f);
+    bool open = st.profile_data_confirm_open;
+    if (!ImGui::BeginPopupModal("Confirm profile data change##profile_data", &open,
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        if (!open && move_to_recovery) hide_profile_recovery_move_result();
+        st.profile_data_confirm_open = open;
+        return;
+    }
+
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "Profile: %s", profile_name.c_str());
+    if (move_to_recovery && !target.id.empty())
+        ImGui::TextColored(k.muted, "Profile ID: %s", target.id.c_str());
+    if (action == ProfileDataAction::DeleteRestorePoint && !st.profile_data_confirm_label.empty())
+        ImGui::TextColored(k.muted, "Backup: %s", st.profile_data_confirm_label.c_str());
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", detail);
+
+    if (st.fixture_mode) {
+        ImGui::Spacing();
+        ImGui::TextColored(k.brand,
+                           "Visual QA fixture — sample profile only; no files are read or changed.");
+    }
+
+    if (move_to_recovery) {
+        const auto snapshot = snapshot_async_ui_request(profile_recovery_move_lane().request);
+        const bool this_move_working = fixture_move_working ||
+            (snapshot.working && snapshot.action == kProfileRecoveryMoveAction);
+        const bool another_move_working = !fixture_move_working && snapshot.working &&
+            snapshot.action != kProfileRecoveryMoveAction;
+        const bool has_move_result = fixture_move_error ||
+            (snapshot.has_result && snapshot.action == kProfileRecoveryMoveAction);
+        const bool move_succeeded = !fixture_move_error && has_move_result &&
+            snapshot.result.success;
+
+        ImGui::Spacing();
+        if (this_move_working) {
+            ImGui::TextColored(k.orange, "Moving profile to recovery...");
+            ImGui::TextWrapped("The move has already started. Closing this dialog only hides the "
+                               "outcome; it does not cancel the filesystem work.");
+        } else if (fixture_move_error) {
+            ImGui::TextColored(k.red, "Profile could not be moved to recovery");
+            ImGui::TextWrapped("The sample error stays visible so the retry state can be reviewed. "
+                               "No profile files were touched for this fixture.");
+        } else if (has_move_result) {
+            const ImVec4 result_color = snapshot.result.success ? k.green : k.red;
+            if (!snapshot.result.title.empty())
+                ImGui::TextColored(result_color, "%s", snapshot.result.title.c_str());
+            if (!snapshot.result.detail.empty())
+                ImGui::TextWrapped("%s", snapshot.result.detail.c_str());
+        } else if (another_move_working) {
+            ImGui::TextColored(k.orange,
+                               "A previous recovery move is still finishing. Wait before retrying.");
+        } else if (!st.profile_data_confirm_error.empty()) {
+            ImGui::TextColored(k.red, "%s", st.profile_data_confirm_error.c_str());
+        }
+        ImGui::Spacing();
+
+        if (move_succeeded) {
+            if (primary_button("Done", ImVec2(ui_px(100.0f), ui_px(32.0f)))) {
+                AsyncUiRequestSnapshot completed;
+                if (take_async_ui_request_result(profile_recovery_move_lane().request, &completed) &&
+                    completed.action == kProfileRecoveryMoveAction && completed.result.success) {
+                    st.content_status = "Profile moved to recovery";
+                    st.instance_detail_open = false;
+                    st.instances_loaded = false;
+                    push_notice(st, ui_model::NoticeLevel::Success, completed.result.title,
+                                completed.result.detail, "Open Library", "library");
+                }
+                hide_profile_recovery_move_result();
+                clear_profile_data_confirmation(st);
+                open = false;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            const char* action_label = this_move_working ? "Moving..." :
+                (has_move_result ? "Retry" : primary);
+            const bool disable_action = this_move_working || another_move_working || st.fixture_mode;
+            if (danger_button(action_label, ImVec2(ui_px(160.0f), ui_px(32.0f)), disable_action)) {
+                std::string start_error;
+                if (!start_profile_recovery_move(st, target, &start_error))
+                    st.profile_data_confirm_error = std::move(start_error);
+                else
+                    st.profile_data_confirm_error.clear();
+            }
+        }
+        ImGui::SameLine();
+        const char* close_label = this_move_working ? "Hide" :
+            (st.fixture_mode ? "Close preview" : "Cancel");
+        if (ghost_button(close_label, ImVec2(ui_px(110.0f), ui_px(32.0f)))) {
+            // A close after a real start invalidates only the result
+            // presentation. The joined worker continues, and a second move
+            // cannot start until it has actually returned.
+            if (!st.fixture_mode) hide_profile_recovery_move_result();
+            if (fixture_data_route) dismissed_fixture_case = st.fixture_case;
+            clear_profile_data_confirmation(st);
+            open = false;
+            ImGui::CloseCurrentPopup();
+        }
+    } else {
+        if (!st.profile_data_confirm_error.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(k.red, "%s", st.profile_data_confirm_error.c_str());
+        }
+        ImGui::Spacing();
+
+        const bool fixture_preview = st.fixture_mode;
+        if (danger_button(primary, ImVec2(ui_px(140.0f), ui_px(32.0f)), fixture_preview) &&
+            !fixture_preview) {
+            std::string error;
+            bool success = false;
+            switch (action) {
+                case ProfileDataAction::RestoreLatest:
+                    success = instances::restore_latest(target, &error);
+                    if (success) {
+                        st.content_status = "Profile restored";
+                        st.instances_loaded = false;
+                        push_notice(st, ui_model::NoticeLevel::Success, "Profile restored",
+                                    "The latest restore point was applied.");
+                    }
+                    break;
+                case ProfileDataAction::DeleteRestorePoint:
+                    success = instances::remove_restore_point(target, st.profile_data_confirm_path, &error);
+                    if (success) {
+                        push_notice(st, ui_model::NoticeLevel::Success, "Backup deleted",
+                                    st.profile_data_confirm_label.empty()
+                                        ? "The restore point was permanently removed."
+                                        : st.profile_data_confirm_label);
+                    }
+                    break;
+                case ProfileDataAction::RestoreGameOptions:
+                    success = performance::restore_game_options(target.directory, &error);
+                    if (success) {
+                        st.content_status = "Options restored";
+                        push_notice(st, ui_model::NoticeLevel::Success, "Options restored",
+                                    "Your current options were saved in .amalgam-backups first.");
+                    }
+                    break;
+                case ProfileDataAction::MoveToRecovery:
+                case ProfileDataAction::None:
+                    break;
+            }
+            if (success) {
+                clear_profile_data_confirmation(st);
+                open = false;
+                ImGui::CloseCurrentPopup();
+            } else {
+                st.profile_data_confirm_error = error.empty()
+                    ? "The requested change could not be completed. No confirmation state was cleared."
+                    : error;
+            }
+        }
+        ImGui::SameLine();
+        if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                         ImVec2(ui_px(fixture_preview ? 118.0f : 82.0f), ui_px(32.0f)))) {
+            if (fixture_data_route) dismissed_fixture_case = st.fixture_case;
+            clear_profile_data_confirmation(st);
+            open = false;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndPopup();
+    if (!open && move_to_recovery) hide_profile_recovery_move_result();
+    if (fixture_data_route && !open) dismissed_fixture_case = st.fixture_case;
+    st.profile_data_confirm_open = open;
+}
+
+static std::string& profile_actions_fixture_dismissed_case() {
+    static std::string dismissed_case;
+    return dismissed_case;
+}
+
+static bool is_profile_actions_fixture_case(const UiState& st) {
+    return st.fixture_mode && st.fixture_case == "profile-actions-menu";
+}
+
 void draw_instance_overflow_menu(UiState& st, instances::Instance& instance,
                                  const char* popup_id) {
     if (!ImGui::BeginPopup(popup_id)) return;
     ImGui::PushFont(f_small);
+    if (st.fixture_mode) {
+        // Do not reuse the live menu handlers for a screenshot fixture. This
+        // menu contains launch, persistence, filesystem, worker, and shell
+        // entry points, so a visually disabled presenter also returns before
+        // any of them can be reached.
+        ImGui::TextColored(k.brand, "LOCAL VISUAL-QA FIXTURE — actions are disabled.");
+        ImGui::Separator();
+        ImGui::MenuItem("Play", nullptr, false, false);
+        ImGui::MenuItem("Open", nullptr, false, false);
+        ImGui::MenuItem("Edit", nullptr, false, false);
+        ImGui::Separator();
+        ImGui::MenuItem("Favorite", nullptr, false, false);
+        ImGui::MenuItem("Duplicate", nullptr, false, false);
+        ImGui::MenuItem("Export", nullptr, false, false);
+        ImGui::MenuItem("Open Folder", nullptr, false, false);
+        ImGui::Separator();
+        ImGui::MenuItem("Scan & Repair", nullptr, false, false);
+        ImGui::MenuItem("Restore Latest", nullptr, false, false);
+        ImGui::MenuItem("Deploy to Cloud", nullptr, false, false);
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, k.red);
+        ImGui::MenuItem("Move to Recovery", nullptr, false, false);
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Close preview")) {
+            profile_actions_fixture_dismissed_case() = st.fixture_case;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopFont();
+        ImGui::EndPopup();
+        return;
+    }
     // ── Primary actions ──────────────────────────────────────────
     if (ImGui::MenuItem("Play")) {
         st.selected = instance.minecraft_version;
@@ -2650,11 +4025,7 @@ void draw_instance_overflow_menu(UiState& st, instances::Instance& instance,
         }));
     }
     if (ImGui::MenuItem("Restore Latest")) {
-        std::string error;
-        if (instances::restore_latest(instance, &error)) {
-            st.content_status = "Restored";
-            st.instances_loaded = false;
-        } else st.content_status = error;
+        request_profile_data_confirmation(st, ProfileDataAction::RestoreLatest, instance);
     }
     if (ImGui::MenuItem("Deploy to Cloud")) {
         ShellExecuteW(st.hwnd, L"open",
@@ -2665,32 +4036,11 @@ void draw_instance_overflow_menu(UiState& st, instances::Instance& instance,
     // ── Danger zone ──────────────────────────────────────────────
     ImGui::PushStyleColor(ImGuiCol_Text, k.red);
     if (ImGui::MenuItem("Delete")) {
-        st.delete_target = instance.id;
-        ImGui::OpenPopup("##confirm_delete_profile");
+        request_profile_data_confirmation(st, ProfileDataAction::MoveToRecovery, instance);
     }
     ImGui::PopStyleColor();
     ImGui::PopFont();
     ImGui::EndPopup();
-
-    // Nested delete confirmation
-    if (ImGui::BeginPopup("##confirm_delete_profile", ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Delete \"%s\"?", instance.name.empty() ? instance.id.c_str() : instance.name.c_str());
-        ImGui::TextColored(k.muted, "This moves the profile to recovery (not permanent).");
-        if (primary_button("Delete", ImVec2(ui_px(90.0f), ui_px(30.0f)))) {
-            std::string error;
-            if (instances::remove(instance, &error)) {
-                push_notice(st, ui_model::NoticeLevel::Success, "Profile moved to recovery",
-                            "Your profile is safely recoverable.", "Open Library", "library");
-                st.instance_detail_open = false;
-                st.instances_loaded = false;
-            } else log_line(st, L"[instances] delete failed: " + net::to_wide(error));
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ghost_button("Cancel", ImVec2(ui_px(80.0f), ui_px(30.0f))))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
 }
 
 // Loader ids are stored lowercase ("fabric", "neoforge") because they are keys.
@@ -2724,6 +4074,7 @@ std::string profile_activity_label(const instances::Instance& instance) {
 
 std::vector<std::string> profile_health(const UiState& st, const instances::Instance& instance) {
     std::vector<std::string> issues;
+    if (is_profile_recovery_fixture_case(st)) return issues;
     if (instance.minecraft_version.empty()) issues.push_back("Minecraft version is not configured");
     if (instance.loader.empty() || instance.loader == "auto") issues.push_back("Loader is not pinned");
     if (!net::directory_exists(instance.directory)) issues.push_back("Instance directory is missing");
@@ -2752,37 +4103,37 @@ std::vector<std::string> profile_health(const UiState& st, const instances::Inst
 std::vector<UiState::LaunchCheck> evaluate_launch(const UiState& st, const std::string& mc_id,
                                                   const std::wstring& instance_dir) {
     std::vector<UiState::LaunchCheck> checks;
-    auto add = [&](std::string label, std::string detail, bool passed, bool blocking) {
-        checks.push_back(UiState::LaunchCheck{std::move(label), std::move(detail), passed, blocking});
+    auto add = [&](std::string label, std::string detail, bool passed) {
+        checks.push_back(UiState::LaunchCheck{std::move(label), std::move(detail), passed});
     };
     add("Minecraft version", mc_id.empty() ? "Choose a Minecraft version first." : mc_id,
-        !mc_id.empty(), true);
+        !mc_id.empty());
 
     instances::Instance instance;
     const bool has_instance = !instance_dir.empty() && instances::load(instance_dir, instance, nullptr);
     if (!instance_dir.empty()) {
         const bool exists = net::directory_exists(instance_dir);
         add("Profile directory", exists ? net::to_utf8(instance_dir) :
-             "The selected profile directory is missing.", exists, true);
+             "The selected profile directory is missing.", exists);
         if (has_instance) {
             const auto issues = profile_health(st, instance);
             if (issues.empty()) {
-                add("Profile health", "Version, loader, and managed content are ready.", true, false);
+                add("Profile health", "Version, loader, and managed content are ready.", true);
             } else {
                 for (const auto& issue : issues)
-                    add("Profile health", issue, false, false);
+                    add("Profile health", issue, false);
             }
         }
     } else {
-        add("Profile target", "A temporary/default instance will be used.", true, false);
+        add("Profile target", "A temporary/default instance will be used.", true);
     }
 
     if (st.cfg->addon) {
         const std::wstring dll = st.exe_dir + L"\\amalgam.dll";
         add("Native bridge", net::file_exists(dll) ? "amalgam.dll is present" :
-            "amalgam.dll is missing from the launcher folder.", net::file_exists(dll), true);
+            "amalgam.dll is missing from the launcher folder.", net::file_exists(dll));
     } else {
-        add("Native bridge", "Optional native bridge is disabled in Settings.", true, false);
+        add("Native bridge", "Optional native bridge is disabled in Settings.", true);
     }
 
     const std::string loader = has_instance && !instance.loader.empty() ? instance.loader : st.cfg->loader;
@@ -2791,18 +4142,18 @@ std::vector<UiState::LaunchCheck> evaluate_launch(const UiState& st, const std::
         add("Loader bridge", net::directory_exists(bridges) ?
             "Bridge directory is available; the launch step will resolve the exact version." :
             "Bridge directory is missing. Build or install the supported bridge first.",
-            net::directory_exists(bridges), true);
+            net::directory_exists(bridges));
     }
 
     auth::Account account;
     std::string account_error;
     const bool signed_in = auth::load(account, &account_error) && !account.access_token.empty();
     if (signed_in) {
-        add("Microsoft account", "A saved account is available.", true, false);
+        add("Microsoft account", "A saved account is available.", true);
     } else {
         add("Minecraft authentication",
             "The Minecraft Launcher signs you in when Play hands it your prepared profile.",
-            official_launcher::IsOfficialLauncherInstalled(), true);
+            official_launcher::IsOfficialLauncherInstalled());
     }
 
     const auto java = java::scan_installed();
@@ -2813,7 +4164,7 @@ std::vector<UiState::LaunchCheck> evaluate_launch(const UiState& st, const std::
     add("Java runtime", java_ready ?
         "A system or cached Java runtime is available." :
         "Java will need to be provisioned before this profile can launch.",
-        java_ready, false);
+        java_ready);
 
     ULARGE_INTEGER free_bytes{}, total_bytes{}, total_free_bytes{};
     const std::wstring disk_root = instance_dir.empty() ? st.exe_dir : instance_dir;
@@ -2821,17 +4172,16 @@ std::vector<UiState::LaunchCheck> evaluate_launch(const UiState& st, const std::
                                              &total_free_bytes) != FALSE;
     if (disk_ok) {
         const bool enough = free_bytes.QuadPart >= 2ull * 1024ull * 1024ull * 1024ull;
-        add("Disk space", format_bytes(free_bytes.QuadPart) + " free",
-            enough, false);
+        add("Disk space", format_bytes(free_bytes.QuadPart) + " free", enough);
     } else {
-        add("Disk space", "Could not read free space for the selected target.", true, false);
+        add("Disk space", "Could not read free space for the selected target.", true);
     }
     return checks;
 }
 
-bool has_failed_launch_check(const std::vector<UiState::LaunchCheck>& checks, bool blocking_only) {
-    return std::any_of(checks.begin(), checks.end(), [blocking_only](const UiState::LaunchCheck& check) {
-        return !check.passed && (!blocking_only || check.blocking);
+bool has_failed_launch_check(const std::vector<UiState::LaunchCheck>& checks) {
+    return std::any_of(checks.begin(), checks.end(), [](const UiState::LaunchCheck& check) {
+        return !check.passed;
     });
 }
 
@@ -2871,7 +4221,7 @@ void refresh_home_readiness_async(UiState& st) {
                     continue;
                 }
                 const auto checks = evaluate_launch(st, instance.minecraft_version, instance.directory);
-                const bool checks_pass = !has_failed_launch_check(checks, false);
+                const bool checks_pass = !has_failed_launch_check(checks);
                 const auto failed = std::find_if(checks.begin(), checks.end(),
                                                  [](const UiState::LaunchCheck& check) {
                                                      return !check.passed;
@@ -2921,7 +4271,6 @@ void start_pending_launch(UiState& st) {
     std::string id = st.pending_id;
     std::wstring instance_dir = st.pending_instance_dir;
     st.pending_instance_dir.clear();
-    st.launch_review_approved = false;
     spawn_worker(st, std::thread([&st, snap, id, instance_dir]() {
         do_launch(st, id, snap, instance_dir);
     }));
@@ -3067,6 +4416,10 @@ void do_mod_search(UiState& st, uint64_t request_id) {
 }
 
 void launch_mod_search(UiState& st) {
+    if (st.fixture_mode) {
+        set_mod_status(st, "Visual fixture: catalog search is disabled");
+        return;
+    }
     uint64_t request_id = 0;
     {
         std::lock_guard<std::mutex> lock(st.mod_mu);
@@ -3141,6 +4494,10 @@ void do_project_detail(UiState& st, const mods::SearchResult& project, uint64_t 
 }
 
 void open_project_detail(UiState& st, const mods::SearchResult& project) {
+    if (st.fixture_mode) {
+        set_mod_status(st, "Visual fixture: project requests are disabled");
+        return;
+    }
     const bool same_project = st.project_detail_open &&
         st.project_detail.source == project.source && st.project_detail.slug == project.slug;
     if (!st.project_detail_open) {
@@ -3238,11 +4595,15 @@ bool draw_catalog_compact_row(UiState& st, const mods::SearchResult& project,
     ImGui::PopFont();
     card_end();
     ImGui::PopStyleVar();
-    return ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    return !st.fixture_mode && ImGui::IsItemClicked(ImGuiMouseButton_Left);
 }
 
 void request_project_install(UiState& st, const mods::SearchResult& project,
                              const instances::Instance& target, bool modpack) {
+    if (st.fixture_mode) {
+        set_mod_status(st, "Visual fixture: project installation is disabled");
+        return;
+    }
     st.install_confirm_project = project;
     instances::Instance resolved_target = target;
     st.install_confirm_modpack = modpack;
@@ -4404,7 +5765,7 @@ void draw_sidebar(UiState& st) {
         if (nav_button(st, item)) {
             navigate_to(st, item.id, item.tab);
         }
-        if (item.id == 23) {
+        if (!st.fixture_mode && item.id == 23) {
             int badge = 0;
             try {
                 badge += (int)aml::essentials::FriendsManager::instance().get_pending_requests().size();
@@ -4466,15 +5827,17 @@ void draw_sidebar(UiState& st) {
     }
 
     // ─── Profile Card (Amalgam Account) ──────────────────────────────────
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    const bool am_authenticated = supabase.is_authenticated();
-    bool mc_authenticated;
-    {
-        std::lock_guard<std::mutex> lock(st.auth_mu);
-        mc_authenticated = !st.account.username.empty();
+    // Fixture captures must never wake an existing account/session through
+    // shell chrome. The account facade itself is local-only, and the shell
+    // remains deliberately signed out.
+    aml::supabase::SupabaseManager* supabase = nullptr;
+    bool am_authenticated = false;
+    aml::supabase::SupabaseUser am_user;
+    if (!st.fixture_mode) {
+        supabase = &aml::supabase::SupabaseManager::instance();
+        am_authenticated = supabase->is_authenticated();
+        if (am_authenticated) am_user = supabase->get_current_user();
     }
-    auto am_user = am_authenticated ? supabase.get_current_user() : aml::supabase::SupabaseUser();
-
     ImGui::SetCursorPosX(ui_px(10.0f));
     card_begin("##profile", ImVec2(-1, profile_card_h));
     {
@@ -4496,8 +5859,9 @@ void draw_sidebar(UiState& st) {
             ImGui::TextColored(k.muted, "%s", subtitle);
             // Show Amalgam+ badge if premium
             {
-                auto& sidebar_ents = aml::entitlements::EntitlementManager::instance();
-                if (sidebar_ents.is_plus()) {
+                const bool has_plus = !st.fixture_mode &&
+                    aml::entitlements::EntitlementManager::instance().is_plus();
+                if (has_plus) {
                     ImVec2 bp = ImGui::GetCursorScreenPos();
                     ImVec4 plus_bg = k.brand; plus_bg.w = 0.15f;
                     draw_badge(ImGui::GetWindowDrawList(), bp, "AMALGAM+", k.brand, plus_bg);
@@ -4532,61 +5896,6 @@ void draw_sidebar(UiState& st) {
                                    ImVec2(sidebar_width - ui_px(20.0f), profile_card_h))) {
             st.account_dropdown_open = true;
         }
-    }
-
-    // ─── Account Dropdown Popup ──────────────────────────────────────────
-    if (st.account_dropdown_open) {
-        ImGui::OpenPopup("##account_dropdown");
-        st.account_dropdown_open = false;
-    }
-    if (ImGui::BeginPopup("##account_dropdown", ImGuiWindowFlags_NoMove)) {
-        if (am_authenticated) {
-            auto user = supabase.get_current_user();
-            std::string display = user.display_name.empty() ? user.email : user.display_name;
-            ImGui::TextColored(k.brand, "%s", display.c_str());
-            ImGui::TextDisabled("%s", user.email.c_str());
-            ImGui::Separator();
-
-            if (mc_authenticated) {
-                ImGui::TextColored(k.green, "Minecraft: %s", st.account.username.c_str());
-            } else {
-                if (ghost_button("Connect Minecraft Account", ImVec2(-1, 0))) {
-                    st.ms_connect_popup_open = true;
-                    ImGui::CloseCurrentPopup();
-                }
-            }
-            ImGui::Separator();
-
-            if (ImGui::MenuItem("Account Settings")) {
-                navigate_to(st, 15, 15);
-            }
-            if (ImGui::MenuItem("Security")) {
-                navigate_to(st, 15, 15);
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Sign Out")) {
-                aml::account::AccountManager::instance().end_current_session();
-                supabase.sign_out();
-                st.account.username.clear();
-                push_notice(st, ui_model::NoticeLevel::Info, "Signed out",
-                            "You have been signed out of Amalgam");
-            }
-        } else {
-            ImGui::TextDisabled("Amalgam Account");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Sign In")) {
-                ImGui::CloseCurrentPopup();
-                st.auth_prompt_dismissed = false;
-                st.login_popup_open = true;
-            }
-            if (ImGui::MenuItem("Create Account")) {
-                ImGui::CloseCurrentPopup();
-                st.auth_prompt_dismissed = false;
-                st.auth_wizard_state = AuthWizardState();
-                st.register_popup_open = true;
-            }
-        }
-        ImGui::EndPopup();
     }
 
     // Auth popups are rendered once from draw_shell after all navigation
@@ -4694,7 +6003,11 @@ void draw_sidebar(UiState& st) {
     const bool mc_account = !st.account.username.empty();
     const char* play_label = st.running ? "LAUNCHING..."
         : (mc_account ? "PLAY" : "PLAY VIA MINECRAFT");
-    if (primary_button(play_label, ImVec2(-1, play_btn_h), st.running) && !st.running) {
+    if (st.fixture_mode) ImGui::BeginDisabled();
+    const bool sidebar_play_clicked =
+        primary_button(play_label, ImVec2(-1, play_btn_h), st.running || st.fixture_mode);
+    if (st.fixture_mode) ImGui::EndDisabled();
+    if (!st.fixture_mode && sidebar_play_clicked && !st.running) {
         if (!st.selected.empty()) {
             st.pending_id = st.selected;
             st.pending_instance_dir = st.active_instance_dir;
@@ -4709,7 +6022,9 @@ void draw_sidebar(UiState& st) {
         if (st.safe_mode) {
             ImGui::TextColored(k.yellow, "SAFE MODE \u2014 optional network features are off");
         }
-        if (!mc_account && official_launcher::IsOfficialLauncherInstalled()) {
+        if (st.fixture_mode) {
+            ImGui::TextDisabled("Amalgam visual-review fixture");
+        } else if (!mc_account && official_launcher::IsOfficialLauncherInstalled()) {
             ImGui::TextDisabled("Plays via official Minecraft Launcher");
         } else {
             ImGui::TextDisabled("Amalgam Launcher v%s", kVersion);
@@ -4718,6 +6033,79 @@ void draw_sidebar(UiState& st) {
     }
 
     ImGui::EndChild();
+}
+
+// The account flyout belongs to the topbar affordance.  It used to be opened
+// while the sidebar was the current ImGui window, which made a topbar click
+// appear beside the brand instead of below the control the player clicked.
+// Keep this renderer immediately after the topbar account item so Dear ImGui
+// uses that item as the popup anchor in both full and compact layouts.
+void draw_account_dropdown_popup(UiState& st) {
+    if (st.account_dropdown_open) {
+        ImGui::OpenPopup("##account_dropdown");
+        st.account_dropdown_open = false;
+    }
+    if (!ImGui::BeginPopup("##account_dropdown", ImGuiWindowFlags_NoMove)) return;
+
+    // Fixture mode intentionally remains signed out and never initializes a
+    // real account session; this mirrors the sidebar facade without waking
+    // account storage during deterministic visual capture.
+    bool am_authenticated = false;
+    aml::supabase::SupabaseUser am_user;
+    if (!st.fixture_mode) {
+        auto& supabase = aml::supabase::SupabaseManager::instance();
+        am_authenticated = supabase.is_authenticated();
+        if (am_authenticated) am_user = supabase.get_current_user();
+    }
+    bool mc_authenticated = false;
+    std::string minecraft_username;
+    {
+        std::lock_guard<std::mutex> lock(st.auth_mu);
+        mc_authenticated = !st.account.username.empty();
+        minecraft_username = st.account.username;
+    }
+
+    if (am_authenticated) {
+        std::string display = am_user.display_name.empty() ? am_user.email : am_user.display_name;
+        ImGui::TextColored(k.brand, "%s", display.c_str());
+        ImGui::TextDisabled("%s", am_user.email.c_str());
+        ImGui::Separator();
+
+        if (mc_authenticated) {
+            ImGui::TextColored(k.green, "Minecraft: %s", minecraft_username.c_str());
+        } else if (ghost_button("Connect Minecraft Account", ImVec2(-1, 0))) {
+            st.ms_connect_popup_open = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::Separator();
+
+        if (ImGui::MenuItem("Account Settings")) {
+            open_account_tab(st, 2);
+        }
+        if (ImGui::MenuItem("Security")) {
+            open_account_tab(st, 3);
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Sign Out")) {
+            request_amalgam_sign_out(st);
+            ImGui::CloseCurrentPopup();
+        }
+    } else {
+        ImGui::TextDisabled("Amalgam Account");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Sign In")) {
+            ImGui::CloseCurrentPopup();
+            st.auth_prompt_dismissed = false;
+            st.login_popup_open = true;
+        }
+        if (ImGui::MenuItem("Create Account")) {
+            ImGui::CloseCurrentPopup();
+            st.auth_prompt_dismissed = false;
+            st.auth_wizard_state = AuthWizardState();
+            st.register_popup_open = true;
+        }
+    }
+    ImGui::EndPopup();
 }
 
 // ---------------------------------------------------------------------------
@@ -4877,8 +6265,10 @@ void draw_topbar(UiState& st) {
         std::lock_guard<std::mutex> lock(st.notice_mu);
         active_notices = static_cast<int>(st.notices.size());
     }
-    const bool signed_in = has_linked_account(st);
-    const std::string display_name = player_display_name(st);
+    // Keep a visual fixture from resolving persisted session state merely to
+    // paint the shell account affordance.
+    const bool signed_in = !st.fixture_mode && has_linked_account(st);
+    const std::string display_name = st.fixture_mode ? std::string() : player_display_name(st);
     const std::string user_label = display_name.empty() ? "Connect account" : display_name;
     const float icon_width = ui_px(36.0f);
     const float window_width = ui_px(34.0f);
@@ -4934,8 +6324,7 @@ void draw_topbar(UiState& st) {
 
     ImGui::SetCursorScreenPos(ImVec2(action_x, action_y));
     if (topbar_icon_button("##top_downloads", NavIcon::Downloads, "Downloads", active_downloads)) {
-        st.downloads_open = true;
-        navigate_to(st, 4, 14);
+        open_downloads_surface(st);
     }
     action_x += icon_width + action_gap;
     ImGui::SetCursorScreenPos(ImVec2(action_x, action_y));
@@ -4958,6 +6347,7 @@ void draw_topbar(UiState& st) {
             st.account_dropdown_open = true;
         }
     }
+    draw_account_dropdown_popup(st);
 
     // The controls are positioned inside the bar; reserve exactly the bar
     // height instead of adding the height after the controls a second time.
@@ -5177,8 +6567,10 @@ bool draw_home_panel_header(const char* title, const char* action = nullptr) {
 void draw_home_tab(UiState& st) {
     ensure_instance_list(st);
     const float width = ImGui::GetContentRegionAvail().x;
-    const std::string username = player_display_name(st);
-    const bool signed_in = has_linked_account(st);
+    // Fixtures must be deterministic: do not let a locally restored account
+    // change a signed-out visual-review state into a mixed welcome/sign-in UI.
+    const std::string username = st.fixture_mode ? std::string() : player_display_name(st);
+    const bool signed_in = !st.fixture_mode && has_linked_account(st);
     draw_breadcrumbs({"Home"});
     ImGui::PushFont(f_title);
     if (username.empty())
@@ -5415,8 +6807,19 @@ void draw_home_tab(UiState& st) {
     const int panel_columns = width >= ui_px(1050.0f) ? 3 : 1;
     const float panel_width = panel_columns == 3 ?
         (width - panel_gap * 2.0f) / 3.0f : width;
-    auto panel_begin = [&](const char* id) {
-        ImGui::BeginChild(id, ImVec2(panel_width, ui_px(252.0f)), ImGuiChildFlags_Borders,
+    // These panels have intentionally different information density.  Giving
+    // all three the recommendation panel's fixed height left the smaller
+    // Updates and Library cards looking unfinished.  The compact values retain
+    // room for wrapped recovery/status copy at narrow desktop widths.
+    const bool compact_home_panels = panel_columns == 3 && panel_width < ui_px(420.0f);
+    const bool stack_activity_actions = st.instance_list.empty() && panel_width < ui_px(390.0f);
+    const float updates_panel_height = compact_home_panels ? ui_px(224.0f) : ui_px(192.0f);
+    const float activity_panel_height = st.instance_list.empty()
+        ? (stack_activity_actions ? ui_px(224.0f) : ui_px(200.0f))
+        : ui_px(188.0f);
+    const float recommended_panel_height = ui_px(252.0f);
+    auto panel_begin = [&](const char* id, float height) {
+        ImGui::BeginChild(id, ImVec2(panel_width, height), ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         const ImVec2 panel_min = ImGui::GetWindowPos();
         const ImVec2 panel_max = panel_min + ImGui::GetWindowSize();
@@ -5427,7 +6830,7 @@ void draw_home_tab(UiState& st) {
     auto panel_end = [&]() {
         ImGui::EndChild();
     };
-    panel_begin("##home_updates");
+    panel_begin("##home_updates", updates_panel_height);
     draw_home_panel_header("Updates");
     ImGui::Separator();
     bool readiness_checked = false;
@@ -5437,7 +6840,7 @@ void draw_home_tab(UiState& st) {
     }
     // Render the cached summary; a background worker recomputes it when the
     // underlying data changed (see refresh_home_readiness_async).
-    if (st.home_readiness.dirty.exchange(false)) {
+    if (!st.fixture_mode && st.home_readiness.dirty.exchange(false)) {
         refresh_home_readiness_async(st);
     }
     int ready_profiles = 0;
@@ -5449,31 +6852,37 @@ void draw_home_tab(UiState& st) {
         profiles_needing_attention = st.home_readiness.attention_profiles;
         first_profile_issue = st.home_readiness.first_issue;
     }
+    auto draw_readiness_summary = [](const ImVec4& color, const std::string& summary) {
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        ImGui::TextWrapped("%s", summary.c_str());
+        ImGui::PopStyleColor();
+    };
     if (!readiness_checked || st.instance_list.empty()) {
-        ImGui::TextColored(k.muted, "Profile readiness: Not checked");
+        draw_readiness_summary(k.muted, "Profile readiness: Not checked");
     } else if (st.home_readiness.computing.load() && ready_profiles == 0 &&
                profiles_needing_attention == 0) {
-        ImGui::TextColored(k.muted, "Profile readiness: checking...");
+        draw_readiness_summary(k.muted, "Profile readiness: checking...");
     } else if (profiles_needing_attention == 0) {
-        ImGui::TextColored(k.green, "%d profile(s) ready to play", ready_profiles);
+        draw_readiness_summary(k.green, std::to_string(ready_profiles) + " profile(s) ready to play");
     } else if (ready_profiles > 0) {
-        ImGui::TextColored(k.yellow, "%d profile(s) ready; %d need attention: %s",
-                           ready_profiles, profiles_needing_attention, first_profile_issue.c_str());
+        draw_readiness_summary(k.yellow, std::to_string(ready_profiles) + " profile(s) ready; " +
+                                            std::to_string(profiles_needing_attention) +
+                                            " need attention: " + first_profile_issue);
     } else {
-        ImGui::TextColored(k.yellow, "Profiles need attention: %s", first_profile_issue.c_str());
+        draw_readiness_summary(k.yellow, "Profiles need attention: " + first_profile_issue);
     }
     ImGui::Spacing();
     if (primary_button("Manage all downloads", ImVec2(-1, ui_px(36.0f)))) {
-        st.sidebar_item = 4;
-        st.active_tab = 17;
-        st.downloads_open = true;
+        open_downloads_surface(st);
     }
     ImGui::Spacing();
-    ImGui::TextColored(k.muted, "Keep your profiles and installed content up to date from one place.");
+    ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+    ImGui::TextWrapped("Keep your profiles and installed content up to date from one place.");
+    ImGui::PopStyleColor();
     panel_end();
     if (panel_columns == 3) ImGui::SameLine(0, panel_gap);
 
-    panel_begin("##home_activity");
+    panel_begin("##home_activity", activity_panel_height);
     if (draw_home_panel_header("Library activity", "View all")) {
         st.sidebar_item = 3;
         st.active_tab = 6;
@@ -5485,10 +6894,16 @@ void draw_home_tab(UiState& st) {
         ImGui::PopFont();
         ImGui::TextColored(k.muted, "Create a profile or install a modpack to get started.");
         ImGui::Spacing();
-        if (primary_button("Create Profile", ImVec2(ui_px(160.0f), ui_px(36.0f))))
+        const float activity_action_width = stack_activity_actions
+            ? -1.0f
+            : std::max(ui_px(120.0f), (ImGui::GetContentRegionAvail().x - ui_px(8.0f)) * 0.5f);
+        if (primary_button("Create Profile", ImVec2(activity_action_width, ui_px(36.0f))))
             open_profile_wizard(st, 0, "My Modpack");
-        ImGui::SameLine();
-        if (ghost_button("Browse Modpacks", ImVec2(ui_px(160.0f), ui_px(36.0f)))) { st.sidebar_item = 2; }
+        if (stack_activity_actions)
+            ImGui::Spacing();
+        else
+            ImGui::SameLine(0, ui_px(8.0f));
+        if (ghost_button("Browse Modpacks", ImVec2(activity_action_width, ui_px(36.0f)))) { st.sidebar_item = 2; }
     } else {
         const auto* newest = &st.instance_list.front();
         for (const auto& instance : st.instance_list) {
@@ -5497,8 +6912,10 @@ void draw_home_tab(UiState& st) {
         ImGui::PushFont(f_bold);
         ImGui::TextUnformatted(newest->name.empty() ? newest->id.c_str() : newest->name.c_str());
         ImGui::PopFont();
-        ImGui::TextColored(k.muted, "%s  |  %s", profile_activity_label(*newest).c_str(),
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::TextWrapped("%s  |  %s", profile_activity_label(*newest).c_str(),
                            newest->pack_source.empty() ? "Custom profile" : newest->pack_source.c_str());
+        ImGui::PopStyleColor();
         ImGui::Separator();
         ImGui::TextColored(k.muted, "%d profile(s) saved locally", static_cast<int>(st.instance_list.size()));
         ImGui::Spacing();
@@ -5510,7 +6927,7 @@ void draw_home_tab(UiState& st) {
     panel_end();
     if (panel_columns == 3) ImGui::SameLine(0, panel_gap);
 
-    panel_begin("##home_recommended");
+    panel_begin("##home_recommended", recommended_panel_height);
     if (draw_home_panel_header("Recommended for you", "View all")) {
         st.sidebar_item = 2;
         st.active_tab = 16;
@@ -5620,7 +7037,7 @@ void discover_card(UiState& st, const char* title, const char* version, const ch
                         p0.y + ui_px(126.0f)), c32(k.muted), stats);
     ImGui::PopFont();
     ImGui::Dummy(ImVec2(avail.x, h + ui_px(10.0f)));
-    if (ImGui::IsItemClicked()) {
+    if (!st.fixture_mode && ImGui::IsItemClicked()) {
         if (project) {
             if (project_index >= 0) st.home_pack_selected = project_index;
             open_project_detail(st, *project);
@@ -5676,6 +7093,7 @@ void draw_discover_tab(UiState& st) {
         draw_mods_tab(st);
         return;
     }
+    const bool fixture_preview = st.fixture_mode;
 
     // ── Context header (adding to profile) ────────────────────────────────
     if (!st.active_instance_dir.empty() && !st.selected.empty()) {
@@ -5690,7 +7108,8 @@ void draw_discover_tab(UiState& st) {
                            st.selected_instance.minecraft_version.c_str(),
                            st.selected_instance.loader.c_str());
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(70.0f));
-        if (ghost_button("Change", ImVec2(ui_px(60.0f), ui_px(26.0f)))) {
+        if (ghost_button("Change", ImVec2(ui_px(60.0f), ui_px(26.0f)), fixture_preview) &&
+            !fixture_preview) {
             st.active_instance_dir.clear();
             st.selected.clear();
         }
@@ -5717,7 +7136,7 @@ void draw_discover_tab(UiState& st) {
         ImVec2 p = ImGui::GetCursorScreenPos();
         ImVec2 sz = ImGui::CalcTextSize(ct.label) + ImVec2(ui_px(16.0f), ui_px(6.0f));
         const bool active = st.discover_sub_tab == ct.idx;
-        const bool hovered = ImGui::IsMouseHoveringRect(p, p + sz);
+        const bool hovered = !fixture_preview && ImGui::IsMouseHoveringRect(p, p + sz);
         ImGui::InvisibleButton(("##ctab_" + std::to_string(ct.idx)).c_str(), sz);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         // Every content type carries a surface, so the row reads as a control the
@@ -5727,7 +7146,7 @@ void draw_discover_tab(UiState& st) {
         dl->AddRect(p, p + sz, c32(active ? k.brand_hov : k.border), ui_px(4.0f), 0, ui_px(1.0f));
         dl->AddText(p + ImVec2(ui_px(8.0f), ui_px(3.0f)), c32(k.text), ct.label);
         if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        if (ImGui::IsItemClicked()) {
+        if (!fixture_preview && ImGui::IsItemClicked()) {
             st.discover_sub_tab = ct.idx;
             st.browse_category = ct.category;
             const int browse_facets[] = {0, 7, 9, 8, 10};
@@ -5747,7 +7166,8 @@ void draw_discover_tab(UiState& st) {
     ImGui::TextUnformatted("Featured Modpacks");
     ImGui::PopFont();
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(84.0f));
-    if (ghost_button("View all", ImVec2(ui_px(74.0f), ui_px(28.0f)))) {
+    if (ghost_button("View all", ImVec2(ui_px(74.0f), ui_px(28.0f)), fixture_preview) &&
+        !fixture_preview) {
         st.discover_sub_tab = 1;
         st.browse_category = 1;
         st.mod_facet = 7;
@@ -5761,7 +7181,12 @@ void draw_discover_tab(UiState& st) {
     }
     const float featured_gap = ui_px(10.0f);
     std::vector<mods::SearchResult> home_packs;
-    { std::lock_guard<std::mutex> lock(st.mod_mu); home_packs = st.home_packs; }
+    std::string featured_error;
+    {
+        std::lock_guard<std::mutex> lock(st.mod_mu);
+        home_packs = st.home_packs;
+        featured_error = st.home_error;
+    }
     int pack_count = std::min(6, static_cast<int>(home_packs.size()));
     const float fw = ImGui::GetContentRegionAvail().x;
     // Four cards need the full desktop content width. At 1280px window width
@@ -5772,7 +7197,14 @@ void draw_discover_tab(UiState& st) {
     const float card_h = ui_px(178.0f);
     const float artwork_h = ui_px(92.0f);
     int frows = std::max(1, (pack_count + fc - 1) / fc);
-    ImGui::BeginChild("##featured", ImVec2(0, frows * (card_h + featured_gap)));
+    // A recoverable catalog error should not leave a card-grid-sized empty
+    // canyon above the next section. Retain the full gallery canvas for real
+    // cards/loading/empty art, but compact the purpose-built error state.
+    const bool featured_error_state = home_packs.empty() && !st.home_fetching &&
+                                      !featured_error.empty();
+    const float featured_height = featured_error_state ? ui_px(96.0f)
+                                                       : frows * (card_h + featured_gap);
+    ImGui::BeginChild("##featured", ImVec2(0, featured_height));
     for (int i = 0; i < pack_count; ++i) {
         if (i && i % fc) ImGui::SameLine(0, featured_gap);
         ImGui::BeginChild((std::string("##fc") + std::to_string(i)).c_str(), ImVec2(card_w, card_h), false);
@@ -5785,8 +7217,6 @@ void draw_discover_tab(UiState& st) {
         ImGui::EndChild();
     }
     if (home_packs.empty()) {
-        std::string he;
-        { std::lock_guard<std::mutex> lock(st.mod_mu); he = st.home_error; }
         if (st.home_fetching) {
             // Skeleton loading for featured modpacks
             for (int i = 0; i < 4; ++i) {
@@ -5799,8 +7229,13 @@ void draw_discover_tab(UiState& st) {
                 ImGui::Dummy(ImVec2(card_w, card_h));
                 ImGui::EndChild();
             }
-        } else if (!he.empty()) {
-            ImGui::TextColored(k.red, "%s", he.c_str());
+        } else if (!featured_error.empty()) {
+            ImGui::TextColored(k.red, "%s", featured_error.c_str());
+            ImGui::Spacing();
+            if (ghost_button("Retry catalog", ImVec2(ui_px(128.0f), ui_px(30.0f)),
+                             st.fixture_mode) && !st.fixture_mode) {
+                retry_home_catalog(st);
+            }
         } else {
             illustrated_empty_state(IconId::Cube, "No modpacks found",
                                     "Try adjusting your search or filters to find content.");
@@ -5816,7 +7251,8 @@ void draw_discover_tab(UiState& st) {
     ImGui::SameLine(0, ui_px(10));
     ImGui::TextColored(k.muted, "Live catalog");
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(84.0f));
-    if (ghost_button("View all", ImVec2(ui_px(74.0f), ui_px(28.0f)))) {
+    if (ghost_button("View all", ImVec2(ui_px(74.0f), ui_px(28.0f)), fixture_preview) &&
+        !fixture_preview) {
         st.discover_sub_tab = 2;
         st.browse_category = 0;
         st.mod_facet = 0;
@@ -5837,8 +7273,10 @@ void draw_discover_tab(UiState& st) {
     const float tw2 = std::max(ui_px(220.0f), (tw - featured_gap * (tc - 1)) / tc);
     for (int i = 0; i < mod_count; ++i) {
         if (i && i % tc) ImGui::SameLine(0, featured_gap);
-        if (draw_catalog_compact_row(st, home_mods[i], ("##tm" + std::to_string(i)).c_str(),
-                                     ImVec2(tw2, ui_px(82.0f)), true))
+        const bool open_project = draw_catalog_compact_row(
+            st, home_mods[i], ("##tm" + std::to_string(i)).c_str(),
+            ImVec2(tw2, ui_px(82.0f)), true);
+        if (open_project && !fixture_preview)
             open_project_detail(st, home_mods[i]);
     }
     if (home_mods.empty()) {
@@ -5852,9 +7290,27 @@ void draw_discover_tab(UiState& st) {
                 draw_skeleton_rect(skel_pos, ImVec2(tw2, ui_px(82.0f)), ui_px(10.0f));
                 ImGui::Dummy(ImVec2(tw2, ui_px(82.0f)));
             }
+        } else if (!he.empty()) {
+            ImGui::TextColored(k.red, "Trending mods are unavailable.");
+            ImGui::TextColored(k.muted,
+                               "Retry the catalog above when your connection is ready.");
         } else {
-            ImGui::TextColored(he.empty() ? k.muted : k.red, "%s",
-                               he.empty() ? "No mod data available." : he.c_str());
+            // Trending is the supporting Discover lane. A compact empty card
+            // preserves a polished visual cue without duplicating the large
+            // featured-gallery illustration or pushing its message below the
+            // initial desktop viewport.
+            card_begin("##trending_empty", ImVec2(0, ui_px(76.0f)));
+            const ImVec2 empty_origin = ImGui::GetCursorScreenPos();
+            draw_icon(IconId::Cube, empty_origin + ImVec2(ui_px(18.0f), ui_px(24.0f)),
+                      ui_px(12.0f), c32(k.brand_hov));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(48.0f));
+            ImGui::PushFont(f_bold);
+            ImGui::TextUnformatted("No trending mods found");
+            ImGui::PopFont();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(48.0f));
+            ImGui::TextColored(k.muted,
+                               "Try adjusting your search or filters to find content.");
+            card_end();
         }
     }
 }
@@ -5916,7 +7372,72 @@ void draw_version_list(UiState& st) {
 }
 
 void draw_play_tab(UiState& st) {
-    draw_discover_tab(st);
+    // This is intentionally a launch-focused surface.  Routing it to Discover
+    // made the named `play` state silently duplicate a different product area
+    // and left both real users and visual evidence with no clear Play view.
+    const instances::Instance& profile = st.selected_instance;
+    const bool has_profile = !profile.minecraft_version.empty() &&
+                             (!profile.id.empty() || !profile.name.empty());
+
+    page_title("Play Java Edition", "Review the prepared profile, then launch with a clear handoff.");
+    if (!has_profile) {
+        empty_state("No profile selected",
+                    "Choose a profile from Library before starting Java Edition.", "P");
+        if (primary_button("Open Library", ImVec2(ui_px(132.0f), ui_px(34.0f)))) {
+            st.active_tab = 6;
+            st.sidebar_item = 3;
+        }
+        return;
+    }
+
+    const std::string name = profile.name.empty() ? profile.id : profile.name;
+    const std::string loader = loader_display_name(profile.loader);
+    card_begin("##play_profile_hero", ImVec2(-1, 0));
+    ImGui::TextColored(k.muted, "SELECTED PROFILE");
+    ImGui::PushFont(f_title);
+    ImGui::TextUnformatted(name.c_str());
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "%s  |  %s", profile.minecraft_version.c_str(),
+                       loader.empty() ? "Vanilla" : loader.c_str());
+    ImGui::Spacing();
+    draw_status_indicator(k.green, "Prepared profile - ready for launch");
+    ImGui::TextColored(k.muted,
+                       "Amalgam prepares this profile and hands it to the official Minecraft Launcher for sign-in.");
+    ImGui::Spacing();
+
+    const bool fixture = st.fixture_mode;
+    if (primary_button(fixture ? "Play profile (fixture)" : "Play profile",
+                       ImVec2(ui_px(176.0f), ui_px(36.0f)), false, fixture) && !fixture) {
+        st.selected = profile.minecraft_version;
+        st.pending_id = st.selected;
+        st.pending_instance_dir = profile.directory;
+        st.active_instance_dir = profile.directory;
+        st.pending_launch = true;
+    }
+    ImGui::SameLine(0, ui_px(8.0f));
+    if (ghost_button("Open profile", ImVec2(ui_px(132.0f), ui_px(36.0f)))) {
+        st.instance_detail_open = true;
+        st.instance_detail_tab = 0;
+        st.active_tab = 6;
+        st.sidebar_item = 3;
+    }
+    if (fixture)
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: launch is disabled; no account, game, or launcher is opened.");
+    card_end();
+
+    ImGui::Spacing();
+    card_begin("##play_handoff", ImVec2(-1, 0));
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Launch handoff");
+    ImGui::PopFont();
+    ImGui::TextColored(k.green, "1. Profile files prepared");
+    ImGui::TextColored(k.green, "2. Java runtime selected");
+    ImGui::TextColored(k.green, "3. Official launcher owns Microsoft sign-in");
+    ImGui::Spacing();
+    ImGui::TextColored(k.muted,
+                       "This separation keeps Microsoft credentials with the official launcher while Amalgam manages the profile.");
+    card_end();
 }
 
 // ---------------------------------------------------------------------------
@@ -5927,7 +7448,8 @@ const char* facet_labels[] = {"Mods", "Modpacks", "Resource Packs", "Shaders", "
                               "Technology", "Adventure", "Storage", "Food", "Utility"};
 
 void draw_project_detail_tab(UiState& st) {
-    if (ghost_button("<  Back to Discover", ImVec2(ui_px(170.0f), ui_px(34.0f)))) {
+    if (ghost_button("<  Back to Discover", ImVec2(ui_px(170.0f), ui_px(34.0f)),
+                     st.fixture_mode) && !st.fixture_mode) {
         close_project_detail(st);
         return;
     }
@@ -6038,17 +7560,21 @@ void draw_project_detail_tab(UiState& st) {
     if (st.active_instance_dir.empty() && !is_modpack) {
         ImGui::TextColored(k.yellow, "Select an existing profile before installing this project.");
         ImGui::TextColored(k.muted, "Amalgam will not silently create or modify a profile for you.");
-        if (primary_button("Open Home / Select profile", ImVec2(ui_px(230.0f), ui_px(40.0f)))) {
+        if (primary_button("Open Home / Select profile", ImVec2(ui_px(230.0f), ui_px(40.0f)),
+                           false, st.fixture_mode) && !st.fixture_mode) {
             st.sidebar_item = 0;
             st.active_tab = 0;
         }
     } else if (is_modpack) {
         ImGui::TextColored(k.muted,
                            "Creates a new isolated profile with the creator's version, loader, and content.");
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, project_compatible ? 1.0f : 0.45f);
-        bool install_modpack_clicked = primary_button(st.mod_installing ? "Installing..." : "Install as new profile", ImVec2(ui_px(210.0f), ui_px(34.0f)));
+        const bool can_install_modpack = project_compatible && !st.mod_installing && !st.fixture_mode;
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, can_install_modpack ? 1.0f : 0.45f);
+        bool install_modpack_clicked = primary_button(
+            st.mod_installing ? "Installing..." : "Install as new profile",
+            ImVec2(ui_px(210.0f), ui_px(34.0f)), false, !can_install_modpack);
         ImGui::PopStyleVar();
-        if (install_modpack_clicked && project_compatible && !st.mod_installing) {
+        if (install_modpack_clicked && can_install_modpack) {
             instances::Instance empty_target;
             empty_target.minecraft_version = selected_release.game_version;
             empty_target.loader = selected_release.loader;
@@ -6056,10 +7582,13 @@ void draw_project_detail_tab(UiState& st) {
         }
     } else {
         ImGui::TextColored(k.muted, "Target profile: %s", net::to_utf8(st.active_instance_dir).c_str());
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, project_compatible ? 1.0f : 0.45f);
-        bool install_mod_clicked = primary_button(st.mod_installing ? "Installing..." : "Install into profile", ImVec2(ui_px(190.0f), ui_px(34.0f)));
+        const bool can_install = project_compatible && !st.mod_installing && !st.fixture_mode;
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, can_install ? 1.0f : 0.45f);
+        bool install_mod_clicked = primary_button(st.mod_installing ? "Installing..." : "Install into profile",
+                                                  ImVec2(ui_px(190.0f), ui_px(34.0f)),
+                                                  false, !can_install);
         ImGui::PopStyleVar();
-        if (install_mod_clicked && project_compatible && !st.mod_installing) {
+        if (install_mod_clicked && can_install) {
             instances::Instance target = st.selected_instance;
             if (target.directory.empty()) target.directory = st.active_instance_dir;
             request_project_install(st, st.project_detail, target, false);
@@ -6083,16 +7612,20 @@ void draw_project_detail_tab(UiState& st) {
         }
         ShellExecuteA(st.hwnd, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     };
-    if (!header_info.website_url.empty() && ghost_button("Open website", ImVec2(ui_px(130.0f), ui_px(30.0f))))
+    if (!header_info.website_url.empty() &&
+        ghost_button("Open website", ImVec2(ui_px(130.0f), ui_px(30.0f)), st.fixture_mode) &&
+        !st.fixture_mode)
         open_external_url(header_info.website_url);
     if (!header_info.source_url.empty() && header_info.source_url != header_info.website_url) {
         ImGui::SameLine();
-        if (ghost_button("Open source", ImVec2(ui_px(120.0f), ui_px(30.0f))))
+        if (ghost_button("Open source", ImVec2(ui_px(120.0f), ui_px(30.0f)), st.fixture_mode) &&
+            !st.fixture_mode)
             open_external_url(header_info.source_url);
     }
     if (!header_info.issues_url.empty()) {
         ImGui::SameLine();
-        if (ghost_button("Open issues", ImVec2(ui_px(110.0f), ui_px(30.0f))))
+        if (ghost_button("Open issues", ImVec2(ui_px(110.0f), ui_px(30.0f)), st.fixture_mode) &&
+            !st.fixture_mode)
             open_external_url(header_info.issues_url);
     }
     if (!is_modpack) {
@@ -6171,8 +7704,13 @@ void draw_project_detail_tab(UiState& st) {
         ImGui::TextColored(k.muted, "%s | %s downloads",
                            st.project_detail.source == "curseforge" ? "CurseForge" : "Modrinth",
                            format_download_count(st.project_detail.downloads).c_str());
-        if (project_retryable && ghost_button("Retry project details", ImVec2(ui_px(150.0f), ui_px(30.0f))))
-            open_project_detail(st, st.project_detail);
+        if (project_retryable) {
+            const bool retry = ghost_button("Retry project details",
+                                            ImVec2(ui_px(150.0f), ui_px(30.0f)),
+                                            st.fixture_mode);
+            if (retry && !st.fixture_mode)
+                open_project_detail(st, st.project_detail);
+        }
     } else {
         std::string project_error;
         {
@@ -6423,14 +7961,22 @@ void draw_project_detail_tab(UiState& st) {
                     }
                 }
                 ImGui::Spacing();
-                 bool confirm = primary_button(st.mod_installing ? "Installing..." : "Confirm install",
-                                               ImVec2(ui_px(150.0f), ui_px(36.0f)));
+                const bool fixture_preview = st.fixture_mode;
+                if (fixture_preview) {
+                    ImGui::TextColored(k.brand,
+                                       "Visual QA fixture — sample install only; no files or downloads are changed.");
+                    ImGui::Spacing();
+                }
+                bool confirm = primary_button(st.mod_installing ? "Installing..." : "Confirm install",
+                                              ImVec2(ui_px(150.0f), ui_px(36.0f)), st.mod_installing,
+                                              fixture_preview || st.mod_installing);
                 ImGui::SameLine();
-                 bool cancel = ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(36.0f)));
+                bool cancel = ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                                           ImVec2(ui_px(fixture_preview ? 118.0f : 100.0f), ui_px(36.0f)));
                 if (cancel) {
                     st.install_confirm_open = false;
                     ImGui::CloseCurrentPopup();
-                } else if (confirm && !st.mod_installing) {
+                } else if (confirm && !fixture_preview && !st.mod_installing) {
                     const auto project = st.install_confirm_project;
                     const auto target = st.install_confirm_target;
                     st.install_confirm_open = false;
@@ -7080,24 +8626,83 @@ void draw_modpack_tab(UiState& st) {
 // ---------------------------------------------------------------------------
 // Bedrock functions are now in bedrock_ui.cpp
 void draw_admin_settings(UiState& st) {
+    // The Settings > Admin route is separate from the Admin page itself.
+    // Render a non-interactive facade first so a fixture never polls an
+    // inherited signed-in Supabase client while presenting this settings tab.
+    if (st.fixture_mode) {
+        card_begin("##fixture_admin_settings", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Admin control center");
+        ImGui::PopFont();
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: local representative state only; no staff account or service is queried.");
+        ImGui::Spacing();
+        ImGui::TextColored(k.green, "Staff access  |  Sample approved role");
+        ImGui::TextColored(k.muted, "Publishing, credentials, and diagnostics remain locked in review captures.");
+        ImGui::Spacing();
+        ImGui::BeginDisabled();
+        primary_button("Open staff controls", ImVec2(ui_px(170.0f), ui_px(34.0f)), false, true);
+        ImGui::SameLine();
+        ghost_button("Refresh access", ImVec2(ui_px(140.0f), ui_px(34.0f)));
+        ImGui::EndDisabled();
+        card_end();
+
+        if (st.fixture_case == "settings-admin-password-change") {
+            // This lives after the fixture card closes, matching the parent
+            // settings scope of the live popup without touching Admin auth or
+            // the protected launcher configuration.
+            static std::string dismissed_fixture_case;
+            if (!dismissed_fixture_case.empty() && dismissed_fixture_case != st.fixture_case)
+                dismissed_fixture_case.clear();
+            if (dismissed_fixture_case != st.fixture_case) {
+                constexpr const char* kPopupId =
+                    "Change Admin password##fixture_admin_password";
+                ImGui::OpenPopup(kPopupId);
+                set_next_adaptive_window(440.0f, 0.0f, 340.0f, 0.0f);
+                bool open = true;
+                if (ImGui::BeginPopupModal(kPopupId, &open, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    std::string empty_password;
+                    std::string empty_confirmation;
+                    ImGui::PushFont(f_h2);
+                    ImGui::TextUnformatted("Change Admin password");
+                    ImGui::PopFont();
+                    ImGui::TextColored(k.brand,
+                                       "LOCAL VISUAL-QA FIXTURE — no credential or configuration is changed.");
+                    ImGui::TextColored(k.muted,
+                                       "Choose a new Admin password. The fields and save action are intentionally disabled for review.");
+                    ImGui::Spacing();
+                    ImGui::BeginDisabled();
+                    input_secret("##fixture_admin_change_password", &empty_password);
+                    input_secret("##fixture_admin_change_confirm", &empty_confirmation);
+                    ImGui::EndDisabled();
+                    ImGui::Spacing();
+                    primary_button("Save new password", ImVec2(ui_px(160.0f), ui_px(32.0f)), false, true);
+                    ImGui::SameLine();
+                    if (ghost_button("Close preview", ImVec2(ui_px(118.0f), ui_px(32.0f)))) {
+                        dismissed_fixture_case = st.fixture_case;
+                        open = false;
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+                if (!open) dismissed_fixture_case = st.fixture_case;
+            }
+        }
+        return;
+    }
     config::Config& c = *st.cfg;
     const uint64_t now = GetTickCount64();
-    static uint64_t last_staff_check = 0;
     if (st.admin_unlocked && now >= st.admin_unlock_until_ms) {
         st.admin_unlocked = false;
         st.admin_password.clear();
         st.admin_password_confirm.clear();
         st.admin_status = "Admin session expired after 15 minutes.";
     }
-    if (!st.admin_unlocked && now - last_staff_check > 5000) {
-        last_staff_check = now;
-        auto* client = aml::supabase::SupabaseManager::instance().client();
-        if (client && client->is_current_user_staff()) {
-            st.admin_unlocked = true;
-            st.admin_unlock_until_ms = now + 15ull * 60ull * 1000ull;
-            st.admin_status = "Staff access enabled for this account.";
-        }
-    }
+    request_admin_staff_access_check(st);
+    // Never inspect the mutable provider client while the shared account lane
+    // is verifying staff access, signing in, or refreshing credentials.
+    const bool account_operation_pending = auth_async_request_lane_busy(st);
+    const bool staff_check_pending = admin_staff_access_check_in_progress(st);
 
     card_begin("##adminaccess", ImVec2(-1, 0));
     ImGui::PushFont(f_h2);
@@ -7108,16 +8713,26 @@ void draw_admin_settings(UiState& st) {
     ImGui::Spacing();
 
     if (!admin_auth::configured(c) && !st.admin_unlocked) {
-        auto* client = aml::supabase::SupabaseManager::instance().client();
-        if (client && client->is_authenticated()) {
-            ImGui::TextColored(k.yellow, "Staff role required.");
-            ImGui::TextWrapped("Admin access is granted server-side to approved staff accounts in public.staff_roles.");
-            ImGui::TextColored(k.muted, "Signed in account: %s", client->current_user().email.c_str());
-            if (ghost_button("Refresh staff access", ImVec2(ui_px(170.0f), ui_px(32.0f))))
-                last_staff_check = 0;
+        if (account_operation_pending) {
+            ImGui::TextColored(k.brand_hov, staff_check_pending
+                ? "Checking staff access securely…"
+                : "Account activity in progress…");
+            ImGui::TextColored(k.muted,
+                               staff_check_pending
+                                   ? "Your launcher stays responsive while the account service verifies this role."
+                                   : "Your launcher stays responsive while the account service finishes its current operation.");
         } else {
-            ImGui::TextColored(k.yellow, "Amalgam account sign-in required.");
-            ImGui::TextWrapped("Sign into your Amalgam account before requesting staff access.");
+            auto* client = aml::supabase::SupabaseManager::instance().client();
+            if (client && client->is_authenticated()) {
+                ImGui::TextColored(k.yellow, "Staff role required.");
+                ImGui::TextWrapped("Admin access is granted server-side to approved staff accounts in public.staff_roles.");
+                ImGui::TextColored(k.muted, "Signed in account: %s", client->current_user().email.c_str());
+                if (ghost_button("Refresh staff access", ImVec2(ui_px(170.0f), ui_px(32.0f))))
+                    request_admin_staff_access_check(st, true);
+            } else {
+                ImGui::TextColored(k.yellow, "Amalgam account sign-in required.");
+                ImGui::TextWrapped("Sign into your Amalgam account before requesting staff access.");
+            }
         }
     } else if (!st.admin_unlocked) {
         ImGui::TextColored(k.yellow, "Admin controls are locked.");
@@ -7132,6 +8747,7 @@ void draw_admin_settings(UiState& st) {
             if (admin_auth::verify_password(c, st.admin_password)) {
                 st.admin_unlocked = true;
                 st.admin_unlock_until_ms = now + 15ull * 60ull * 1000ull;
+                note_admin_local_password_unlock();
                 st.admin_failed_attempts = 0;
                 st.admin_status = "Admin unlocked for 15 minutes.";
             } else {
@@ -7366,7 +8982,10 @@ void draw_settings_tab(UiState& st) {
     std::vector<int> visible_settings;
     for (int i = 0; i < static_cast<int>(std::size(settings_nav)); ++i) {
         #if !defined(AMALGAM_DEVELOPER_UI)
-        if (i == 9) continue;
+        // Privacy is release-facing. Advanced is publisher-only; retain it
+        // exclusively for deterministic fixture coverage so the released
+        // navigation never advertises controls it does not ship.
+        if (i == 10 && !st.fixture_mode) continue;
         #endif
         if (settings_search_filter(settings_search_buf, settings_nav[i], settings_descriptions[i]))
             visible_settings.push_back(i);
@@ -7443,7 +9062,13 @@ void draw_settings_tab(UiState& st) {
         ImGui::EndChild();
         ImGui::SameLine(0, ui_px(14.0f));
     }
-    ImGui::BeginChild("##settingscontent", ImVec2(0, 0));
+    // Normal Settings use a bounded content column beside the navigation rail.
+    // Fixture snapshots deliberately flatten that column into the launcher-wide
+    // document so @top/@middle/@bottom evidence scrolls the real visual content
+    // instead of an invisible nested child. Live navigation remains unchanged.
+    const bool fixture_settings_document = st.fixture_mode;
+    if (fixture_settings_document) ImGui::BeginGroup();
+    else ImGui::BeginChild("##settingscontent", ImVec2(0, 0));
 
     if (st.settings_section == 0) {
     card_begin("##account", ImVec2(-1, 0));
@@ -7467,18 +9092,7 @@ void draw_settings_tab(UiState& st) {
         auth_status = st.auth_status;
     }
     ImGui::TextColored(k.muted, "%s", auth_status.c_str());
-    const bool sign_in_configured = auth::valid_client_id(c.microsoft_client_id);
-    if (sign_in_configured) {
-        ImGui::TextColored(k.yellow,
-                           "Microsoft sign-in is built in and ready, but it is still waiting on\n"
-                           "Minecraft approval, so it may not complete yet. If it fails, set Play to\n"
-                           "the Minecraft Launcher mode below and play there.");
-    } else {
-        ImGui::TextColored(k.yellow,
-                           "Microsoft sign-in is unavailable in this build. Play still works: set\n"
-                           "Play to the Minecraft Launcher mode below and Amalgam hands it your\n"
-                           "prepared profile.");
-    }
+    const bool direct_sign_in_configured = auth::valid_client_id(c.microsoft_client_id);
     if (st.auth_working) {
         ImGui::SameLine();
         ImGui::TextColored(k.yellow, "sign-in is waiting for Microsoft...");
@@ -7492,15 +9106,7 @@ void draw_settings_tab(UiState& st) {
     if (has_account) {
     ImGui::SameLine();
     if (ghost_button("Disconnect", ImVec2(ui_px(110.0f), ui_px(32.0f)))) {
-        std::string error;
-        if (auth::logout(&error)) {
-            std::lock_guard<std::mutex> lock(st.auth_mu);
-            st.account = {};
-            st.auth_status = "No Microsoft account connected";
-        } else {
-            std::lock_guard<std::mutex> lock(st.auth_mu);
-            st.auth_status = "Logout failed: " + error;
-        }
+        request_minecraft_disconnect(st);
     }
     } // has_account
     card_end();
@@ -7513,31 +9119,39 @@ void draw_settings_tab(UiState& st) {
     ImGui::TextColored(k.muted,
                        "Both modes play the same prepared profile. Choose whether\n"
                        "Amalgam signs you in, or hands the profile to the Minecraft Launcher.");
-    const bool microsoft_available = sign_in_configured && auth::valid_client_id(c.microsoft_client_id);
-    int mode_index = c.launch_mode == "microsoft" ? 0 : 1;
-    if (ImGui::RadioButton("Amalgam (connect a Microsoft account here)", &mode_index, 0)) {
-        c.launch_mode = "microsoft";
-        st.settings_dirty = true;
-    }
-    if (!microsoft_available) {
+    const bool microsoft_available = direct_sign_in_configured;
+    // An unavailable device-code client cannot be a real launch choice.  Keep
+    // a stale persisted "microsoft" preference from visually selecting an
+    // option that cannot work; the launch path already falls back safely to
+    // the Minecraft Launcher when direct sign-in is not usable.
+    int mode_index = microsoft_available && c.launch_mode == "microsoft" ? 0 : 1;
+    if (microsoft_available) {
+        if (ImGui::RadioButton("Amalgam direct sign-in", &mode_index, 0)) {
+            c.launch_mode = "microsoft";
+            st.settings_dirty = true;
+        }
+    } else {
+        ImGui::BeginDisabled(true);
+        ImGui::RadioButton("Amalgam direct sign-in", &mode_index, 0);
+        ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::TextColored(k.yellow, "unavailable in this build");
+        ImGui::TextColored(k.muted, "Unavailable in this build");
     }
     if (ImGui::RadioButton("Minecraft Launcher (Amalgam hands it your prepared profile)",
                            &mode_index, 1)) {
         c.launch_mode = "official_launcher";
         st.settings_dirty = true;
     }
-    ImGui::TextColored(k.muted,
-                       c.launch_mode == "microsoft"
-                           ? "Play opens the game directly with your connected account."
-                           : "Play prepares the profile, then opens the Minecraft Launcher.\n"
-                             "Select the Amalgam profile there and press Play.");
-    if (microsoft_available) {
-        ImGui::TextColored(k.yellow,
-                           "Signing in here is built in and ready, but it is still waiting on\n"
-                           "Minecraft approval, so it may not complete yet. If it fails, pick the\n"
-                           "Minecraft Launcher mode above and Play works there either way.");
+    if (microsoft_available && c.launch_mode == "microsoft") {
+        ImGui::TextColored(k.muted, "Play opens the game directly with your connected account.");
+    } else {
+        ImGui::TextColored(k.muted,
+                           "Play prepares the profile, then opens the Minecraft Launcher.\n"
+                           "Select the Amalgam profile there and press Play.");
+    }
+    if (!microsoft_available) {
+        ImGui::TextColored(k.muted,
+                           "Direct sign-in is unavailable here. Minecraft Launcher mode prepares your profile and hands it off securely.");
     }
     card_end();
 
@@ -7849,7 +9463,67 @@ void draw_settings_tab(UiState& st) {
     // ── Local AI installation (in-launcher GUI) ────────────────────────
     ImGui::Spacing();
     card_begin("##ai_install", ImVec2(-1, 0));
-    aml::ai_install_ui::draw_ai_install_panel(st);
+    if (st.fixture_mode) {
+        const bool ai_installing = st.fixture_case == "settings-modpacks-ai-installing";
+        const bool ai_verifying = st.fixture_case == "settings-modpacks-ai-verifying";
+        const bool ai_component_error =
+            st.fixture_case == "settings-modpacks-ai-component-error";
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Local AI models");
+        ImGui::PopFont();
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: representative status only; no model manifest or local files are read.");
+        ImGui::Spacing();
+        if (ai_installing) {
+            ImGui::TextColored(k.blue, "Status: Installing local AI components…");
+            ImGui::TextColored(k.green, "[v] Assistant model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Ready - 2.4 GB");
+            ImGui::TextColored(k.blue, "[>] Vision model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Downloading - 640 MB of 1.1 GB");
+            progress_bar(0.58f, ImVec2(std::min(ui_px(420.0f), ImGui::GetContentRegionAvail().x),
+                                        ui_px(10.0f)), "58%", &k.blue);
+            ImGui::TextColored(k.muted,
+                               "Fixture preview only — no component is downloaded, extracted, or written.");
+            ghost_button("Cancel install", ImVec2(ui_px(120.0f), ui_px(32.0f)), true);
+        } else if (ai_verifying) {
+            ImGui::TextColored(k.yellow, "Status: Verifying installed components…");
+            ImGui::TextColored(k.green, "[v] Assistant model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Verified - 2.4 GB");
+            ImGui::TextColored(k.yellow, "[?] Vision model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Checking SHA-256 integrity…");
+            progress_bar(0.72f, ImVec2(std::min(ui_px(420.0f), ImGui::GetContentRegionAvail().x),
+                                        ui_px(10.0f)), "72%", &k.yellow);
+            ImGui::TextColored(k.muted,
+                               "Fixture preview only — no model manifest, hash, or local file is inspected.");
+            ghost_button("Stop check", ImVec2(ui_px(110.0f), ui_px(32.0f)), true);
+        } else if (ai_component_error) {
+            ImGui::TextColored(k.red, "Status: A local component needs attention");
+            ImGui::TextColored(k.green, "[v] Assistant model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Ready - 2.4 GB");
+            ImGui::TextColored(k.red, "[!] Vision model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.red, "Verification could not complete");
+            ImGui::TextColored(k.muted,
+                               "No local model was changed. Retry after the local component source is available.");
+            primary_button("Retry verification", ImVec2(ui_px(148.0f), ui_px(32.0f)), false, true);
+        } else {
+            ImGui::TextColored(k.green, "[v] Assistant model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Ready - 2.4 GB");
+            ImGui::TextColored(k.green, "[v] Vision model");
+            ImGui::SameLine();
+            ImGui::TextColored(k.muted, "Ready - 1.1 GB");
+            ImGui::TextColored(k.muted, "Models are managed locally and stay on this device.");
+            primary_button("Manage local models", ImVec2(ui_px(180.0f), ui_px(32.0f)), false, true);
+        }
+    } else {
+        aml::ai_install_ui::draw_ai_install_panel(st);
+    }
     card_end();
     }
 
@@ -7884,29 +9558,26 @@ void draw_settings_tab(UiState& st) {
         if (st.settings_section == 3) {
             ImGui::TextColored(k.muted, "Configure global launcher behavior and appearance.");
             ImGui::Spacing();
-            ImGui::TextUnformatted("Theme");
+            ImGui::TextUnformatted("Appearance preset");
             ImGui::SetNextItemWidth(ui_px(200.0f));
             {
                 extern void draw_theme_selector_inline(UiState& st, config::Config& c);
                 draw_theme_selector_inline(st, c);
             }
-            ImGui::SameLine(0, ui_px(12.0f));
-            if (draw_theme_toggle()) {
-                st.settings_dirty = true;
-            }
+            ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+            ImGui::TextWrapped("Choose one complete appearance preset. Colors, fonts, and accessibility controls are available in Theme & Accessibility.");
+            ImGui::PopStyleColor();
+            if (ghost_button("Open Theme & Accessibility", ImVec2(ui_px(210.0f), ui_px(32.0f))))
+                navigate_to(st, 12, 22);
             ImGui::Spacing();
             bool kb = c.keyboard_navigation;
             if (ImGui::Checkbox("Keyboard navigation shortcuts", &kb)) {
                 c.keyboard_navigation = kb;
                 st.settings_dirty = true;
             }
-            ImGui::TextColored(k.muted, "Enable keyboard shortcuts for navigation between tabs and sections.");
-            bool sr = c.screen_reader_support;
-            if (ImGui::Checkbox("Screen reader announcements", &sr)) {
-                c.screen_reader_support = sr;
-                st.settings_dirty = true;
-            }
-            ImGui::TextColored(k.muted, "Announce tab changes and important state updates for assistive technology.");
+            ImGui::TextColored(k.muted, "Enables Ctrl+1–6 and Ctrl+, navigation shortcuts. Tab and arrow-key focus remain available.");
+            ImGui::TextColored(k.yellow, "Screen-reader semantics are not available in this build.");
+            ImGui::TextWrapped("The launcher does not yet expose reliable control-by-control screen-reader information, so it does not present an inactive screen-reader switch.");
             if (ghost_button("Send feedback", ImVec2(ui_px(150.0f), ui_px(32.0f))))
                 st.feedback_open = true;
         } else if (st.settings_section == 4) {
@@ -7929,9 +9600,7 @@ void draw_settings_tab(UiState& st) {
             ImGui::Text("%d active  |  %d completed  |  %d needs attention  |  %d resumable",
                         active_jobs, completed_jobs, failed_jobs, resumable_jobs);
             if (primary_button("Open Downloads", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
-                st.sidebar_item = 17;
-                st.active_tab = 17;
-                st.downloads_open = true;
+                open_downloads_surface(st);
             }
             ImGui::SameLine();
             const bool can_clear = completed_jobs > 0;
@@ -7962,11 +9631,16 @@ void draw_settings_tab(UiState& st) {
                 c.performance_profile = performance_ids[performance_index];
                 st.settings_dirty = true;
             }
+            // Do not disclose or probe the review host's memory in an
+            // evidence fixture. The static sample preserves the layout and
+            // tuning explanation without reading system state.
+            const uint64_t physical_memory = st.fixture_mode
+                ? 16ull * 1024ull
+                : performance::physical_memory_mb();
             const auto tuning = performance::make_tuning(c.performance_profile,
-                                                           performance::physical_memory_mb(), 21);
-            const uint64_t physical_memory = performance::physical_memory_mb();
+                                                           physical_memory, 21);
             ImGui::Spacing();
-            ImGui::TextColored(k.muted, "This device: %s RAM", 
+            ImGui::TextColored(k.muted, st.fixture_mode ? "Representative device: %s RAM" : "This device: %s RAM",
                                physical_memory > 0 ?
                                    (std::to_string(physical_memory / 1024) + " GB").c_str() :
                                    "memory unavailable");
@@ -8005,8 +9679,11 @@ void draw_settings_tab(UiState& st) {
             ImGui::TextColored(k.muted, "Credentials and profile data stay on this Windows device.");
             ImGui::TextColored(k.green, "No remote telemetry upload is enabled by this launcher.");
             ImGui::Spacing();
-            ImGui::TextColored(k.muted, "Local profile data: %s", net::to_utf8(data_root).c_str());
-            if (ghost_button("Open local data", ImVec2(ui_px(150.0f), ui_px(32.0f))))
+            ImGui::TextColored(k.muted, st.fixture_mode
+                                             ? "Local profile data: isolated visual-review fixture"
+                                             : "Local profile data remains on this device.");
+            if (ghost_button("Open local data", ImVec2(ui_px(150.0f), ui_px(32.0f)),
+                             st.fixture_mode) && !st.fixture_mode)
                 ShellExecuteW(st.hwnd, L"open", data_root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             #if defined(AMALGAM_DEVELOPER_UI)
             ImGui::SameLine();
@@ -8048,8 +9725,25 @@ void draw_settings_tab(UiState& st) {
             ImGui::Spacing();
             ImGui::TextColored(k.muted, "Runtime health checks for all Amalgam systems.");
             ImGui::Spacing();
-            if (ghost_button("Run Diagnostics", ImVec2(ui_px(200.0f), ui_px(30.0f)))) {
-                st.ui_diagnostics_results = aml::diagnostics::run_all();
+            const bool diagnostics_fixture = st.fixture_mode;
+            if (diagnostics_fixture) ImGui::BeginDisabled();
+            const bool run_diagnostics = ghost_button("Run Diagnostics", ImVec2(ui_px(200.0f), ui_px(30.0f)));
+            if (diagnostics_fixture) ImGui::EndDisabled();
+            if (run_diagnostics && !diagnostics_fixture) {
+                // These are in-process state reads only. Diagnostics receives
+                // the current configuration/session facts and never turns this
+                // button into a synchronous provider or backend network probe.
+                bool backend_initialized = false;
+                bool backend_authenticated = false;
+                if (aml::diagnostics::local_state::has_complete_backend_config(c) &&
+                    aml::diagnostics::local_state::is_https_endpoint(c.supabase_url)) {
+                    auto& supabase = aml::supabase::SupabaseManager::instance();
+                    backend_initialized = supabase.is_initialized();
+                    backend_authenticated =
+                        backend_initialized && supabase.is_authenticated();
+                }
+                st.ui_diagnostics_results = aml::diagnostics::run_all(
+                    c, backend_initialized, backend_authenticated);
                 st.ui_diagnostics_ran = true;
             }
             ImGui::Spacing();
@@ -8069,8 +9763,11 @@ void draw_settings_tab(UiState& st) {
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                // Per-check rows
-                ImGui::BeginChild("##diag_checks", ImVec2(-1, ui_px(340.0f)), true);
+                // Keep this modest result set on the page's primary scroll
+                // surface. A fixed nested panel hid lower checks behind a
+                // second scrollbar at compact sizes and made diagnostics feel
+                // more like a log than a recoverable settings report.
+                card_begin("##diag_checks", ImVec2(-1, 0));
                 for (const auto& r : st.ui_diagnostics_results) {
                     ImVec4 color = k.green;
                     const char* icon = "OK";
@@ -8081,12 +9778,14 @@ void draw_settings_tab(UiState& st) {
                     ImGui::Text("%s / %s", r.system.c_str(), r.check.c_str());
                     if (!r.detail.empty()) {
                         ImGui::Indent(ui_px(24.0f));
-                        ImGui::TextColored(k.muted, "%s", r.detail.c_str());
+                        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+                        ImGui::TextWrapped("%s", r.detail.c_str());
+                        ImGui::PopStyleColor();
                         ImGui::Unindent(ui_px(24.0f));
                     }
                     ImGui::Spacing();
                 }
-                ImGui::EndChild();
+                card_end();
             } else if (!st.ui_diagnostics_ran) {
                 ImGui::TextColored(k.muted, "Click Run Diagnostics to check all systems.");
             }
@@ -8163,7 +9862,8 @@ void draw_settings_tab(UiState& st) {
         ImGui::Spacing();
 
         float link_w = ui_px(120.0f);
-        if (ghost_button("Website", ImVec2(link_w, ui_px(28.0f)))) {
+        if (ghost_button("Website", ImVec2(link_w, ui_px(28.0f)), st.fixture_mode) &&
+            !st.fixture_mode) {
             // The public site is configuration, so a packaged build cannot send
             // players to a stale or unregistered domain.
             ShellExecuteW(st.hwnd, L"open",
@@ -8171,18 +9871,22 @@ void draw_settings_tab(UiState& st) {
                           nullptr, nullptr, SW_SHOWNORMAL);
         }
         ImGui::SameLine(0, ui_px(8.0f));
-        if (ghost_button("Known Issues", ImVec2(link_w, ui_px(28.0f))))
+        if (ghost_button("Known Issues", ImVec2(link_w, ui_px(28.0f)), st.fixture_mode) &&
+            !st.fixture_mode)
             st.known_issues_open = true;
         ImGui::SameLine(0, ui_px(8.0f));
-        if (ghost_button("Report a Bug", ImVec2(link_w, ui_px(28.0f))))
+        if (ghost_button("Report a Bug", ImVec2(link_w, ui_px(28.0f)), st.fixture_mode) &&
+            !st.fixture_mode)
             st.feedback_open = true;
         ImGui::SameLine(0, ui_px(8.0f));
-        if (ghost_button("Discord", ImVec2(link_w, ui_px(28.0f)))) {
+        if (ghost_button("Discord", ImVec2(link_w, ui_px(28.0f)), st.fixture_mode) &&
+            !st.fixture_mode) {
             ShellExecuteW(st.hwnd, L"open", L"https://discord.gg/amalgam",
                           nullptr, nullptr, SW_SHOWNORMAL);
         }
         ImGui::SameLine(0, ui_px(8.0f));
-        if (ghost_button("GitHub", ImVec2(link_w, ui_px(28.0f)))) {
+        if (ghost_button("GitHub", ImVec2(link_w, ui_px(28.0f)), st.fixture_mode) &&
+            !st.fixture_mode) {
             ShellExecuteW(st.hwnd, L"open", L"https://github.com/amalgam",
                           nullptr, nullptr, SW_SHOWNORMAL);
         }
@@ -8214,8 +9918,10 @@ void draw_settings_tab(UiState& st) {
                 ImGui::TextColored(k.muted, "Update: offline - could not reach the update server");
                 break;
             case updater::CheckState::Error:
-                ImGui::TextColored(k.red, "Update error: %s",
-                                   st.update_status.error.c_str());
+                ImGui::TextColored(k.red, "Update error");
+                ImGui::PushStyleColor(ImGuiCol_Text, k.red);
+                ImGui::TextWrapped("%s", st.update_status.error.c_str());
+                ImGui::PopStyleColor();
                 break;
         }
         ImGui::Spacing();
@@ -8224,7 +9930,8 @@ void draw_settings_tab(UiState& st) {
                                update_state == updater::CheckState::Offline ||
                                update_state == updater::CheckState::Error;
         if (checkable) {
-            if (ghost_button("Check for Updates", ImVec2(ui_px(160.0f), ui_px(28.0f)))) {
+            if (ghost_button("Check for Updates", ImVec2(ui_px(160.0f), ui_px(28.0f)),
+                             st.fixture_mode) && !st.fixture_mode) {
                 st.update_status.state = updater::CheckState::Checking;
                 spawn_worker(st, std::thread([&st]() { do_update_check(st); }));
             }
@@ -8232,7 +9939,8 @@ void draw_settings_tab(UiState& st) {
                    update_state == updater::CheckState::Mandatory) {
             if (primary_button(st.update_status.staged.load() ? "Install & Restart"
                                                               : "Download & Install",
-                               ImVec2(ui_px(180.0f), ui_px(28.0f)))) {
+                               ImVec2(ui_px(180.0f), ui_px(28.0f)), false,
+                               st.fixture_mode) && !st.fixture_mode) {
                 st.update_status.state = updater::CheckState::Checking;
                 spawn_worker(st, std::thread([&st]() { do_update_install(st); }));
             }
@@ -8243,13 +9951,18 @@ void draw_settings_tab(UiState& st) {
             ImGui::Spacing();
             ImGui::TextWrapped("%s", st.update_status.notes.c_str());
         }
+        if (st.fixture_mode)
+            ImGui::TextColored(k.brand_hov,
+                               "Visual fixture: website, support, update, and install actions are disabled.");
         card_end();
     }
 
     ImGui::Spacing();
-    if (primary_button("Save settings", ImVec2(ui_px(150.0f), ui_px(36.0f)))) save_ui_config(st);
+    if (primary_button("Save settings", ImVec2(ui_px(150.0f), ui_px(36.0f)), false,
+                       st.fixture_mode) && !st.fixture_mode)
+        save_ui_config(st);
     ImGui::SameLine();
-    if (ghost_button("Reload saved", ImVec2(ui_px(130.0f), ui_px(36.0f)))) {
+    if (!st.fixture_mode && ghost_button("Reload saved", ImVec2(ui_px(130.0f), ui_px(36.0f)))) {
         config::Config fresh;
         if (config::load(st.exe_dir + L"\\launcher.json", fresh)) {
             *st.cfg = std::move(fresh);
@@ -8262,13 +9975,15 @@ void draw_settings_tab(UiState& st) {
             load_performance_settings(*st.cfg);
             load_social_settings(*st.cfg);
             load_mod_settings(*st.cfg);
+            apply_configured_theme(*st.cfg);
             st.settings_dirty = false;
             set_settings_status(st, "Saved settings reloaded");
         } else {
             set_settings_status(st, "Could not reload launcher settings");
         }
     }
-    ImGui::EndChild();
+    if (fixture_settings_document) ImGui::EndGroup();
+    else ImGui::EndChild();
 }
 
 void draw_instances_tab(UiState& st);
@@ -8280,15 +9995,69 @@ void draw_my_games_tab(UiState& st) {
 // Profile content, counts, and storage are all filesystem-backed. Keep the
 // render thread limited to copying the last completed result; the actual
 // directory scans run on workers so a large modpack never freezes navigation.
-std::vector<instances::ContentEntry> cached_instance_content(
-    UiState& st, const instances::Instance& inst) {
+struct InstanceContentSnapshot {
+    std::vector<instances::ContentEntry> entries;
+    bool initial_scan_complete = false;
+    bool pending = false;
+    std::string error;
+};
+
+static InstanceContentSnapshot fixture_content_snapshot(const UiState& st) {
+    InstanceContentSnapshot result;
+    const std::string& c = st.fixture_case;
+    if (c == "profile-content-loading") {
+        result.pending = true;
+        return result;
+    }
+    result.initial_scan_complete = true;
+    if (c == "profile-content-error") {
+        result.error = "The profile content folder could not be read during this review fixture.";
+        return result;
+    }
+    if (c != "profile-content-ready" && c != "profile-content-filtered") return result;
+
+    const auto add = [&](const char* filename, instances::ContentType type,
+                         uint64_t size, bool managed, const char* source) {
+        instances::ContentEntry entry;
+        entry.filename = filename;
+        entry.path = net::to_wide(std::string("fixture-content\\") + filename);
+        entry.type = type;
+        entry.size = size;
+        entry.managed = managed;
+        entry.owner_project = managed ? "fixture-project" : "";
+        entry.owner_source = managed ? source : "";
+        entry.owner_version = managed ? "1.0.0" : "";
+        result.entries.push_back(std::move(entry));
+    };
+    add("sodium-fabric-0.6.0.jar", instances::ContentType::Mod, 1'284'096, true, "Modrinth");
+    add("lithium-fabric-0.15.0.jar", instances::ContentType::Mod, 734'208, true, "Modrinth");
+    add("fresh-animations.zip", instances::ContentType::ResourcePack, 2'719'744, false, "");
+    if (c == "profile-content-ready") {
+        add("complementary-shaders.zip", instances::ContentType::Shader, 5'242'880, false, "");
+        add("world-tweaks.zip", instances::ContentType::DataPack, 180'224, false, "");
+    }
+    return result;
+}
+
+InstanceContentSnapshot cached_instance_content(UiState& st,
+                                                const instances::Instance& inst) {
+    if (st.fixture_mode &&
+        (st.fixture_case == "profile-content" ||
+         st.fixture_case == "profile-content-empty" ||
+         st.fixture_case == "profile-content-ready" ||
+         st.fixture_case == "profile-content-filtered" ||
+         st.fixture_case == "profile-content-loading" ||
+         st.fixture_case == "profile-content-error" ||
+         is_profile_recovery_fixture_case(st))) {
+        return fixture_content_snapshot(st);
+    }
     const uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     constexpr uint64_t kContentTtlMs = 1000;
     bool start_scan = false;
     uint64_t generation = 0;
-    std::vector<instances::ContentEntry> cached;
+    InstanceContentSnapshot snapshot;
     {
         std::lock_guard<std::mutex> lock(st.detail_cache.mu);
         if (st.detail_cache.directory != inst.directory) {
@@ -8297,6 +10066,8 @@ std::vector<instances::ContentEntry> cached_instance_content(
             st.detail_cache.content_at_ms = 0;
             st.detail_cache.content.clear();
             st.detail_cache.content_scan_pending = false;
+            st.detail_cache.content_initial_scan_complete = false;
+            st.detail_cache.content_error.clear();
             st.detail_cache.counts_at_ms = 0;
             st.detail_cache.counts_scan_pending = false;
             st.detail_cache.storage_at_ms = 0;
@@ -8316,7 +10087,10 @@ std::vector<instances::ContentEntry> cached_instance_content(
             generation = st.detail_cache.generation;
             start_scan = true;
         }
-        cached = st.detail_cache.content;
+        snapshot.entries = st.detail_cache.content;
+        snapshot.initial_scan_complete = st.detail_cache.content_initial_scan_complete;
+        snapshot.pending = st.detail_cache.content_scan_pending;
+        snapshot.error = st.detail_cache.content_error;
     }
     if (start_scan) {
         const std::wstring directory = inst.directory;
@@ -8334,10 +10108,12 @@ std::vector<instances::ContentEntry> cached_instance_content(
                 st.detail_cache.content = std::move(content);
                 st.detail_cache.content_at_ms = completed_at;
                 st.detail_cache.content_scan_pending = false;
+                st.detail_cache.content_initial_scan_complete = true;
+                st.detail_cache.content_error = std::move(error);
             }
         }));
     }
-    return cached;
+    return snapshot;
 }
 
 struct InstanceStorageSizes {
@@ -8354,6 +10130,11 @@ struct InstanceCounts {
 };
 
 InstanceCounts cached_instance_counts(UiState& st, const instances::Instance& inst) {
+    if (is_profile_recovery_fixture_case(st)) {
+        // The recovery dialog itself is the subject of these captures; retain
+        // representative header counts without enumerating a fixture folder.
+        return {2, 3};
+    }
     const uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -8367,7 +10148,10 @@ InstanceCounts cached_instance_counts(UiState& st, const instances::Instance& in
             st.detail_cache.directory = inst.directory;
             ++st.detail_cache.generation;
             st.detail_cache.content_at_ms = 0;
+            st.detail_cache.content.clear();
             st.detail_cache.content_scan_pending = false;
+            st.detail_cache.content_initial_scan_complete = false;
+            st.detail_cache.content_error.clear();
             st.detail_cache.storage_at_ms = 0;
             st.detail_cache.storage_scan_pending = false;
             st.detail_cache.world_sizes.clear();
@@ -8444,6 +10228,9 @@ InstanceCounts cached_instance_counts(UiState& st, const instances::Instance& in
 
 InstanceStorageSizes cached_instance_storage(UiState& st,
                                              const instances::Instance& inst) {
+    if (is_profile_recovery_fixture_case(st)) {
+        return {2'682'880, 8'912'896, 1'048'576, 14'221'312, false};
+    }
     const uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -8458,6 +10245,8 @@ InstanceStorageSizes cached_instance_storage(UiState& st,
             st.detail_cache.content_at_ms = 0;
             st.detail_cache.content.clear();
             st.detail_cache.content_scan_pending = false;
+            st.detail_cache.content_initial_scan_complete = false;
+            st.detail_cache.content_error.clear();
             st.detail_cache.counts_at_ms = 0;
             st.detail_cache.counts_scan_pending = false;
             st.detail_cache.storage_at_ms = 0;
@@ -8558,6 +10347,11 @@ void invalidate_instance_detail_cache(UiState& st) {
         ++st.detail_cache.generation;
         st.detail_cache.content_at_ms = 0;
         st.detail_cache.content_scan_pending = false;
+        // Retain a usable stale list during a refresh, but make an empty or
+        // failed cache show the genuine loading state until the worker returns.
+        if (st.detail_cache.content.empty())
+            st.detail_cache.content_initial_scan_complete = false;
+        st.detail_cache.content_error.clear();
         st.detail_cache.counts_at_ms = 0;
         st.detail_cache.counts_scan_pending = false;
         st.detail_cache.storage_at_ms = 0;
@@ -8579,7 +10373,7 @@ void invalidate_instance_detail_cache(UiState& st) {
 
 void draw_instance_detail(UiState& st) {
     const instances::Instance& inst = st.selected_instance;
-    st.instance_detail_tab = std::clamp(st.instance_detail_tab, 0, 6);
+    st.instance_detail_tab = std::clamp(st.instance_detail_tab, 0, 7);
 
     // ── Breadcrumb ────────────────────────────────────────────────────────
     {
@@ -8628,8 +10422,8 @@ void draw_instance_detail(UiState& st) {
     // Count content (cached; list_content scans five content directories)
     int mod_count = 0;
     {
-        const auto all_content = cached_instance_content(st, inst);
-        for (const auto& e : all_content) {
+        const auto content_scan = cached_instance_content(st, inst);
+        for (const auto& e : content_scan.entries) {
             if (e.type == instances::ContentType::Mod) ++mod_count;
         }
     }
@@ -8693,6 +10487,12 @@ void draw_instance_detail(UiState& st) {
     ImGui::SameLine(0, ui_px(8.0f));
     if (ghost_button("...", ImVec2(dots_w, btn_h)))
         ImGui::OpenPopup("##instance_hero_more");
+    if (is_profile_actions_fixture_case(st) &&
+        profile_actions_fixture_dismissed_case() != st.fixture_case) {
+        ImGui::OpenPopup("##instance_hero_more");
+    } else if (!is_profile_actions_fixture_case(st)) {
+        profile_actions_fixture_dismissed_case().clear();
+    }
     
     // Essentials host/invite actions live on the Essentials page so the
     // compact profile hero does not overflow horizontally.
@@ -8739,7 +10539,14 @@ void draw_instance_detail(UiState& st) {
     ImGui::Spacing();
 
     // ── Tab content ───────────────────────────────────────────────────────
-    card_begin("##instancedetailcontent", ImVec2(-1, -1));
+    // The live profile workspace intentionally fills the remaining panel.
+    // Fixture captures instead let this route's detail body report its full
+    // height to ##contentmax, giving the generic @middle/@bottom harness one
+    // real page-level scroll surface rather than a clipped nested panel.
+    const ImVec2 detail_content_size = st.fixture_mode
+        ? ImVec2(-1, 0)
+        : ImVec2(-1, -1);
+    card_begin("##instancedetailcontent", detail_content_size);
 
     if (st.instance_detail_tab == 0) {
         // ─── OVERVIEW DASHBOARD ───────────────────────────────────────────
@@ -8948,14 +10755,22 @@ void draw_instance_detail(UiState& st) {
             auto bar = [&](const char* label, uint64_t sz) {
                 if (sz == 0 && stored_total == 0) return;
                 float frac = stored_total > 0 ? static_cast<float>(sz) / static_cast<float>(stored_total) : 0;
+                const std::string value = format_bytes(sz);
+                const float row_x = ImGui::GetCursorPosX();
+                const float row_width = ImGui::GetContentRegionAvail().x;
                 ImVec2 p = ImGui::GetCursorScreenPos();
-                float bar_w = ImGui::GetContentRegionAvail().x - ui_px(100.0f);
                 dl = ImGui::GetWindowDrawList();
-                dl->AddRectFilled(p, p + ImVec2(bar_w, ui_px(8.0f)), c32(k.surface), ui_px(3.0f));
-                dl->AddRectFilled(p, p + ImVec2(bar_w * frac, ui_px(8.0f)), c32(k.brand), ui_px(3.0f));
+                dl->AddRectFilled(p, p + ImVec2(row_width, ui_px(8.0f)), c32(k.surface), ui_px(3.0f));
+                dl->AddRectFilled(p, p + ImVec2(row_width * frac, ui_px(8.0f)), c32(k.brand), ui_px(3.0f));
                 ImGui::Dummy(ImVec2(0, ui_px(12.0f)));
                 ImGui::SameLine();
-                ImGui::TextColored(k.muted, "%-16s %s", label, format_bytes(sz).c_str());
+                ImGui::TextColored(k.muted, "%s", label);
+                // The value belongs at the track's right end, not floating where
+                // a 16-character label pad happened to leave it. SameLine offsets
+                // count from the window, so add the row's own inset.
+                ImGui::SameLine(row_x + row_width - ui_px(8.0f) -
+                                ImGui::CalcTextSize(value.c_str()).x);
+                ImGui::TextColored(k.muted, "%s", value.c_str());
             };
             bar("Mods", mods_sz);
             bar("Worlds", worlds_sz);
@@ -8972,27 +10787,39 @@ void draw_instance_detail(UiState& st) {
     } else if (st.instance_detail_tab == 1) {
         // ─── CONTENT ──────────────────────────────────────────────────────
         const bool narrow = ImGui::GetContentRegionAvail().x < ui_px(700.0f);
-        // Sub-tabs: All, Mods, Resource Packs, Shaders
-        static const char* content_tabs[] = {"All", "Mods", "Resource Packs", "Shaders"};
-        int content_counts[4] = {0, 0, 0, 0};
-        const auto all_content = cached_instance_content(st, inst);
+        // Keep a named type mapping instead of relying on enum ordinal math.
+        // The content scanner supports Data Packs too; excluding it here made
+        // an "All 5" fixture appear to contain only four reachable items.
+        struct ContentFilterTab {
+            const char* label;
+            instances::ContentType type;
+        };
+        static const ContentFilterTab content_tabs[] = {
+            {"Mods", instances::ContentType::Mod},
+            {"Resource Packs", instances::ContentType::ResourcePack},
+            {"Shaders", instances::ContentType::Shader},
+            {"Data Packs", instances::ContentType::DataPack},
+        };
+        constexpr int content_tab_count = static_cast<int>(sizeof(content_tabs) / sizeof(content_tabs[0]));
+        int content_counts[1 + content_tab_count] = {};
+        if (st.content_filter < 0 || st.content_filter > content_tab_count) st.content_filter = 0;
+        const auto content_scan = cached_instance_content(st, inst);
+        const auto& all_content = content_scan.entries;
+        // The empty-state card owns the single next step when nothing has
+        // been installed yet. Keeping the toolbar action in that one state
+        // creates two identical Browse paths without adding useful choice.
+        const bool completed_empty_inventory = content_scan.initial_scan_complete &&
+            content_scan.error.empty() && all_content.empty();
         for (const auto& e : all_content) {
             content_counts[0]++;
-            if (e.type == instances::ContentType::Mod) content_counts[1]++;
-            else if (e.type == instances::ContentType::ResourcePack) content_counts[2]++;
-            else if (e.type == instances::ContentType::Shader) content_counts[3]++;
+            for (int tab = 0; tab < content_tab_count; ++tab) {
+                if (e.type == content_tabs[tab].type) {
+                    content_counts[tab + 1]++;
+                    break;
+                }
+            }
         }
-        for (int i = 0; i < 4; ++i) {
-            if (i > 0) ImGui::SameLine(0, ui_px(4.0f));
-            std::string lbl = std::string(content_tabs[i]) + " " + std::to_string(content_counts[i]);
-            bool active = st.content_filter == i;
-            if (active) ImGui::PushStyleColor(ImGuiCol_Button, k.brand);
-            else        ImGui::PushStyleColor(ImGuiCol_Button, k.surface);
-            if (ImGui::Button(lbl.c_str())) st.content_filter = i;
-            ImGui::PopStyleColor();
-        }
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(140.0f));
-        if (primary_button("+ Add Content", ImVec2(ui_px(140.0f), ui_px(32.0f)))) {
+        const auto open_content_browser = [&]() {
             st.active_instance_dir = inst.directory;
             st.mod_loader = inst.loader == "auto" ? "" : inst.loader;
             st.mod_version = inst.minecraft_version;
@@ -9001,11 +10828,28 @@ void draw_instance_detail(UiState& st) {
             st.active_tab = 1;
             st.sidebar_item = 2;
             st.browse_category = 0;
+        };
+        for (int i = 0; i <= content_tab_count; ++i) {
+            if (i > 0) ImGui::SameLine(0, ui_px(4.0f));
+            const char* tab_label = i == 0 ? "All" : content_tabs[i - 1].label;
+            std::string lbl = std::string(tab_label) + " " + std::to_string(content_counts[i]);
+            bool active = st.content_filter == i;
+            if (active) ImGui::PushStyleColor(ImGuiCol_Button, k.brand);
+            else        ImGui::PushStyleColor(ImGuiCol_Button, k.surface);
+            if (ImGui::Button(lbl.c_str())) st.content_filter = i;
+            ImGui::PopStyleColor();
+        }
+        if (!completed_empty_inventory) {
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(140.0f));
+            if (primary_button("+ Add Content", ImVec2(ui_px(140.0f), ui_px(32.0f)))) {
+                open_content_browser();
+            }
         }
         ImGui::Spacing();
         // Search + filter
         ImGui::SetNextItemWidth(narrow ? -1.0f : ui_px(250.0f));
-        input_text("Search installed content", &st.content_search);
+        input_text_hint("##content_search", "Search installed content by filename...",
+                        &st.content_search);
         if (!narrow) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(ui_px(120.0f));
@@ -9027,7 +10871,8 @@ void draw_instance_detail(UiState& st) {
             std::string path;
             if (show_open_content(st, path)) {
                 instances::ContentType type = instances::ContentType::Mod;
-                if (st.content_filter > 0) type = static_cast<instances::ContentType>(st.content_filter - 1);
+                if (st.content_filter > 0 && st.content_filter <= content_tab_count)
+                    type = content_tabs[st.content_filter - 1].type;
                 instances::ContentEntry imported;
                 std::string error;
                 if (instances::import_content(inst, net::to_wide(path), type, &imported, &error)) {
@@ -9081,53 +10926,207 @@ void draw_instance_detail(UiState& st) {
         }
 
         ImGui::Spacing();
-        // Content list
-        int files = 0;
+        // Build the exact visible set before rendering. The empty-state model
+        // must use the same predicate as the rows or a retained filter could
+        // claim there are no matches while a row is still drawn.
+        std::vector<const instances::ContentEntry*> visible_content;
+        visible_content.reserve(all_content.size());
+        const ContentFilterTab* type_filter =
+            st.content_filter > 0 && st.content_filter <= content_tab_count
+                ? &content_tabs[st.content_filter - 1]
+                : nullptr;
         for (const auto& entry : all_content) {
-            int type_filter = st.content_filter - 1;
-            if (type_filter >= 0 && static_cast<int>(entry.type) != type_filter) continue;
+            if (type_filter && entry.type != type_filter->type) continue;
             if (!st.content_search.empty() && entry.filename.find(st.content_search) == std::string::npos) continue;
-            ++files;
-            const bool compact = narrow;
-            card_begin((std::string("##ci") + std::to_string(files)).c_str(),
-                       ImVec2(-1, compact ? ui_px(80.0f) : ui_px(52.0f)));
-            ImGui::PushFont(f_bold);
-            ImGui::TextUnformatted(entry.filename.c_str());
-            ImGui::PopFont();
-            if (!compact) {
-                ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(330));
-                ImGui::TextColored(k.muted, "%s  %.1f KB  %s", instances::content_type_name(entry.type),
-                                   entry.size / 1024.0, entry.enabled ? "Enabled" : "Disabled");
-                ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(160));
-                ImGui::TextColored(entry.managed ? k.green : k.muted, "%s",
-                                   entry.managed ? (entry.owner_source.empty() ? "Managed" : entry.owner_source.c_str()) : "Local");
-            } else {
-                ImGui::TextColored(k.muted, "%s  %.1f KB  %s  %s", instances::content_type_name(entry.type),
-                                   entry.size / 1024.0, entry.enabled ? "Enabled" : "Disabled",
-                                   entry.managed ? "Managed" : "Local");
-            }
-            if (ghost_button(entry.enabled ? "Disable" : "Enable", ImVec2(ui_px(76.0f), ui_px(26.0f)))) {
-                std::string err;
-                if (!instances::set_content_enabled(entry, !entry.enabled, &err)) st.content_status = err;
-                else {
-                    mark_profile_modified(st, st.selected_instance);
-                    invalidate_instance_detail_cache(st);
-                }
-            }
-            ImGui::SameLine();
-            if (ghost_button("Remove", ImVec2(ui_px(72.0f), ui_px(26.0f)))) {
-                std::wstring rp; std::string err;
-                if (!instances::move_content_to_trash(inst, entry, &rp, &err)) st.content_status = err;
-                else {
-                    mark_profile_modified(st, st.selected_instance);
-                    st.content_status = "Removed to recovery";
-                    invalidate_instance_detail_cache(st);
-                }
-            }
-            card_end();
+            visible_content.push_back(&entry);
         }
-        if (files == 0) {
-            ImGui::TextColored(k.muted, "No content matches your filters.");
+        const auto presentation = ui_model::profile_content_presentation(
+            content_scan.initial_scan_complete, content_scan.error,
+            all_content.size(), visible_content.size());
+        // The generic filtered-result state remains centered. Its decorative
+        // icon is intentionally omitted when the compact profile shell leaves
+        // too little vertical room for it.
+        const char* empty_state_icon = ImGui::GetContentRegionAvail().y < ui_px(260.0f)
+            ? nullptr : "+";
+
+        // The normal shared empty-state layout is intentionally spacious, but
+        // after the profile header and content toolbar it can put an important
+        // action below the compact viewport. These three states need one
+        // compact, action-first presentation instead: the call to action is
+        // always in the first visible row and the explanatory copy remains a
+        // single readable line rather than pushing it below the fold.
+        const auto compact_content_status =
+            [&](const char* title, const char* detail, const char* action_label,
+                const ImVec4& accent, bool show_activity) {
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                if (available.x <= ui_px(1.0f)) return false;
+
+                // Visual fixtures deliberately use an auto-height detail card
+                // so @middle/@bottom can exercise its real scroll surface.
+                // Before this state draws, that card reports zero remaining
+                // vertical pixels even though it is valid to add content. The
+                // compact status panel must therefore establish its own height
+                // from the current cursor instead of treating that pre-layout
+                // value as a hidden or unavailable region.
+                const float panel_height = action_label ? ui_px(62.0f) : ui_px(54.0f);
+                const float panel_width = std::min(ui_px(560.0f),
+                    std::max(ui_px(1.0f), available.x - ui_px(4.0f)));
+                const ImVec2 origin = ImGui::GetCursorPos() + ImVec2(
+                    std::max(0.0f, (available.x - panel_width) * 0.5f), 0.0f);
+                const ImVec2 panel_pos = ImGui::GetCursorScreenPos() +
+                    (origin - ImGui::GetCursorPos());
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec4 fill(accent.x, accent.y, accent.z, 0.075f);
+                const ImVec4 border(accent.x, accent.y, accent.z, 0.38f);
+                const float rounding = ui_px(9.0f);
+                dl->AddRectFilled(panel_pos, panel_pos + ImVec2(panel_width, panel_height),
+                                  c32(fill), rounding);
+                dl->AddRect(panel_pos, panel_pos + ImVec2(panel_width, panel_height),
+                            c32(border), rounding, 0, ui_px(1.0f));
+                dl->AddRectFilled(panel_pos,
+                                  panel_pos + ImVec2(ui_px(3.0f), panel_height),
+                                  c32(accent), ui_px(2.0f));
+
+                const float pad = ui_px(8.0f);
+                const float mark_size = ui_px(18.0f);
+                const float gap = ui_px(8.0f);
+                const float action_width = action_label
+                    ? std::max(ui_px(116.0f), ImGui::CalcTextSize(action_label).x + ui_px(30.0f))
+                    : 0.0f;
+                const float title_width = std::max(ui_px(1.0f), panel_width -
+                    (2.0f * pad) - mark_size - gap -
+                    (action_label ? action_width + gap : 0.0f));
+
+                ImGui::SetCursorPos(origin + ImVec2(pad, pad));
+                if (show_activity && motion_enabled()) {
+                    draw_loading_spinner(mark_size);
+                } else {
+                    const ImVec2 mark_center = ImGui::GetCursorScreenPos() +
+                        ImVec2(mark_size * 0.5f, mark_size * 0.5f);
+                    const ImVec4 halo(accent.x, accent.y, accent.z, 0.26f);
+                    dl->AddCircle(mark_center, ui_px(7.0f), c32(halo), 16, ui_px(1.0f));
+                    dl->AddCircleFilled(mark_center, ui_px(4.0f), c32(accent), 16);
+                    ImGui::Dummy(ImVec2(mark_size, mark_size));
+                }
+
+                ImGui::SameLine(0.0f, gap);
+                ImGui::PushFont(f_bold);
+                ImGui::TextColored(k.text, "%s", elide_to_width(title, title_width).c_str());
+                ImGui::PopFont();
+
+                bool action_pressed = false;
+                if (action_label) {
+                    ImGui::SameLine(origin.x + panel_width - pad - action_width);
+                    action_pressed = primary_button(action_label,
+                                                    ImVec2(action_width, ui_px(30.0f)));
+                }
+
+                ImGui::SetCursorPosX(origin.x + pad + mark_size + gap);
+                ImGui::PushFont(f_small);
+                const float detail_width = std::max(ui_px(1.0f),
+                    panel_width - (2.0f * pad) - mark_size - gap);
+                ImGui::TextColored(k.muted, "%s",
+                                   elide_to_width(detail, detail_width).c_str());
+                ImGui::PopFont();
+                // Do not finish with a naked SetCursorPosY(): Dear ImGui
+                // correctly warns that it cannot grow an auto-height parent
+                // from a cursor move alone. A zero-width layout item claims
+                // only the panel's remaining height and keeps both fixture
+                // cards and live fixed-height cards in normal layout flow.
+                const float remaining_panel_height = std::max(0.0f,
+                    origin.y + panel_height - ImGui::GetCursorPosY());
+                if (remaining_panel_height > 0.0f)
+                    ImGui::Dummy(ImVec2(0.0f, remaining_panel_height));
+                return action_pressed;
+            };
+
+        if (content_scan.pending && content_scan.initial_scan_complete) {
+            ImGui::TextColored(k.muted, "Refreshing installed content...");
+            ImGui::Spacing();
+        }
+        if (!content_scan.error.empty() &&
+            presentation != ui_model::ProfileContentPresentation::Error) {
+            ImGui::TextColored(k.yellow, "Some content could not be read: %s",
+                               content_scan.error.c_str());
+            ImGui::Spacing();
+        }
+
+        if (presentation == ui_model::ProfileContentPresentation::Loading) {
+            compact_content_status("Scanning installed content",
+                                   "Checking mods, packs, shaders, and data packs.",
+                                   nullptr, k.brand, true);
+        } else if (presentation == ui_model::ProfileContentPresentation::Error) {
+            if (compact_content_status("Couldn't scan installed content",
+                                       "Try again, or check that the profile folder is available.",
+                                       "Retry scan", k.red, false)) {
+                invalidate_instance_detail_cache(st);
+            }
+        } else if (presentation == ui_model::ProfileContentPresentation::EmptyInventory) {
+            if (compact_content_status("No installed content yet",
+                                       "Browse Discover or upload a local file to add something here.",
+                                       "Browse Content", k.brand, false)) {
+                open_content_browser();
+            }
+        } else if (presentation == ui_model::ProfileContentPresentation::EmptyFiltered) {
+            if (empty_state("No installed content matches these filters",
+                            "Try another search or content type, or clear the current filters.",
+                            empty_state_icon, "Clear filters")) {
+                st.content_filter = 0;
+                st.content_search.clear();
+            }
+        } else {
+            // Content list
+            int files = 0;
+            for (const auto* visible_entry : visible_content) {
+                const auto& entry = *visible_entry;
+                ++files;
+                const bool compact = narrow;
+                const char* source = entry.managed
+                    ? (entry.owner_source.empty() ? "Managed" : entry.owner_source.c_str())
+                    : "Local";
+                char meta[192];
+                std::snprintf(meta, sizeof(meta), "%s  %.1f KB  %s",
+                              instances::content_type_name(entry.type), entry.size / 1024.0,
+                              entry.enabled ? "Enabled" : "Disabled");
+                card_begin((std::string("##ci") + std::to_string(files)).c_str(),
+                           ImVec2(-1, compact ? ui_px(80.0f) : ui_px(52.0f)));
+                const float row_width = ImGui::GetContentRegionAvail().x;
+                const auto columns = ui_model::list_row_columns(
+                    row_width, ImGui::CalcTextSize(source).x, ImGui::CalcTextSize(meta).x,
+                    ui_px(4.0f), ui_px(20.0f));
+                ImGui::PushFont(f_bold);
+                ImGui::TextUnformatted(elide_to_width(entry.filename, columns.name_width).c_str());
+                ImGui::PopFont();
+                if (!compact) {
+                    ImGui::SameLine(row_width - columns.middle_reserve);
+                    ImGui::TextColored(k.muted, "%s", meta);
+                    ImGui::SameLine(row_width - columns.trailing_reserve);
+                    ImGui::TextColored(entry.managed ? k.green : k.muted, "%s", source);
+                } else {
+                    ImGui::TextColored(k.muted, "%s  %.1f KB  %s  %s", instances::content_type_name(entry.type),
+                                       entry.size / 1024.0, entry.enabled ? "Enabled" : "Disabled",
+                                       entry.managed ? "Managed" : "Local");
+                }
+                if (ghost_button(entry.enabled ? "Disable" : "Enable", ImVec2(ui_px(76.0f), ui_px(26.0f)))) {
+                    std::string err;
+                    if (!instances::set_content_enabled(entry, !entry.enabled, &err)) st.content_status = err;
+                    else {
+                        mark_profile_modified(st, st.selected_instance);
+                        invalidate_instance_detail_cache(st);
+                    }
+                }
+                ImGui::SameLine();
+                if (ghost_button("Remove", ImVec2(ui_px(72.0f), ui_px(26.0f)))) {
+                    std::wstring rp; std::string err;
+                    if (!instances::move_content_to_trash(inst, entry, &rp, &err)) st.content_status = err;
+                    else {
+                        mark_profile_modified(st, st.selected_instance);
+                        st.content_status = "Removed to recovery";
+                        invalidate_instance_detail_cache(st);
+                    }
+                }
+                card_end();
+            }
         }
         if (!st.content_status.empty()) ImGui::TextColored(k.yellow, "%s", st.content_status.c_str());
 
@@ -9155,25 +11154,30 @@ void draw_instance_detail(UiState& st) {
                 card_begin((std::string("##w") + std::to_string(count)).c_str(),
                            ImVec2(-1, compact ? ui_px(90.0f) : ui_px(56.0f)));
                 const std::filesystem::path icon = w / L"icon.png";
+                // Measured before the icon, which leaves the cursor mid-line.
+                const float row_width = ImGui::GetContentRegionAvail().x;
                 if (std::filesystem::exists(icon, ec) && !ec) {
                     draw_local_image(st, icon.wstring(), ImGui::GetCursorScreenPos(),
                                      ImVec2(ui_px(38.0f), ui_px(38.0f)), c32(k.brand_dk));
                     ImGui::Dummy(ImVec2(ui_px(42.0f), 0));
                     ImGui::SameLine(0, ui_px(4.0f));
                 }
-                ImGui::PushFont(f_bold);
-                ImGui::TextUnformatted(name.c_str());
-                ImGui::PopFont();
                 // World sizes are produced by the same background profile
                 // scan as the storage card; never recurse through a world
                 // while the overview is drawing.
+                const uint64_t wsz = cached_world_size(st, w.wstring());
+                const std::string size_text = wsz == 0 ? "Calculating..." : format_bytes(wsz);
+                const auto columns = ui_model::list_row_columns(
+                    row_width, ui_px(236.0f), ImGui::CalcTextSize(size_text.c_str()).x,
+                    ui_px(4.0f), ui_px(20.0f));
+                ImGui::PushFont(f_bold);
+                ImGui::TextUnformatted(elide_to_width(name, columns.name_width).c_str());
+                ImGui::PopFont();
                 if (!compact) {
-                    const uint64_t wsz = cached_world_size(st, w.wstring());
-                    ImGui::SameLine();
-                    ImGui::TextColored(k.muted, "  %s",
-                                       wsz == 0 ? "Calculating..." : format_bytes(wsz).c_str());
+                    ImGui::SameLine(row_width - columns.middle_reserve);
+                    ImGui::TextColored(k.muted, "%s", size_text.c_str());
                 }
-                if (!compact) ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(240));
+                if (!compact) ImGui::SameLine(row_width - columns.trailing_reserve);
                 if (ghost_button("Open", ImVec2(ui_px(64.0f), ui_px(26.0f))))
                     ShellExecuteW(st.hwnd, L"open", w.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                 ImGui::SameLine();
@@ -9283,7 +11287,7 @@ void draw_instance_detail(UiState& st) {
         if (ghost_button("Change Version", ImVec2(ui_px(150.0f), ui_px(30.0f)))) {
             st.version_change_kind = 1;
             st.version_change_backup = true;
-            request_popup("Change Version##version_change_modal");
+            st.version_change_backup_error.clear();
         }
         card_end();
         ImGui::Spacing();
@@ -9303,7 +11307,7 @@ void draw_instance_detail(UiState& st) {
         if (ghost_button("Change Loader", ImVec2(ui_px(150.0f), ui_px(30.0f)))) {
             st.version_change_kind = 2;
             st.version_change_backup = true;
-            request_popup("Change Version##version_change_modal");
+            st.version_change_backup_error.clear();
         }
         card_end();
         ImGui::Spacing();
@@ -9315,7 +11319,12 @@ void draw_instance_detail(UiState& st) {
         if (inst.memory_mb == 0) ImGui::TextColored(k.muted, "Using performance profile recommendation");
         card_end();
 
-        // Backup-before-change safeguard
+        // Backup-before-change safeguard. This is intentionally opened from
+        // the same instance-detail child that owns the modal. The generic
+        // shell-level popup drain uses a different ImGui ID scope and cannot
+        // open a nested detail modal reliably.
+        if (st.version_change_kind != 0)
+            ImGui::OpenPopup("Change Version##version_change_modal");
         set_next_adaptive_window(440.0f, 0.0f, 340.0f, 0.0f);
         bool version_change_open = true;
         if (ImGui::BeginPopupModal("Change Version##version_change_modal", &version_change_open,
@@ -9329,44 +11338,75 @@ void draw_instance_detail(UiState& st) {
                                    ? "This will rebuild your profile against a new game version. Some mods and worlds may be incompatible until updated."
                                    : "Switching mod loaders changes how your mods are loaded. Installed mods built for the current loader will not work until re-installed.");
             ImGui::Spacing();
-            ImGui::Checkbox("Create a restore point first", &st.version_change_backup);
+            const bool fixture_preview = st.fixture_mode;
+            if (fixture_preview) ImGui::BeginDisabled();
+            if (ImGui::Checkbox("Create a restore point first", &st.version_change_backup))
+                st.version_change_backup_error.clear();
+            if (fixture_preview) ImGui::EndDisabled();
             ImGui::TextColored(k.muted,
                                st.version_change_backup
                                    ? "Your current profile configuration and mods are saved so you can restore them later."
                                    : "Your profile will be changed without a backup. Restore points cannot recover this change.");
+            if (!st.version_change_backup_error.empty()) {
+                ImGui::Spacing();
+                ImGui::TextColored(k.red, "Restore point was not created");
+                ImGui::TextWrapped("%s", st.version_change_backup_error.c_str());
+                ImGui::TextColored(k.muted,
+                                   "The profile change is paused. Retry, or turn off the restore point option only if you accept the risk.");
+            }
             ImGui::Spacing();
+            if (fixture_preview) {
+                ImGui::Spacing();
+                ImGui::TextColored(k.brand,
+                                   "Visual QA fixture — no backup is created and no profile change is started.");
+            }
             bool confirmed = false;
-            if (primary_button("Continue", ImVec2(ui_px(140.0f), ui_px(32.0f)))) confirmed = true;
+            if (primary_button("Continue", ImVec2(ui_px(140.0f), ui_px(32.0f)), false,
+                               fixture_preview)) confirmed = true;
             ImGui::SameLine();
-            if (ghost_button("Cancel", ImVec2(ui_px(110.0f), ui_px(32.0f)))) {
+            if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                             ImVec2(ui_px(fixture_preview ? 118.0f : 110.0f), ui_px(32.0f)))) {
                 st.version_change_kind = 0;
+                st.version_change_backup_error.clear();
                 ImGui::CloseCurrentPopup();
             }
-            if (confirmed) {
+            if (confirmed && !fixture_preview) {
+                bool may_continue = true;
                 if (st.version_change_backup) {
                     std::string backup_error;
                     std::wstring backup_path;
                     if (!instances::create_restore_point(inst, &backup_path, &backup_error)) {
+                        may_continue = false;
+                        st.version_change_backup_error = backup_error.empty()
+                            ? "Amalgam could not create a restore point. Your profile has not been changed."
+                            : backup_error;
                         push_notice(st, ui_model::NoticeLevel::Error, "Backup failed",
-                                    backup_error.empty() ? "Could not create a restore point." : backup_error);
+                                    st.version_change_backup_error);
                     } else {
+                        st.version_change_backup_error.clear();
                         push_notice(st, ui_model::NoticeLevel::Success, "Restore point created",
                                     "Your profile was backed up before the change.");
                     }
                 }
-                st.version_change_kind = 0;
-                open_profile_wizard(st, 0, inst.name.empty() ? inst.id : inst.name);
-                st.wizard_version = inst.minecraft_version;
-                st.wizard_loader = inst.loader == "auto" ? "fabric" : inst.loader;
-                st.wizard_memory = inst.memory_mb;
-                st.wizard_performance_profile = inst.performance_profile;
-                st.sidebar_item = 3;
-                st.active_tab = 6;
-                ImGui::CloseCurrentPopup();
+                if (may_continue) {
+                    st.version_change_kind = 0;
+                    st.version_change_backup_error.clear();
+                    open_profile_wizard(st, 0, inst.name.empty() ? inst.id : inst.name);
+                    st.wizard_version = inst.minecraft_version;
+                    st.wizard_loader = inst.loader == "auto" ? "fabric" : inst.loader;
+                    st.wizard_memory = inst.memory_mb;
+                    st.wizard_performance_profile = inst.performance_profile;
+                    st.sidebar_item = 3;
+                    st.active_tab = 6;
+                    ImGui::CloseCurrentPopup();
+                }
             }
             ImGui::EndPopup();
         }
-        if (!version_change_open) st.version_change_kind = 0;
+        if (!version_change_open) {
+            st.version_change_kind = 0;
+            st.version_change_backup_error.clear();
+        }
 
     } else if (st.instance_detail_tab == 5) {
         // ─── LOGS ─────────────────────────────────────────────────────────
@@ -9510,9 +11550,7 @@ void draw_instance_detail(UiState& st) {
             }
         }
         if (ghost_button("Restore options", ImVec2(ui_px(140.0f), ui_px(28.0f)))) {
-            std::string err;
-            if (performance::restore_game_options(inst.directory, &err)) st.content_status = "Options restored";
-            else st.content_status = err;
+            request_profile_data_confirmation(st, ProfileDataAction::RestoreGameOptions, inst);
         }
         card_end();
         ImGui::Spacing();
@@ -9557,22 +11595,12 @@ void draw_instance_detail(UiState& st) {
         }
         ImGui::SameLine();
         if (ghost_button("Restore Latest", ImVec2(ui_px(130.0f), ui_px(28.0f)))) {
-            std::string err;
-            if (instances::restore_latest(inst, &err)) {
-                st.content_status = "Restored";
-                st.instances_loaded = false;
-            } else st.content_status = err;
+            request_profile_data_confirmation(st, ProfileDataAction::RestoreLatest, inst);
         }
         if (st.cfg->advanced_mode) {
             ImGui::Spacing();
             if (ghost_button("Move to Recovery", ImVec2(ui_px(160.0f), ui_px(28.0f)))) {
-                std::string err;
-                if (instances::remove(inst, &err)) {
-                    push_notice(st, ui_model::NoticeLevel::Success, "Moved to recovery",
-                                "Profile removed from active library.", "Open Library", "library");
-                    st.instance_detail_open = false;
-                    st.instances_loaded = false;
-                } else log_line(st, L"[instances] recovery failed: " + net::to_wide(err));
+                request_profile_data_confirmation(st, ProfileDataAction::MoveToRecovery, inst);
             }
         }
         card_end();
@@ -9606,8 +11634,16 @@ void draw_instance_detail(UiState& st) {
         else
             ImGui::TextWrapped("Pack-managed content will be replaced. Worlds, screenshots, and logs are untouched.");
         ImGui::Spacing();
+        const bool fixture_preview = st.fixture_mode;
+        if (fixture_preview) {
+            ImGui::TextColored(k.brand,
+                               "Visual QA fixture — no profile, content, or download job is changed.");
+            ImGui::Spacing();
+        }
         const char* cl = st.pack_update_confirm_copy ? "Create updated copy" : "Apply creator update";
-        if (primary_button(cl, ImVec2(ui_px(190.0f), ui_px(36.0f))) && !st.mod_installing) {
+        if (primary_button(cl, ImVec2(ui_px(190.0f), ui_px(36.0f)), st.mod_installing,
+                           fixture_preview || st.mod_installing) &&
+            !fixture_preview && !st.mod_installing) {
             const config::Config snap = *st.cfg;
             const instances::Instance ut = st.pack_update_confirm_target;
             const bool cc = st.pack_update_confirm_copy;
@@ -9616,7 +11652,8 @@ void draw_instance_detail(UiState& st) {
             spawn_worker(st, std::thread([&st, snap, ut, cc]() { do_published_pack_update(st, snap, ut, cc); }));
         }
         ImGui::SameLine();
-        if (ghost_button("Cancel", ImVec2(ui_px(110.0f), ui_px(36.0f)))) {
+        if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                         ImVec2(ui_px(fixture_preview ? 118.0f : 110.0f), ui_px(36.0f)))) {
             st.pack_update_confirm_open = false;
             ImGui::CloseCurrentPopup();
         }
@@ -9624,7 +11661,101 @@ void draw_instance_detail(UiState& st) {
     }
 }
 
+// A populated World Library needs a deterministic visual proof that does not
+// enumerate a reviewer's save folders or offer Explorer access.  Keep this
+// entirely separate from the live indexer below; the normal Library continues
+// to use its cached asynchronous scan.
+static void draw_fixture_library_worlds_populated(UiState& st) {
+    draw_page_emblem(st, "library-emblem-ai.png");
+    page_title("Library", "Your modpacks, worlds, and collections in one place.");
+    draw_breadcrumbs({"Home", "Library", "My Worlds"});
+
+    const char* tabs[] = {"My Modpacks", "My Worlds", "Collections"};
+    ImGui::BeginDisabled();
+    for (int i = 0; i < 3; ++i) {
+        if (i) ImGui::SameLine(0, ui_px(28.0f));
+        const bool active = i == 1;
+        ImGui::PushStyleColor(ImGuiCol_Text, active ? k.text : k.muted);
+        ImGui::PushFont(active ? f_h2 : f_body);
+        ImGui::Selectable(tabs[i], active, ImGuiSelectableFlags_None,
+                          ImVec2(ImGui::CalcTextSize(tabs[i]).x + ui_px(18.0f), ui_px(38.0f)));
+        ImGui::PopFont();
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndDisabled();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    card_begin("##fixture_library_world_gallery", ImVec2(-1, 0));
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("My Worlds");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted,
+                       "3 representative worlds across managed profiles — sample paths are never inspected.");
+    ImGui::TextColored(k.brand_hov,
+                       "LOCAL VISUAL FIXTURE — Open and Profile actions are disabled.");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    struct FixtureWorld {
+        const char* name;
+        const char* profile;
+        const char* target;
+        ImVec4 accent;
+    };
+    const FixtureWorld worlds[] = {
+        {"Aurora Valley", "Aurora Frontier", "Fabric 1.21.1", k.brand},
+        {"Skyline Workshop", "Creative Workshop", "NeoForge 1.21.1", k.blue},
+        {"Redwood Realm", "Weekend Survival", "Forge 1.20.1", k.green},
+    };
+    const float gap = ui_px(12.0f);
+    const float available = std::max(0.0f, ImGui::GetContentRegionAvail().x - ui_px(6.0f));
+    const int columns = available >= ui_px(650.0f) ? 3 : available >= ui_px(420.0f) ? 2 : 1;
+    const float card_width = std::max(ui_px(190.0f),
+        (available - gap * static_cast<float>(columns - 1)) / static_cast<float>(columns));
+    // The fixture cards deliberately keep all actions inside the first frame at
+    // the compact evidence tier.  A child scrollbar here obscures the action
+    // row and makes the static preview look like a broken live library card.
+    const float card_height = ui_px(154.0f);
+    for (size_t index = 0; index < sizeof(worlds) / sizeof(worlds[0]); ++index) {
+        const FixtureWorld& world = worlds[index];
+        if (index % static_cast<size_t>(columns)) ImGui::SameLine(0, gap);
+        ImGui::PushID(static_cast<int>(index));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, k.surface2);
+        ImGui::PushStyleColor(ImGuiCol_Border, k.border);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_px(9.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, ui_px(1.0f));
+        ImGui::BeginChild("##fixture_world_card", ImVec2(card_width, card_height), ImGuiChildFlags_Borders);
+        const ImVec2 art_origin = ImGui::GetCursorScreenPos();
+        const ImVec2 art_size(card_width - ui_px(2.0f), ui_px(40.0f));
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(art_origin, art_origin + art_size,
+                            c32(ImVec4(world.accent.x, world.accent.y, world.accent.z, 0.22f)),
+                            ui_px(8.0f), ImDrawFlags_RoundCornersTop);
+        draw->AddCircleFilled(art_origin + ImVec2(ui_px(26.0f), ui_px(23.0f)), ui_px(13.0f),
+                              c32(ImVec4(world.accent.x, world.accent.y, world.accent.z, 0.78f)));
+        ImGui::Dummy(art_size);
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted(world.name);
+        ImGui::PopFont();
+        ImGui::TextColored(k.muted, "%s | %s", world.profile, world.target);
+        ImGui::Spacing();
+        primary_button("Open", ImVec2(ui_px(74.0f), ui_px(28.0f)), false, true);
+        ImGui::SameLine(0, ui_px(6.0f));
+        ghost_button("Profile", ImVec2(ui_px(82.0f), ui_px(28.0f)), true);
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+        ImGui::PopID();
+    }
+    card_end();
+}
+
 void draw_instances_tab(UiState& st) {
+    if (st.fixture_mode && st.fixture_case == "library-worlds-populated") {
+        draw_fixture_library_worlds_populated(st);
+        return;
+    }
     std::wstring instances_root = (st.cfg->base_dir.empty() ? st.exe_dir : st.cfg->base_dir) +
                                   L"\\instances";
     if (!st.instances_loaded) {
@@ -10000,14 +12131,26 @@ void draw_instances_tab(UiState& st) {
         // Rename group modal
         set_next_adaptive_window(380.0f, 0.0f, 300.0f, 0.0f);
         if (ImGui::BeginPopupModal("Rename Group##rename_group_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            const bool fixture_preview = st.fixture_mode &&
+                st.fixture_case == "library-group-rename";
             ImGui::TextUnformatted(st.rename_group_target.empty() ? "Group name:" : "Rename group:");
+            if (fixture_preview) ImGui::BeginDisabled();
             input_text("##new_group_input", &st.new_group_name);
+            if (fixture_preview) ImGui::EndDisabled();
             ImGui::Spacing();
+            if (fixture_preview) {
+                ImGui::TextColored(k.brand,
+                                   "Visual QA fixture — sample group membership is not changed or saved.");
+                ImGui::Spacing();
+            }
             bool confirmed = false;
-            if (primary_button("Save", ImVec2(ui_px(120.0f), ui_px(32.0f)))) confirmed = true;
+            if (primary_button("Save", ImVec2(ui_px(120.0f), ui_px(32.0f)), false,
+                               fixture_preview)) confirmed = true;
             ImGui::SameLine();
-            if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)))) ImGui::CloseCurrentPopup();
-            if (confirmed) {
+            if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                             ImVec2(ui_px(fixture_preview ? 118.0f : 100.0f), ui_px(32.0f))))
+                ImGui::CloseCurrentPopup();
+            if (confirmed && !fixture_preview) {
                 std::string group = st.new_group_name;
                 if (!group.empty()) {
                     if (!st.rename_group_target.empty() && st.rename_group_target != group) {
@@ -10033,17 +12176,27 @@ void draw_instances_tab(UiState& st) {
         // Delete group confirmation
         set_next_adaptive_window(380.0f, 0.0f, 300.0f, 0.0f);
         if (ImGui::BeginPopupModal("Delete Group##delete_group_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            const bool fixture_preview = st.fixture_mode &&
+                st.fixture_case == "library-group-delete";
             ImGui::PushFont(f_bold);
             ImGui::TextUnformatted("Delete this group?");
             ImGui::PopFont();
             ImGui::TextColored(k.muted,
                                "Profiles stay in your library — only the group label is removed.");
             ImGui::Spacing();
+            if (fixture_preview) {
+                ImGui::TextColored(k.brand,
+                                   "Visual QA fixture — sample group labels are not changed or saved.");
+                ImGui::Spacing();
+            }
             bool confirmed = false;
-            if (primary_button("Delete group", ImVec2(ui_px(130.0f), ui_px(32.0f)))) confirmed = true;
+            if (primary_button("Delete group", ImVec2(ui_px(130.0f), ui_px(32.0f)), false,
+                               fixture_preview)) confirmed = true;
             ImGui::SameLine();
-            if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)))) ImGui::CloseCurrentPopup();
-            if (confirmed) {
+            if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                             ImVec2(ui_px(fixture_preview ? 118.0f : 100.0f), ui_px(32.0f))))
+                ImGui::CloseCurrentPopup();
+            if (confirmed && !fixture_preview) {
                 for (auto& inst : st.instance_list)
                     if (inst.group == st.delete_group_target) {
                         inst.group.clear();
@@ -10061,7 +12214,12 @@ void draw_instances_tab(UiState& st) {
         }
         return;
     }
-    ImGui::BeginChild("##packleft", ImVec2(0, 0));
+    // Keep the production library pane independently scrollable, but make the
+    // snapshot fixture one page-level document. Otherwise a @bottom fixture
+    // would only scroll an empty outer host while the grid stayed trapped here.
+    const bool fixture_library_document = st.fixture_mode;
+    if (fixture_library_document) ImGui::BeginGroup();
+    else ImGui::BeginChild("##packleft", ImVec2(0, 0));
     if (primary_button("+  Create Custom Profile", ImVec2(ui_px(190.0f), ui_px(38.0f)))) {
         open_profile_wizard(st, 0, "My Modpack");
     }
@@ -10207,7 +12365,38 @@ void draw_instances_tab(UiState& st) {
         if (ghost_button("...", ImVec2(library_more_width, ui_px(32.0f))))
             ImGui::OpenPopup(menu_id.c_str());
         draw_instance_overflow_menu(st, instance, menu_id.c_str());
-        if (ImGui::BeginPopupContextItem((std::string("##packctx") + instance.id).c_str())) {
+        const std::string context_menu_id = std::string("##packctx") + instance.id;
+        if (st.fixture_mode) {
+            // The regular card context menu includes persistence and recovery
+            // actions. Render a dedicated, disabled in-scope preview instead
+            // of allowing right-click interaction to reach production code.
+            static std::string dismissed_fixture_case;
+            const bool move_group_preview = st.fixture_case == "library-move-to-group-menu" &&
+                instance.id == "fixture-astral";
+            if (move_group_preview && dismissed_fixture_case != st.fixture_case)
+                ImGui::OpenPopup(context_menu_id.c_str());
+            if (ImGui::BeginPopup(context_menu_id.c_str())) {
+                ImGui::TextColored(k.brand,
+                                   "LOCAL VISUAL-QA FIXTURE — profile actions are disabled.");
+                ImGui::Separator();
+                ImGui::MenuItem(instance.favorite ? "Remove favorite" : "Add to favorites",
+                                nullptr, false, false);
+                ImGui::TextDisabled("Move to group  >");
+                ImGui::Indent(ui_px(12.0f));
+                ImGui::MenuItem("Weekend Builds", nullptr, instance.group == "Weekend Builds", false);
+                ImGui::MenuItem("Creative Projects", nullptr, false, false);
+                ImGui::MenuItem("New group…", nullptr, false, false);
+                ImGui::Unindent(ui_px(12.0f));
+                ImGui::Separator();
+                ImGui::MenuItem("Move to recovery…", nullptr, false, false);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Close preview")) {
+                    dismissed_fixture_case = st.fixture_case;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+        } else if (ImGui::BeginPopupContextItem(context_menu_id.c_str())) {
             if (ImGui::MenuItem(instance.favorite ? "Remove favorite" : "Add to favorites")) {
                 instance.favorite = !instance.favorite;
                 std::string error;
@@ -10232,8 +12421,8 @@ void draw_instances_tab(UiState& st) {
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Move to recovery...")) {
-                st.delete_target = instance.id;
-                request_popup("Move Modpack to Recovery##delete_modal");
+                request_profile_data_confirmation(st, ProfileDataAction::MoveToRecovery,
+                                                  instance);
             }
             ImGui::EndPopup();
         }
@@ -10247,18 +12436,31 @@ void draw_instances_tab(UiState& st) {
     }
     if (count % columns) ImGui::SameLine(0, ui_px(12.0f));
     draw_home_create_card(st, card_width, count);
-    ImGui::EndChild();
+    if (fixture_library_document) ImGui::EndGroup();
+    else ImGui::EndChild();
 
     set_next_adaptive_window(380.0f, 0.0f, 300.0f, 0.0f);
     if (ImGui::BeginPopupModal("New Group##new_group_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const bool fixture_preview = st.fixture_mode &&
+            st.fixture_case == "library-group-create-for-profile";
         ImGui::TextUnformatted("Group name:");
+        if (fixture_preview) ImGui::BeginDisabled();
         input_text("##new_group_input", &st.new_group_name);
+        if (fixture_preview) ImGui::EndDisabled();
         ImGui::Spacing();
+        if (fixture_preview) {
+            ImGui::TextColored(k.brand,
+                               "Visual QA fixture — no profile assignment or configuration write is performed.");
+            ImGui::Spacing();
+        }
         bool confirmed = false;
-         if (primary_button("Create", ImVec2(ui_px(120.0f), ui_px(32.0f)))) confirmed = true;
+        if (primary_button("Create", ImVec2(ui_px(120.0f), ui_px(32.0f)), false,
+                           fixture_preview)) confirmed = true;
         ImGui::SameLine();
-         if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)))) ImGui::CloseCurrentPopup();
-        if (confirmed) {
+        if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                         ImVec2(ui_px(fixture_preview ? 118.0f : 100.0f), ui_px(32.0f))))
+            ImGui::CloseCurrentPopup();
+        if (confirmed && !fixture_preview) {
             std::string group = st.new_group_name;
             if (!group.empty()) {
                 if (st.group_target.empty()) {
@@ -10278,37 +12480,16 @@ void draw_instances_tab(UiState& st) {
         }
         ImGui::EndPopup();
     }
-    set_next_adaptive_window(380.0f, 0.0f, 300.0f, 0.0f);
-    if (ImGui::BeginPopupModal("Move Modpack to Recovery##delete_modal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Move this modpack to recovery?");
-        ImGui::TextColored(k.muted, "The full instance folder will leave your active library and remain recoverable.");
-        ImGui::Spacing();
-        bool confirmed = false;
-        if (primary_button("Move to recovery", ImVec2(ui_px(155.0f), ui_px(32.0f)))) confirmed = true;
-        ImGui::SameLine();
-        if (ghost_button("Cancel", ImVec2(ui_px(100.0f), ui_px(32.0f)))) ImGui::CloseCurrentPopup();
-        if (confirmed) {
-            for (const auto& inst : st.instance_list) {
-                if (inst.id == st.delete_target) {
-                    std::string error;
-                    if (!instances::remove(inst, &error))
-                        log_line(st, L"[instances] recovery move failed: " + net::to_wide(error));
-                    else
-                        push_notice(st, ui_model::NoticeLevel::Success, "Profile moved to recovery",
-                                    "The full profile left your active library without being permanently deleted.",
-                                    "Open Library", "library");
-                    break;
-                }
-            }
-            st.instances_loaded = false;
-            st.delete_target.clear();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
 }
 
 void draw_screenshots_tab(UiState& st) {
+    const bool fixture_preview = st.fixture_mode;
+    const bool fixture_context_case = fixture_preview &&
+        st.fixture_case == "screenshots-context-menu";
+    // A snapshot process normally exits after one capture, but retaining this
+    // dismissal keeps an interactive reviewer from immediately reopening the
+    // fixture-only menu after choosing Close preview.
+    static std::string dismissed_fixture_context_case;
     page_title("Screenshots", "Captured screenshots from your managed Minecraft instances.");
     
     // ── Header with quick actions ─────────────────────────────────────────
@@ -10317,7 +12498,8 @@ void draw_screenshots_tab(UiState& st) {
     ImGui::TextUnformatted("Screenshot Library");
     ImGui::PopFont();
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(200.0f));
-    if (primary_button("Open Screenshots Folder", ImVec2(ui_px(180.0f), ui_px(32.0f)))) {
+    if (primary_button("Open Screenshots Folder", ImVec2(ui_px(180.0f), ui_px(32.0f)),
+                       false, fixture_preview) && !fixture_preview) {
         std::filesystem::path screenshots;
         if (!st.active_instance_dir.empty()) {
             screenshots = std::filesystem::path(st.active_instance_dir) / L"screenshots";
@@ -10441,6 +12623,12 @@ void draw_screenshots_tab(UiState& st) {
     
     // View toggle
     static bool grid_view = true;
+    if (st.fixture_mode) {
+        // The static local has process lifetime; assign a choice for every
+        // named screenshot case rather than inheriting a prior capture's
+        // grid/list preference.
+        grid_view = st.fixture_case != "screenshots-list";
+    }
     if (ghost_button(grid_view ? "Grid" : "List", ImVec2(ui_px(32.0f), ui_px(32.0f)))) {
         grid_view = !grid_view;
     }
@@ -10530,21 +12718,42 @@ void draw_screenshots_tab(UiState& st) {
                                                     ui_px(9.0f), 0, ui_px(1.5f));
             }
             
-            // Context menu
+            // Context menu.  The fixture route opens a presentation-only
+            // version from the exact card and ID stack that owns the live
+            // menu.  It returns before any shell or filesystem action can be
+            // invoked, even if someone interacts with the captured launcher.
+            const bool show_fixture_context = fixture_context_case && index == 0 &&
+                dismissed_fixture_context_case != st.fixture_case;
+            if (show_fixture_context) ImGui::OpenPopup("screenshot_ctx");
             if (ImGui::BeginPopupContextItem("screenshot_ctx")) {
-                if (ImGui::MenuItem("Open")) {
-                    ShellExecuteW(st.hwnd, L"open", file.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                }
-                if (ImGui::MenuItem("Open in Explorer")) {
-                    ShellExecuteW(st.hwnd, L"open", file.parent_path().wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                }
-                if (ImGui::MenuItem("Delete", nullptr, false, false)) {
-                    // Confirmation would go here
+                if (fixture_preview) {
+                    ImGui::TextDisabled("Visual QA preview — local sample only");
+                    ImGui::Separator();
+                    ImGui::BeginDisabled();
+                    ImGui::MenuItem("Open");
+                    ImGui::MenuItem("Open in Explorer");
+                    ImGui::MenuItem("Delete");
+                    ImGui::EndDisabled();
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Close preview")) {
+                        dismissed_fixture_context_case = st.fixture_case;
+                        ImGui::CloseCurrentPopup();
+                    }
+                } else {
+                    if (ImGui::MenuItem("Open")) {
+                        ShellExecuteW(st.hwnd, L"open", file.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    if (ImGui::MenuItem("Open in Explorer")) {
+                        ShellExecuteW(st.hwnd, L"open", file.parent_path().wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    if (ImGui::MenuItem("Delete", nullptr, false, false)) {
+                        // Confirmation would go here
+                    }
                 }
                 ImGui::EndPopup();
             }
             
-            if (ImGui::IsItemClicked()) {
+            if (!fixture_preview && ImGui::IsItemClicked()) {
                 ShellExecuteW(st.hwnd, L"open", file.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             }
 
@@ -10558,7 +12767,8 @@ void draw_screenshots_tab(UiState& st) {
             const uintmax_t bytes = std::filesystem::file_size(file, size_error);
             ImGui::TextColored(k.muted, "%s", size_error ? "Open full size" : format_bytes(bytes).c_str());
             
-            if (primary_button("Open", ImVec2(-1, ui_px(30.0f)))) {
+            if (primary_button("Open", ImVec2(-1, ui_px(30.0f)), false, fixture_preview) &&
+                !fixture_preview) {
                 ShellExecuteW(st.hwnd, L"open", file.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             }
 
@@ -10614,7 +12824,8 @@ void draw_screenshots_tab(UiState& st) {
             ImGui::SameLine();
             ImGui::BeginChild("##actions", ImVec2(ui_px(120.0f), row_height), ImGuiChildFlags_None);
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_height - ui_px(30.0f)) * 0.5f);
-            if (primary_button("Open", ImVec2(-1, ui_px(30.0f)))) {
+            if (primary_button("Open", ImVec2(-1, ui_px(30.0f)), false, fixture_preview) &&
+                !fixture_preview) {
                 ShellExecuteW(st.hwnd, L"open", file.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             }
             ImGui::EndChild();
@@ -10731,7 +12942,127 @@ static void start_managed_java_install(UiState& st, int major) {
     }));
 }
 
+// The live Java path constructs a runtime manager and can download or remove a
+// managed runtime. Fixture captures instead use this self-contained presenter;
+// no manager, downloader, configuration write, or local runtime lookup exists
+// on this branch.
+static void draw_fixture_managed_java_dialog(UiState& st) {
+    const bool install_preview = st.fixture_case == "java-managed-install-dialog";
+    const bool install_working = st.fixture_case == "java-managed-install-working";
+    const bool remove_preview = st.fixture_case == "java-managed-remove-confirm";
+    if (!install_preview && !install_working && !remove_preview) return;
+
+    static std::string dismissed_fixture_case;
+    if (!dismissed_fixture_case.empty() && dismissed_fixture_case != st.fixture_case)
+        dismissed_fixture_case.clear();
+    if (dismissed_fixture_case == st.fixture_case) return;
+
+    const char* popup_id = (install_preview || install_working)
+        ? "Install Managed Java##fixture_java_install"
+        : "Remove Managed Java##fixture_java_remove";
+    ImGui::OpenPopup(popup_id);
+    set_next_adaptive_window(460.0f, 0.0f, 340.0f, 0.0f);
+    bool open = true;
+    if (ImGui::BeginPopupModal(popup_id, &open, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted((install_preview || install_working)
+            ? (install_working ? "Installing managed Java" : "Install managed Java")
+            : "Remove managed Java");
+        ImGui::PopFont();
+        ImGui::TextColored(k.brand,
+                           "LOCAL VISUAL-QA FIXTURE — runtime discovery and changes are disabled.");
+        ImGui::Spacing();
+        if (install_preview || install_working) {
+            ImGui::TextUnformatted("Download a portable Eclipse Temurin runtime");
+            ImGui::TextColored(k.muted,
+                               "Selected sample: Java 21  •  64-bit  •  required by newer Minecraft targets.");
+            if (install_working) {
+                ImGui::Spacing();
+                ImGui::TextColored(k.yellow, "Verifying the downloaded runtime…");
+                progress_bar(0.72f, ImVec2(std::min(ui_px(390.0f), ImGui::GetContentRegionAvail().x),
+                                            ui_px(12.0f)), "72%", &k.yellow);
+                ImGui::TextColored(k.muted,
+                                   "This local fixture does not download, extract, verify, or write a runtime.");
+            } else {
+                ImGui::TextWrapped("The real installer fetches only the selected runtime. This visual preview starts no download and writes no configuration.");
+            }
+            ImGui::Spacing();
+            primary_button(install_working ? "Installing Java 21…" : "Install Java 21",
+                           ImVec2(ui_px(160.0f), ui_px(32.0f)), install_working, true);
+        } else {
+            ImGui::TextUnformatted("Remove managed Temurin Java 21?");
+            ImGui::TextColored(k.muted,
+                               "This does not affect system Java installations.");
+            ImGui::TextWrapped("The selected runtime is representative only. No runtime directory or launcher preference is removed by this fixture.");
+            ImGui::Spacing();
+            danger_button("Remove", ImVec2(ui_px(110.0f), ui_px(32.0f)), true);
+        }
+        ImGui::SameLine();
+        if (ghost_button("Close preview", ImVec2(ui_px(118.0f), ui_px(32.0f)))) {
+            dismissed_fixture_case = st.fixture_case;
+            open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (!open) dismissed_fixture_case = st.fixture_case;
+}
+
 void draw_java_tab(UiState& st) {
+    if (st.fixture_mode) {
+        draw_page_emblem(st, "java-emblem-ai.png");
+        page_title("Java Manager", "Representative runtimes and compatibility guidance");
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: runtime discovery, downloads, removal, and configuration writes are disabled.");
+        ImGui::Spacing();
+        card_begin("##fixture_java_overview", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Runtime overview");
+        ImGui::PopFont();
+        ImGui::TextColored(k.green, "2 compatible runtimes available in this representative sample");
+        ImGui::TextColored(k.muted, "Minecraft 1.20.1 works with Java 17; newer targets use Java 21.");
+        card_end();
+        ImGui::Spacing();
+        struct FixtureJava { const char* title; const char* detail; const char* state; ImVec4 color; };
+        const FixtureJava runtimes[] = {
+            {"Temurin Java 17", "64-bit  •  Managed runtime  •  Minecraft 1.18–1.20.4", "Ready", k.green},
+            {"Temurin Java 21", "64-bit  •  Managed runtime  •  Minecraft 1.20.5+", "Ready", k.green},
+        };
+        for (const auto& runtime : runtimes) {
+            card_begin((std::string("##fixture_java_") + runtime.title).c_str(), ImVec2(-1, 0));
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.text, "%s", runtime.title);
+            ImGui::PopFont();
+            ImGui::SameLine(0, ui_px(10.0f));
+            ImGui::TextColored(runtime.color, "%s", runtime.state);
+            ImGui::TextColored(k.muted, "%s", runtime.detail);
+            if (st.fixture_case == "java-runtime-actions" &&
+                std::string_view(runtime.title).find("21") != std::string_view::npos) {
+                ImGui::Spacing();
+                ImGui::TextColored(k.muted,
+                                   "Representative runtime actions — disabled in visual fixture");
+                ghost_button("Folder", ImVec2(ui_px(72.0f), ui_px(30.0f)), true);
+                ImGui::SameLine(0, ui_px(6.0f));
+                primary_button("Set Default", ImVec2(ui_px(98.0f), ui_px(30.0f)), false, true);
+                ImGui::SameLine(0, ui_px(6.0f));
+                ghost_button("Reset", ImVec2(ui_px(62.0f), ui_px(30.0f)), true);
+                ImGui::SameLine(0, ui_px(6.0f));
+                danger_button("Remove", ImVec2(ui_px(76.0f), ui_px(30.0f)), true);
+            }
+            card_end();
+            ImGui::Spacing();
+        }
+        primary_button("Install Java", ImVec2(ui_px(128.0f), ui_px(32.0f)), false, true);
+        ImGui::SameLine(0, ui_px(6.0f));
+        ghost_button("Rescan", ImVec2(ui_px(92.0f), ui_px(32.0f)), true);
+        if (st.fixture_case == "java-runtime-actions") {
+            ImGui::SameLine(0, ui_px(6.0f));
+            ghost_button("Choose Folder", ImVec2(ui_px(122.0f), ui_px(32.0f)), true);
+        }
+        draw_fixture_managed_java_dialog(st);
+        return;
+    }
+
     draw_page_emblem(st, "java-emblem-ai.png");
     page_title("Java Manager", "Installed runtimes detected for Minecraft versions and loaders.");
     const std::wstring managed_java_root =
@@ -10896,7 +13227,10 @@ void draw_java_tab(UiState& st) {
     ImGui::Spacing();
 
     // ── Installed runtimes list ───────────────────────────────────────────
-    card_begin("##java_installed", ImVec2(-1, -1));
+    // This is a content-sized card, not a second document.  Let the page
+    // scroll surface own overflow so a short runtime list never grows a
+    // nested scrollbar of its own.
+    card_begin("##java_installed", ImVec2(-1, 0));
     ImGui::PushFont(f_h2);
     ImGui::TextUnformatted("Installed Runtimes");
     ImGui::PopFont();
@@ -11046,6 +13380,13 @@ void draw_java_tab(UiState& st) {
                  ImGui::TextColored(k.green, "Default");
              } else if (!j.home.empty()) {
                  ImGui::TextColored(k.muted, "Auto");
+             } else {
+                 // Java majors are intentionally shown before installation so
+                 // the user can see which runtime a profile will acquire on
+                 // demand.  Keep the cell an actual layout item: leaving the
+                 // cursor after SetCursorPosY() triggered Dear ImGui's 1.92
+                 // parent-boundary assertion for the empty Java 25 row.
+                 ImGui::TextColored(k.muted, "Not configured");
              }
             ImGui::EndChild();
             
@@ -11156,7 +13497,103 @@ static std::string normalize_loader_name(const std::string& raw) {
 // Backups Tool
 // ---------------------------------------------------------------------------
 
+// Do not call list_restore_points() for a visual proof of a populated backup
+// list.  That live helper inspects the selected profile; this façade keeps the
+// evidence reproducible and makes every write/delete/restore affordance inert.
+static void draw_fixture_backups_populated(UiState& st) {
+    page_title("Backups", "Manage profile backups and restore points.");
+    ImGui::TextColored(k.brand_hov,
+                       "LOCAL VISUAL FIXTURE — representative restore points only; no profile backup is read or changed.");
+    ImGui::Spacing();
+
+    card_begin("##fixture_backups_header", ImVec2(-1, 0));
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Backup Manager");
+    ImGui::PopFont();
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(300.0f));
+    primary_button("+ Create Backup", ImVec2(ui_px(130.0f), ui_px(32.0f)), false, true);
+    ImGui::SameLine();
+    ghost_button("Refresh", ImVec2(ui_px(90.0f), ui_px(32.0f)), true);
+    ImGui::SameLine();
+    ghost_button("Settings", ImVec2(ui_px(70.0f), ui_px(32.0f)), true);
+    card_end();
+    ImGui::Spacing();
+
+    card_begin("##fixture_backups_summary", ImVec2(-1, 0));
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Storage");
+    ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::TextColored(k.muted, "Total Backups");
+    ImGui::SameLine(ui_px(150.0f));
+    ImGui::TextUnformatted("3");
+    ImGui::SameLine(ui_px(250.0f));
+    ImGui::TextColored(k.muted, "Total Size");
+    ImGui::SameLine(ui_px(350.0f));
+    ImGui::TextUnformatted("1.8 GB");
+    card_end();
+    ImGui::Spacing();
+
+    card_begin("##fixture_backups_list", ImVec2(-1, 0));
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("All Backups");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::TextColored(k.muted, "3 backups");
+    ImGui::Spacing();
+    ImGui::BeginDisabled();
+    static std::string fixture_backup_filter;
+    ImGui::SetNextItemWidth(ui_px(240.0f));
+    ImGui::InputTextWithHint("##fixture_backup_filter", "Filter by name...", &fixture_backup_filter);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ui_px(160.0f));
+    if (ImGui::BeginCombo("##fixture_backup_sort", "Newest")) {
+        ImGui::Selectable("Newest", true);
+        ImGui::Selectable("Oldest", false);
+        ImGui::Selectable("Largest", false);
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    struct FixtureBackup { const char* name; const char* modified; const char* size; };
+    const FixtureBackup entries[] = {
+        {"Before shader refresh", "Today, 10:42 AM", "826 MB"},
+        {"Weekend survival checkpoint", "Yesterday, 8:17 PM", "612 MB"},
+        {"Before loader update", "Sep 20, 2026", "401 MB"},
+    };
+    if (ImGui::BeginTable("##fixture_restore_points", 4,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Restore point", 0, 0.45f);
+        ImGui::TableSetupColumn("Modified", 0, 0.25f);
+        ImGui::TableSetupColumn("Size", 0, 0.15f);
+        ImGui::TableSetupColumn("Action", 0, 0.15f);
+        ImGui::TableHeadersRow();
+        for (const FixtureBackup& entry : entries) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(entry.name);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(k.muted, "%s", entry.modified);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextColored(k.muted, "%s", entry.size);
+            ImGui::TableSetColumnIndex(3);
+            ghost_button("Delete", ImVec2(ui_px(68.0f), ui_px(24.0f)), true);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Spacing();
+    primary_button("Restore Latest", ImVec2(ui_px(140.0f), ui_px(30.0f)), false, true);
+    card_end();
+}
+
 void draw_backups_tab(UiState& st) {
+    if (st.fixture_mode && st.fixture_case == "backups-populated") {
+        draw_fixture_backups_populated(st);
+        return;
+    }
     page_title("Backups", "Manage profile backups and restore points.");
     instances::Instance backup_instance = st.selected_instance;
     if (backup_instance.directory.empty() && !st.instance_list.empty())
@@ -11251,6 +13688,29 @@ void draw_backups_tab(UiState& st) {
             if (ImGui::Selectable("Name", backup_sort == 3)) backup_sort = 3;
             ImGui::EndCombo();
         }
+        const int selected_backup_sort = backup_sort;
+        std::vector<instances::BackupEntry> ordered_backups = backup_entries;
+        std::sort(ordered_backups.begin(), ordered_backups.end(), [selected_backup_sort](
+            const instances::BackupEntry& left, const instances::BackupEntry& right) {
+            switch (selected_backup_sort) {
+                case 1: // Oldest
+                    if (left.modified_at != right.modified_at)
+                        return left.modified_at < right.modified_at;
+                    break;
+                case 2: // Largest
+                    if (left.size_bytes != right.size_bytes)
+                        return left.size_bytes > right.size_bytes;
+                    break;
+                case 3: // Name
+                    if (left.name != right.name) return left.name < right.name;
+                    break;
+                default: // Newest
+                    if (left.modified_at != right.modified_at)
+                        return left.modified_at > right.modified_at;
+                    break;
+            }
+            return left.name < right.name;
+        });
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
@@ -11263,7 +13723,7 @@ void draw_backups_tab(UiState& st) {
             ImGui::TableSetupColumn("Size", 0, 0.15f);
             ImGui::TableSetupColumn("Action", 0, 0.15f);
             ImGui::TableHeadersRow();
-            for (const auto& backup : backup_entries) {
+            for (const auto& backup : ordered_backups) {
                 if (!st.backup_filter.empty() && backup.name.find(st.backup_filter) == std::string::npos)
                     continue;
                 ImGui::TableNextRow();
@@ -11276,11 +13736,8 @@ void draw_backups_tab(UiState& st) {
                 ImGui::TableSetColumnIndex(3);
                 ImGui::PushID(backup.path.c_str());
                 if (ghost_button("Delete", ImVec2(ui_px(68.0f), ui_px(24.0f)))) {
-                    std::string remove_error;
-                    if (instances::remove_restore_point(backup_instance, backup.path, &remove_error))
-                        push_notice(st, ui_model::NoticeLevel::Success, "Backup deleted", backup.name);
-                    else
-                        push_notice(st, ui_model::NoticeLevel::Error, "Delete failed", remove_error);
+                    request_profile_data_confirmation(st, ProfileDataAction::DeleteRestorePoint,
+                                                      backup_instance, backup.name, backup.path);
                 }
                 ImGui::PopID();
             }
@@ -11288,12 +13745,7 @@ void draw_backups_tab(UiState& st) {
         }
         ImGui::Spacing();
         if (primary_button("Restore Latest", ImVec2(ui_px(140.0f), ui_px(30.0f)))) {
-            std::string restore_error;
-            if (instances::restore_latest(backup_instance, &restore_error))
-                push_notice(st, ui_model::NoticeLevel::Success, "Profile restored",
-                            "The latest restore point was applied.");
-            else
-                push_notice(st, ui_model::NoticeLevel::Error, "Restore failed", restore_error);
+            request_profile_data_confirmation(st, ProfileDataAction::RestoreLatest, backup_instance);
         }
     }
     card_end();
@@ -11336,19 +13788,50 @@ void draw_logs_tab(UiState& st) {
     ImGui::Spacing();
     
     static int log_source = 0; // 0 latest, 1 profile, 2 launcher, 3 game, 4 debug
+    if (st.fixture_mode) {
+        if (st.fixture_case == "logs-profile") log_source = 1;
+        else if (st.fixture_case == "logs-launcher") log_source = 2;
+        else if (st.fixture_case == "logs-game") log_source = 3;
+        else if (st.fixture_case == "logs-debug") log_source = 4;
+        else if (st.fixture_case == "logs" || st.fixture_case == "logs-latest") log_source = 0;
+    }
     if (ImGui::BeginTabBar("##log_source_tabs")) {
-        if (ImGui::BeginTabItem("Latest")) { log_source = 0; ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Profile")) { log_source = 1; ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Launcher")) { log_source = 2; ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Game")) { log_source = 3; ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Debug")) { log_source = 4; ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Latest", nullptr, st.fixture_mode && log_source == 0
+                                                    ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            if (!st.fixture_mode) log_source = 0;
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Profile", nullptr, st.fixture_mode && log_source == 1
+                                                     ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            if (!st.fixture_mode) log_source = 1;
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Launcher", nullptr, st.fixture_mode && log_source == 2
+                                                      ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            if (!st.fixture_mode) log_source = 2;
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Game", nullptr, st.fixture_mode && log_source == 3
+                                                  ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            if (!st.fixture_mode) log_source = 3;
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Debug", nullptr, st.fixture_mode && log_source == 4
+                                                   ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            if (!st.fixture_mode) log_source = 4;
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::Spacing();
     card_end();
     ImGui::Spacing();
 
-    card_begin("##logs_viewer", ImVec2(-1, -1));
+    // A live log viewer owns its remaining-height scrolling surface. For
+    // visual fixtures, let representative log rows extend the page instead so
+    // the shared deterministic @top/@middle/@bottom host remains truthful.
+    const bool fixture_logs_document = st.fixture_mode;
+    card_begin("##logs_viewer", fixture_logs_document ? ImVec2(-1, 0) : ImVec2(-1, -1));
     ImGui::PushFont(f_h2);
     ImGui::TextUnformatted(log_source == 0 ? "Latest Activity" :
                          log_source == 1 ? "Profile / Install Log" :
@@ -11386,17 +13869,27 @@ void draw_logs_tab(UiState& st) {
         std::transform(filter_lower.begin(), filter_lower.end(), filter_lower.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         st.log_cache_filtered.clear();
+        const int selected_log_source = log_source;
+        const auto source_matches = [selected_log_source](const std::string& log) {
+            const bool profile = log.find("[profile]") != std::string::npos ||
+                log.find("[mods]") != std::string::npos ||
+                log.find("[modpack]") != std::string::npos ||
+                log.find("[installer]") != std::string::npos ||
+                log.find("[job]") != std::string::npos;
+            const bool game = log.find("[game]") != std::string::npos;
+            const bool debug = log.find("[debug]") != std::string::npos;
+            const bool launcher = log.find("[launcher]") != std::string::npos ||
+                (!profile && !game && !debug);
+            switch (selected_log_source) {
+                case 1: return profile;
+                case 2: return launcher;
+                case 3: return game;
+                case 4: return debug;
+                default: return true;
+            }
+        };
         for (const auto& log : snapshot) {
-            if (log_source == 1 && log.find("[profile]") == std::string::npos &&
-                log.find("[mods]") == std::string::npos &&
-                log.find("[modpack]") == std::string::npos &&
-                log.find("[installer]") == std::string::npos &&
-                log.find("[job]") == std::string::npos) continue;
-            if (log_source == 2 && (log.find("[profile]") != std::string::npos ||
-                                    log.find("[mods]") != std::string::npos ||
-                                    log.find("[modpack]") != std::string::npos ||
-                                    log.find("[installer]") != std::string::npos ||
-                                    log.find("[job]") != std::string::npos)) continue;
+            if (!source_matches(log)) continue;
             if (filter_lower.empty()) {
                 st.log_cache_filtered.push_back(log);
             } else {
@@ -11412,7 +13905,9 @@ void draw_logs_tab(UiState& st) {
         st.log_cache_filter = st.log_filter;
     }
 
-    ImGui::BeginChild("##log_content", ImVec2(-1, -1), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+    if (!fixture_logs_document)
+        ImGui::BeginChild("##log_content", ImVec2(-1, -1), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar);
     
     if (st.log_cache_filtered.empty()) {
         ImGui::TextColored(k.muted, "No log entries yet.");
@@ -11441,12 +13936,12 @@ void draw_logs_tab(UiState& st) {
             ImGui::TextColored(line_color, "%s", line.c_str());
         }
         
-        if (auto_scroll) {
+        if (!fixture_logs_document && auto_scroll) {
             ImGui::SetScrollHereY(1.0f);
         }
     }
-    
-    ImGui::EndChild();
+
+    if (!fixture_logs_document) ImGui::EndChild();
     card_end();
 }
 
@@ -11455,6 +13950,91 @@ void draw_logs_tab(UiState& st) {
 // ---------------------------------------------------------------------------
 
 void draw_config_tab(UiState& st) {
+    if (st.fixture_mode) {
+        page_title("Configuration", "Representative launcher preferences for visual review");
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: no configuration file is read, changed, or saved.");
+        ImGui::Spacing();
+
+        // Keep the visual-review composition structurally aligned with the
+        // shipped editor while keeping every field local and inert. A short
+        // summary card used to conceal the compact-layout geometry that real
+        // players use for quick and advanced settings.
+        card_begin("##fixture_config_header", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Configuration Editor");
+        ImGui::PopFont();
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(200.0f));
+        primary_button("Save", ImVec2(ui_px(80.0f), ui_px(32.0f)), false, true);
+        ImGui::SameLine();
+        ghost_button("Reset", ImVec2(ui_px(80.0f), ui_px(32.0f)), true);
+        card_end();
+        ImGui::Spacing();
+
+        card_begin("##fixture_config_quick", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Quick Settings");
+        ImGui::PopFont();
+        ImGui::Spacing();
+
+        ImGui::Columns(2, "##fixture_config_cols", false);
+        ImGui::TextUnformatted("Theme");
+        ImGui::SetNextItemWidth(ui_px(200.0f));
+        // Use the same five-theme control as the shipped Configuration page.
+        // The shared handler remains inert in fixture mode, so the open-picker
+        // route proves the real premium labels and compact popup geometry.
+        draw_theme_selector_inline(st, *st.cfg);
+
+        ImGui::TextUnformatted("Launcher language");
+        ImGui::TextColored(k.muted, "English (the current launcher interface)");
+
+        ImGui::NextColumn();
+        ImGui::TextUnformatted("Max Memory (GB)");
+        int fixture_memory_gb = 8;
+        ImGui::SetNextItemWidth(ui_px(100.0f));
+        ImGui::BeginDisabled();
+        ImGui::InputInt("##fixture_config_max_memory", &fixture_memory_gb, 1, 1);
+        ImGui::EndDisabled();
+
+        ImGui::TextUnformatted("JVM Arguments");
+        std::string fixture_jvm_args = "-Xms2G -XX:+UseG1GC";
+        ImGui::SetNextItemWidth(ui_px(200.0f));
+        ImGui::BeginDisabled();
+        ImGui::InputText("##fixture_config_jvm_args", &fixture_jvm_args);
+        ImGui::EndDisabled();
+
+        ImGui::Columns(1);
+        card_end();
+        ImGui::Spacing();
+
+        card_begin("##fixture_config_advanced", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Advanced Configuration");
+        ImGui::PopFont();
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted,
+                            "Protected credentials are managed through the dedicated settings pages.");
+        ImGui::Spacing();
+
+        ImGui::BeginChild("##fixture_config_editor", ImVec2(-1, ui_px(300.0f)),
+                          ImGuiChildFlags_Borders);
+        ImGui::TextUnformatted("Current configuration");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Theme: default_dark");
+        ImGui::TextUnformatted("Language: en");
+        ImGui::TextUnformatted("Loader: fabric");
+        ImGui::TextUnformatted("Base directory: isolated visual-review fixture");
+        ImGui::TextUnformatted("Assets directory: local fixture assets");
+        ImGui::TextUnformatted("Java runtimes: representative managed runtime");
+        ImGui::TextUnformatted("Provider credentials: not loaded in fixture");
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted,
+                            "Use the Launcher, Java, Performance, Modpacks, and Admin sections to edit these values safely.");
+        ImGui::EndChild();
+        card_end();
+        return;
+    }
+
     config::Config& c = *st.cfg;
     page_title("Configuration", "Manage launcher settings and preferences.");
     
@@ -11479,6 +14059,16 @@ void draw_config_tab(UiState& st) {
     if (ghost_button("Reset", ImVec2(ui_px(80.0f), ui_px(32.0f)))) {
         c.theme = "default_dark";
         c.language = "en";
+        c.theme_custom_colors.clear();
+        c.high_contrast_mode = false;
+        c.reduced_motion = false;
+        c.color_vision_palette = false;
+        c.color_vision_profile = "red_green";
+        c.keyboard_navigation = false;
+        c.date_format = "YYYY-MM-DD";
+        c.time_format = "24-hour";
+        c.theme_font_size = 14.0f;
+        apply_configured_theme(c);
         c.perf_max_memory_mb = 4096;
         c.extra_jvm.clear();
         st.settings_dirty = true;
@@ -11497,21 +14087,14 @@ void draw_config_tab(UiState& st) {
     ImGui::Columns(2, "##config_cols", false);
     
     ImGui::TextUnformatted("Theme");
-    const char* themes[] = {"System", "Light", "Dark"};
-    int current_theme = c.theme == "default_light" ? 1 : 0;
-    ImGui::SetNextItemWidth(ui_px(160.0f));
-    if (ImGui::Combo("##theme", &current_theme, "System\0Light\0Dark\0", 3)) {
-        c.theme = current_theme == 1 ? "default_light" : "default_dark";
-        st.settings_dirty = true;
-    }
+    ImGui::SetNextItemWidth(ui_px(200.0f));
+    // Reuse the canonical five-theme control. The previous three-label menu
+    // showed every non-light theme as "System" and silently overwrote several
+    // supported persisted choices with Default Dark.
+    draw_theme_selector_inline(st, c);
     
-    ImGui::TextUnformatted("Language");
-    ImGui::SetNextItemWidth(ui_px(160.0f));
-    int language_index = c.language == "en" ? 0 : 1;
-    if (ImGui::Combo("##language", &language_index, "English\0Spanish\0", 2)) {
-        c.language = language_index == 0 ? "en" : "es";
-        st.settings_dirty = true;
-    }
+    ImGui::TextUnformatted("Launcher language");
+    ImGui::TextColored(k.muted, "English (the current launcher interface)");
     
     ImGui::NextColumn();
     ImGui::TextUnformatted("Max Memory (GB)");
@@ -11532,7 +14115,10 @@ void draw_config_tab(UiState& st) {
     card_end();
     ImGui::Spacing();
 
-    card_begin("##config_advanced", ImVec2(-1, -1));
+    // Let the page own vertical scrolling.  A fill-height card created a
+    // second scroll surface at compact window sizes while the fixed editor
+    // already provides the only intentional document viewport below.
+    card_begin("##config_advanced", ImVec2(-1, 0));
     ImGui::PushFont(f_h2);
     ImGui::TextUnformatted("Advanced Configuration");
     ImGui::PopFont();
@@ -11623,7 +14209,7 @@ void draw_pack_wizard(UiState& st) {
     if (st.wizard_open) {
         ImGui::OpenPopup("Create Profile");
         st.wizard_preset = -1;
-        {
+        if (!st.fixture_mode) {
             std::lock_guard<std::mutex> lock(st.wizard_resolve_mu);
             st.wizard_resolved_loaders.clear();
             st.wizard_resolved_versions.clear();
@@ -11646,7 +14232,10 @@ void draw_pack_wizard(UiState& st) {
     // New profiles are deliberately limited to targets with a maintained
     // Amalgam launch path. Existing/imported profiles remain untouched.
     const bool wizard_is_import = st.wizard_source == 4;
-    if (!wizard_is_import &&
+    const bool preserve_unsupported_fixture = st.fixture_mode &&
+        (st.fixture_case == "wizard-profile-target-unsupported" ||
+         st.fixture_case == "wizard-profile-performance-loader-unsupported");
+    if (!wizard_is_import && !preserve_unsupported_fixture &&
         !version_catalog::supports(st.wizard_loader, st.wizard_version)) {
         st.wizard_version = version_catalog::default_version(st.wizard_loader);
         if (st.wizard_version.empty())
@@ -11664,14 +14253,14 @@ void draw_pack_wizard(UiState& st) {
     const ImVec4 col_error = k.red;
 
     {
-        card_begin("##profile_wizard_hero", ImVec2(-1, ui_px(86.0f)));
+        card_begin("##profile_wizard_hero", ImVec2(-1, ui_px(76.0f)));
         const ImVec2 hero_origin = ImGui::GetCursorScreenPos();
         draw_local_image(st, st.exe_dir + L"\\branding\\ai\\wizard-profile-ai-v2.png",
                          hero_origin, ImGui::GetWindowSize(),
                          c32(ImVec4(k.text.x, k.text.y, k.text.z, 0.18f)),
                          ui_model::ImageFit::Cover);
         draw_brand_badge(ImGui::GetWindowDrawList(),
-                         hero_origin + ImVec2(ui_px(28.0f), ui_px(28.0f)), ui_px(25.0f), ui_px(1.0f));
+                         hero_origin + ImVec2(ui_px(24.0f), ui_px(24.0f)), ui_px(22.0f), ui_px(1.0f));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(62.0f));
         ImGui::PushFont(f_h2);
         ImGui::TextUnformatted("Create a launchable profile");
@@ -11680,7 +14269,6 @@ void draw_pack_wizard(UiState& st) {
         ImGui::TextColored(k.muted, "Build an isolated profile with a validated source and performance plan.");
         card_end();
     }
-    ImGui::Spacing();
     ImGui::Spacing();
 
     // Step indicator with circles and connecting lines
@@ -11725,17 +14313,69 @@ void draw_pack_wizard(UiState& st) {
 
     ImGui::Separator();
     ImGui::Spacing();
-    ImGui::Spacing();
 
     // Scrollable content area
     ImGui::BeginChild("##wizard_content", ImVec2(0, -ui_px(56.0f)));
+    // Keep the active source and resolver outcome visible before the longer
+    // setup form. On compact windows this prevents a selected provider or a
+    // recovery state from disappearing below the fold, and it gives every
+    // player a clear answer about what the draft currently means.
+    if (st.wizard_step == 0) {
+        const char* source_names[] = {"Vanilla", "Modrinth", "CurseForge", "AI co-pilot", "Import archive"};
+        const int source_index = std::clamp(st.wizard_source, 0, 4);
+        std::string source_status;
+        std::string resolve_error;
+        {
+            std::lock_guard<std::mutex> lock(st.wizard_resolve_mu);
+            resolve_error = st.wizard_resolve_error;
+        }
+        if (source_index == 1 || source_index == 2) {
+            const char* identifier = source_index == 1 ? "Project slug" : "Project ID";
+            if (st.wizard_resolving.load())
+                source_status = std::string("Resolving ") + identifier + "…";
+            else if (!resolve_error.empty())
+                source_status = "Needs attention: " + humanize_error(resolve_error);
+            else if (st.wizard_project.empty())
+                source_status = std::string(identifier) + " is still required.";
+            else
+                source_status = std::string(identifier) + ": " + st.wizard_project;
+        } else if (source_index == 3) {
+            source_status = st.wizard_prompt.empty()
+                ? "A short description is still required before planning."
+                : "Plan prompt is ready for review.";
+        } else if (source_index == 4) {
+            source_status = st.wizard_archive.empty()
+                ? "Choose an archive before continuing."
+                : "Archive is selected and ready to validate.";
+        } else {
+            source_status = "No downloaded content will be added to this profile.";
+        }
+        card_begin("##wizard_source_summary", ImVec2(-1, 0));
+        ImGui::PushFont(f_bold);
+        ImGui::TextColored(k.text, "Current draft: %s", source_names[source_index]);
+        ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, resolve_error.empty() ? k.muted : k.yellow);
+        ImGui::TextWrapped("%s", source_status.c_str());
+        ImGui::PopStyleColor();
+        card_end();
+        ImGui::Spacing();
+    }
+    // A fixture must show the same composition without allowing its source
+    // cards, AI planning, or archive picker to reach live code. In particular,
+    // the source-specific fields below can otherwise start a planner worker or
+    // invoke the Windows file picker even though Create Profile is disabled.
+    if (st.fixture_mode) {
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: source inputs and actions are disabled; no planner, provider, or file picker is used.");
+        ImGui::Spacing();
+        ImGui::BeginDisabled();
+    }
 
     if (st.wizard_step == 0) {
         ImGui::PushFont(f_h2);
         ImGui::TextUnformatted("Choose a starting point");
         ImGui::PopFont();
         ImGui::TextColored(k.muted, "Pick a template or configure from scratch. Every option stays isolated and reversible.");
-        ImGui::Spacing();
         ImGui::Spacing();
 
         // Quick start cards — 2 per row
@@ -11747,7 +14387,7 @@ void draw_pack_wizard(UiState& st) {
             {"Import Pack",      "Import an existing .mrpack or CurseForge zip", 4, "fabric"},
         };
         const float card_w = (w - pad * 2.0f - ui_px(12.0f)) * 0.5f;
-        const float card_h = ui_px(52.0f);
+        const float card_h = ui_px(50.0f);
         for (int i = 0; i < 4; i += 2) {
             for (int j = 0; j < 2; ++j) {
                 int idx = i + j;
@@ -11783,7 +14423,6 @@ void draw_pack_wizard(UiState& st) {
             }
         }
         ImGui::Spacing();
-        ImGui::Spacing();
 
         ImGui::PushFont(f_bold);
         ImGui::TextUnformatted("Profile name");
@@ -11793,7 +14432,6 @@ void draw_pack_wizard(UiState& st) {
         if (st.wizard_name.empty()) {
             ImGui::TextColored(col_error, "A name is required.");
         }
-        ImGui::Spacing();
         ImGui::Spacing();
 
         ImGui::PushFont(f_bold);
@@ -11811,7 +14449,7 @@ void draw_pack_wizard(UiState& st) {
             "Import .mrpack or .zip"
         };
         const float btn_w = (w - pad * 2.0f - ui_px(8.0f) * 4.0f) / 5.0f;
-        const float btn_h = ui_px(56.0f);
+        const float btn_h = ui_px(52.0f);
         for (int i = 0; i < 5; ++i) {
             if (i) ImGui::SameLine(0, ui_px(8.0f));
             bool active = (st.wizard_source == i);
@@ -11842,7 +14480,6 @@ void draw_pack_wizard(UiState& st) {
         }
 
         ImGui::Spacing();
-        ImGui::Spacing();
 
         if (st.wizard_source == 1 || st.wizard_source == 2) {
             const char* field_label = st.wizard_source == 1 ? "Modrinth project slug" : "CurseForge project ID";
@@ -11859,7 +14496,8 @@ void draw_pack_wizard(UiState& st) {
                 st.wizard_resolved_icon.clear();
                 st.wizard_last_project.clear();
             }
-            if (!st.wizard_project.empty() && st.wizard_project != st.wizard_last_project && !st.wizard_resolving) {
+            if (!st.fixture_mode && !st.wizard_project.empty() &&
+                st.wizard_project != st.wizard_last_project && !st.wizard_resolving) {
                 st.wizard_last_project = st.wizard_project;
                 std::string src = st.wizard_source == 1 ? "modrinth" : "curseforge";
                 spawn_worker(st, std::thread(do_wizard_resolve, std::ref(st), st.wizard_project, src));
@@ -11868,7 +14506,9 @@ void draw_pack_wizard(UiState& st) {
             if (st.wizard_resolving) {
                 ImGui::TextColored(k.brand_hov, "Resolving project...");
             } else if (!st.wizard_resolve_error.empty()) {
-                ImGui::TextColored(col_error, "%s", humanize_error(st.wizard_resolve_error).c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, col_error);
+                ImGui::TextWrapped("%s", humanize_error(st.wizard_resolve_error).c_str());
+                ImGui::PopStyleColor();
             } else if (!st.wizard_resolved_title.empty()) {
                 ImGui::TextColored(k.green, "Found: %s", st.wizard_resolved_title.c_str());
                 {
@@ -11951,7 +14591,10 @@ void draw_pack_wizard(UiState& st) {
         }
         const std::vector<std::string> supported_versions =
             available_profile_versions(st, "auto");
-        if (!is_import && !version_catalog::supports("auto", st.wizard_version))
+        const bool preserve_unsupported_target_fixture = st.fixture_mode &&
+            st.fixture_case == "wizard-profile-target-unsupported";
+        if (!is_import && !preserve_unsupported_target_fixture &&
+            !version_catalog::supports("auto", st.wizard_version))
             st.wizard_version = version_catalog::default_version(st.wizard_loader);
         if (!is_import && st.wizard_version.empty() && !supported_versions.empty())
             st.wizard_version = supported_versions.front();
@@ -12188,6 +14831,7 @@ void draw_pack_wizard(UiState& st) {
         ImGui::TextColored(k.green, "This will create one isolated launchable profile. Existing profiles will not be modified.");
     }
 
+    if (st.fixture_mode) ImGui::EndDisabled();
     ImGui::EndChild();
 
     ImGui::Separator();
@@ -12199,6 +14843,11 @@ void draw_pack_wizard(UiState& st) {
         ImGui::SameLine();
     }
     if (ghost_button("Cancel", ImVec2(ui_px(90.0f), ui_px(34.0f)))) ImGui::CloseCurrentPopup();
+    if (st.fixture_mode && st.wizard_step == 3) {
+        ImGui::SameLine(0, ui_px(12.0f));
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: profile creation and downloads are disabled.");
+    }
     ImGui::SameLine(ImGui::GetWindowWidth() - ui_px(st.wizard_step == 3 ? 170.0f : 130.0f));
     if (st.wizard_step < 3) {
         bool valid = false;
@@ -12219,8 +14868,10 @@ void draw_pack_wizard(UiState& st) {
     } else {
         const bool create_ready = st.wizard_source == 4 ||
             version_catalog::supports(st.wizard_loader, st.wizard_version);
-        if (primary_button("Create Profile", ImVec2(ui_px(150.0f), ui_px(34.0f)), false, !create_ready) &&
-            create_ready) {
+        const bool fixture_create_blocked = st.fixture_mode;
+        if (primary_button("Create Profile", ImVec2(ui_px(150.0f), ui_px(34.0f)), false,
+                           !create_ready || fixture_create_blocked) &&
+            create_ready && !fixture_create_blocked) {
             if ((st.wizard_source == 1 || st.wizard_source == 2) && !st.wizard_project.empty()) {
                 st.mod_loader = st.wizard_loader;
                 st.mod_version = st.wizard_version;
@@ -12810,9 +15461,7 @@ void draw_notice_center(UiState& st) {
                     if (ghost_button(notice.action_label.c_str(), ImVec2(ui_px(130.0f), ui_px(26.0f)))) {
                         st.notice_center_open = false;
                         if (notice.action_id == "downloads") {
-                            st.sidebar_item = 4;
-                            st.active_tab = 17;
-                            st.downloads_open = true;
+                            open_downloads_surface(st);
                         } else if (notice.action_id == "settings") {
                             st.sidebar_item = 12;
                             st.active_tab = 4;
@@ -12824,10 +15473,12 @@ void draw_notice_center(UiState& st) {
                             st.active_tab = 6;
                         } else if (notice.action_id == "open_mc_launcher") {
                             official_launcher::OpenOfficialLauncher();
+                        } else if (notice.action_id == "get_mc_launcher") {
+                            ShellExecuteW(st.hwnd, L"open",
+                                          L"https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en&gl=US&ocid=pdpshare",
+                                          nullptr, nullptr, SW_SHOWNORMAL);
                         } else if (notice.action_id == "open_signin") {
-                            st.sidebar_item = 9;
-                            st.active_tab = 9;
-                            st.settings_section = 0;
+                            request_microsoft_connect_surface(st);
                         }
                     }
                     ImGui::SameLine();
@@ -13028,7 +15679,68 @@ static void draw_local_feedback_dialog(UiState& st) {
     st.local_feedback_open = open;
 }
 
+constexpr char kBetaFeedbackSubmitAction[] = "beta-feedback-submit";
+
+static bool beta_feedback_scope_is_current(const std::string& expected_account_id,
+                                           uint64_t expected_generation) {
+    auto& supabase = aml::supabase::SupabaseManager::instance();
+    if (expected_account_id.empty() ||
+        supabase.session_generation() != expected_generation) {
+        return false;
+    }
+    return supabase.get_current_user().id == expected_account_id;
+}
+
+static AsyncUiRequestResult beta_feedback_scope_changed_result(
+    const std::string& expected_account_id, uint64_t expected_generation) {
+    AsyncUiRequestResult result;
+    result.payload_a = expected_account_id;
+    result.payload_c = std::to_string(expected_generation);
+    result.title = "Feedback submission not applied";
+    result.detail = "Your signed-in account changed before the feedback could be submitted.";
+    return result;
+}
+
+static void consume_beta_feedback_submission(UiState& st) {
+    const auto snapshot = snapshot_async_ui_request(st.auth_async_request);
+    if (snapshot.action != kBetaFeedbackSubmitAction || !snapshot.has_result) return;
+
+    AsyncUiRequestSnapshot completed;
+    if (!take_auth_async_request_result(st, kBetaFeedbackSubmitAction, &completed)) return;
+
+    st.feedback_submitting = false;
+    const auto& result = completed.result;
+    const bool scope_matches = beta_feedback_scope_is_current(
+        st.feedback_submission_account_id, st.feedback_submission_generation) &&
+        (result.payload_a.empty() || result.payload_a == st.feedback_submission_account_id) &&
+        (result.payload_c.empty() ||
+         result.payload_c == std::to_string(st.feedback_submission_generation));
+    st.feedback_submission_account_id.clear();
+    st.feedback_submission_generation = 0;
+    if (!scope_matches) {
+        push_notice(st, ui_model::NoticeLevel::Warning, "Feedback submission needs review",
+                    "Your signed-in account changed before the result was confirmed. The launcher did not retry the submission.");
+        return;
+    }
+
+    if (result.success) {
+        push_notice(st, ui_model::NoticeLevel::Success, "Feedback submitted",
+                    "Thank you for helping improve the beta.");
+        st.feedback_message.clear();
+        st.feedback_rating = 0;
+        st.feedback_open = false;
+        return;
+    }
+    push_notice(st, ui_model::NoticeLevel::Error, "Feedback failed",
+                result.detail.empty() ? "The feedback service could not accept your submission. Please try again." :
+                                        humanize_error(result.detail));
+}
+
 static void draw_feedback_dialog(UiState& st) {
+    // This dialog is drawn even when closed, making it a safe owner for a
+    // completed result after someone dismisses the modal while the worker is
+    // still finishing.
+    consume_beta_feedback_submission(st);
     if (st.feedback_open) ImGui::OpenPopup("Beta Feedback");
     bool open = st.feedback_open;
     if (!ImGui::BeginPopupModal("Beta Feedback", &open,
@@ -13038,6 +15750,19 @@ static void draw_feedback_dialog(UiState& st) {
     ImGui::TextUnformatted("Beta Feedback");
     ImGui::TextColored(k.muted, "Tell us what worked, what failed, or what should improve.");
     ImGui::Separator();
+    const bool feedback_submitting = st.feedback_submitting ||
+        auth_async_request_is_working(st, kBetaFeedbackSubmitAction);
+    const bool account_operation_pending = auth_async_request_lane_busy(st);
+    if (feedback_submitting) {
+        ImGui::TextColored(k.brand_hov,
+                           "Submitting your feedback in the background. You can keep using the launcher.");
+        ImGui::Spacing();
+    } else if (account_operation_pending) {
+        ImGui::TextColored(k.muted,
+                           "Finish the current account operation before submitting feedback.");
+        ImGui::Spacing();
+    }
+    ImGui::BeginDisabled(feedback_submitting);
     const char* categories[] = {"Bug", "UI", "Performance", "Feature", "Other"};
     ImGui::SetNextItemWidth(ui_px(180.0f));
     ImGui::Combo("Category", &st.feedback_category, categories, 5);
@@ -13054,37 +15779,79 @@ static void draw_feedback_dialog(UiState& st) {
                               ImVec2(ui_px(460.0f), ui_px(120.0f)));
     ImGui::TextColored(k.muted, "Do not include passwords, tokens, API keys, or raw log files.");
     ImGui::Spacing();
-    if (primary_button("Submit Feedback", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
-        auto* client = aml::supabase::SupabaseManager::instance().client();
-        if (!client || !client->is_authenticated()) {
-            push_notice(st, ui_model::NoticeLevel::Warning, "Sign-in required",
-                        "Sign into your Amalgam account before submitting beta feedback.");
-        } else if (st.feedback_rating < 1 || st.feedback_message.empty()) {
+    const bool submit_pressed = primary_button(feedback_submitting ? "Submitting..." : "Submit Feedback",
+                                               ImVec2(ui_px(150.0f), ui_px(32.0f)), feedback_submitting,
+                                               feedback_submitting || account_operation_pending);
+    ImGui::EndDisabled();
+    if (submit_pressed) {
+        if (st.feedback_rating < 1 || st.feedback_message.empty()) {
             push_notice(st, ui_model::NoticeLevel::Warning, "Feedback incomplete",
                         "Choose a rating and enter a message.");
         } else {
-            static const char* category_ids[] = {"bug", "ui", "performance", "feature", "other"};
-            Json diagnostics = Json::obj();
-            diagnostics.set("active_tab", Json::num(st.active_tab));
-            diagnostics.set("has_java", Json::boolean(!st.javas.empty()));
-            diagnostics.set("profile_loaded", Json::boolean(!st.selected_instance.id.empty()));
-            Json args = Json::obj();
-            args.set("category", Json::str(category_ids[std::clamp(st.feedback_category, 0, 4)]));
-            args.set("rating", Json::num(st.feedback_rating));
-            args.set("message", Json::str(st.feedback_message));
-            args.set("page", Json::str("launcher-tab-" + std::to_string(st.active_tab)));
-            args.set("app_version", Json::str(kVersion));
-            args.set("diagnostics", diagnostics);
-            const auto result = client->rpc("submit_beta_feedback", args);
-            if (result.success) {
-                push_notice(st, ui_model::NoticeLevel::Success, "Feedback submitted",
-                            "Thank you for helping improve the beta.");
-                st.feedback_message.clear();
-                st.feedback_rating = 0;
-                open = false;
-                ImGui::CloseCurrentPopup();
+            // The button is disabled while the shared account lane is busy,
+            // so these provider reads cannot race a sign-in, sign-out, or
+            // token refresh. The RPC itself runs below on that same lane.
+            auto* client = aml::supabase::SupabaseManager::instance().client();
+            const auto current_user = aml::supabase::SupabaseManager::instance().get_current_user();
+            if (!client || !client->is_authenticated() || current_user.id.empty()) {
+                push_notice(st, ui_model::NoticeLevel::Warning, "Sign-in required",
+                            "Sign into your Amalgam account before submitting beta feedback.");
             } else {
-                push_notice(st, ui_model::NoticeLevel::Error, "Feedback failed", result.error);
+                static const char* category_ids[] = {"bug", "ui", "performance", "feature", "other"};
+                Json diagnostics = Json::obj();
+                diagnostics.set("active_tab", Json::num(st.active_tab));
+                diagnostics.set("has_java", Json::boolean(!st.javas.empty()));
+                diagnostics.set("profile_loaded", Json::boolean(!st.selected_instance.id.empty()));
+                Json args = Json::obj();
+                args.set("category", Json::str(category_ids[std::clamp(st.feedback_category, 0, 4)]));
+                args.set("rating", Json::num(st.feedback_rating));
+                args.set("message", Json::str(st.feedback_message));
+                args.set("page", Json::str("launcher-tab-" + std::to_string(st.active_tab)));
+                args.set("app_version", Json::str(kVersion));
+                args.set("diagnostics", diagnostics);
+
+                const std::string expected_account_id = current_user.id;
+                const uint64_t expected_generation =
+                    aml::supabase::SupabaseManager::instance().session_generation();
+                if (start_auth_async_request(
+                        st, kBetaFeedbackSubmitAction,
+                        [expected_account_id, expected_generation, args = std::move(args)]() mutable {
+                            if (!beta_feedback_scope_is_current(expected_account_id, expected_generation)) {
+                                return beta_feedback_scope_changed_result(expected_account_id,
+                                                                          expected_generation);
+                            }
+
+                            AsyncUiRequestResult result;
+                            result.payload_a = expected_account_id;
+                            result.payload_c = std::to_string(expected_generation);
+                            auto* request_client = aml::supabase::SupabaseManager::instance().client();
+                            if (!request_client || !request_client->is_authenticated()) {
+                                result.title = "Feedback unavailable";
+                                result.detail = "Sign in to your Amalgam account before submitting feedback.";
+                                return result;
+                            }
+
+                            const auto response = request_client->rpc("submit_beta_feedback", args);
+                            if (!beta_feedback_scope_is_current(expected_account_id, expected_generation)) {
+                                return beta_feedback_scope_changed_result(expected_account_id,
+                                                                          expected_generation);
+                            }
+                            result.success = response.success;
+                            result.title = response.success ? "Feedback submitted" : "Feedback failed";
+                            result.detail = response.success
+                                ? "Thank you for helping improve the beta."
+                                : (response.error.empty()
+                                    ? "The feedback service could not accept your submission. Please try again."
+                                    : response.error);
+                            return result;
+                        })) {
+                    st.feedback_submitting = true;
+                    st.feedback_submission_account_id = expected_account_id;
+                    st.feedback_submission_generation = expected_generation;
+                } else {
+                    push_notice(st, ui_model::NoticeLevel::Info, "Account operation in progress",
+                                "Wait for the current account operation to finish before submitting feedback.");
+                }
             }
         }
     }
@@ -13095,138 +15862,6 @@ static void draw_feedback_dialog(UiState& st) {
     }
     ImGui::EndPopup();
     st.feedback_open = open;
-}
-
-void draw_launch_review(UiState& st) {
-    if (st.launch_review_open) ImGui::OpenPopup("Launch preflight");
-    bool open = st.launch_review_open;
-    if (!ImGui::BeginPopupModal("Launch preflight", &open,
-                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
-        return;
-    ImGui::PushFont(f_h2);
-    ImGui::TextUnformatted("Launch preflight");
-    ImGui::PopFont();
-    ImGui::TextWrapped("Review the selected target before starting Minecraft.");
-    if (!st.pending_id.empty())
-        ImGui::TextColored(k.muted, "Version: %s", st.pending_id.c_str());
-    if (!st.pending_instance_dir.empty())
-        ImGui::TextColored(k.muted, "Profile: %s", net::to_utf8(st.pending_instance_dir).c_str());
-    ImGui::Separator();
-    for (const auto& check : st.launch_checks) {
-        ImGui::PushStyleColor(ImGuiCol_Text, check.passed ? k.green :
-                               (check.blocking ? k.red : k.yellow));
-        ImGui::TextUnformatted(check.passed ? "OK" : (check.blocking ? "BLOCKED" : "CHECK"));
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::PushFont(f_bold);
-        ImGui::TextUnformatted(check.label.c_str());
-        ImGui::PopFont();
-        ImGui::TextWrapped("%s", check.detail.c_str());
-    }
-    const bool blocked = has_failed_launch_check(st.launch_checks, true);
-    const bool official_launcher_installed = official_launcher::IsOfficialLauncherInstalled();
-    if (blocked)
-        ImGui::TextColored(k.red, "Launch is blocked until the required checks pass.");
-    else
-        ImGui::TextColored(k.yellow, "Warnings can be resolved later, but the launch may continue.");
-    ImGui::Spacing();
-
-    // Show the official launcher path prominently when no Microsoft account
-    if (official_launcher_installed && !st.account.username.empty()) {
-        // User has Microsoft account — direct launch available
-        if (ghost_button(blocked ? "Close" : "Cancel", ImVec2(ui_px(100), ui_px(34)))) {
-            st.launch_review_open = false;
-            st.launch_review_approved = false;
-            st.pending_id.clear();
-            st.pending_instance_dir.clear();
-            ImGui::CloseCurrentPopup();
-        }
-    } else if (official_launcher_installed && st.account.username.empty()) {
-        // No Microsoft account — recommend official launcher path
-        ImGui::PushFont(f_bold);
-        ImGui::TextColored(k.green, "READY TO PLAY VIA MINECRAFT LAUNCHER");
-        ImGui::PopFont();
-        ImGui::TextColored(k.muted, "Amalgam will prepare your profile and open the Minecraft Launcher.");
-        ImGui::TextColored(k.muted, "Sign in with your Microsoft account there and press Play.");
-        if (st.cfg && auth::valid_client_id(st.cfg->microsoft_client_id)) {
-            ImGui::TextColored(k.yellow,
-                               "Signing in inside Amalgam is built in but still waiting on Minecraft\n"
-                               "approval, so Play uses the Minecraft Launcher until it is granted.\n"
-                               "You can switch modes in Settings > Account.");
-        }
-        ImGui::Spacing();
-
-        if (primary_button("Play via Minecraft Launcher", ImVec2(ui_px(220), ui_px(38)))) {
-            st.launch_review_open = false;
-            st.launch_review_approved = false;
-            st.pending_id.clear();
-            st.pending_instance_dir.clear();
-            ImGui::CloseCurrentPopup();
-            st.pending_launch = true;
-        }
-        ImGui::SameLine(0, ui_px(8.0f));
-        if (ghost_button("Cancel", ImVec2(ui_px(90), ui_px(38)))) {
-            st.launch_review_open = false;
-            st.launch_review_approved = false;
-            st.pending_id.clear();
-            st.pending_instance_dir.clear();
-            ImGui::CloseCurrentPopup();
-        }
-    } else {
-        // Official launcher not installed — need to get it
-        ImGui::PushFont(f_bold);
-        ImGui::TextColored(k.yellow, "MINECRAFT LAUNCHER NOT FOUND");
-        ImGui::PopFont();
-        ImGui::TextColored(k.muted,
-                           "Install the Minecraft Launcher to play: Amalgam prepares the\n"
-                           "profile and hands it over, and the launcher signs you in.");
-        ImGui::Spacing();
-
-        if (primary_button("Get Minecraft Launcher", ImVec2(ui_px(200), ui_px(38)))) {
-            ShellExecuteW(st.hwnd, L"open",
-                          L"https://apps.microsoft.com/detail/9PGW18NPBZV5?hl=en&gl=US&ocid=pdpshare",
-                          nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        ImGui::SameLine(0, ui_px(8.0f));
-        if (ghost_button("Cancel", ImVec2(ui_px(90), ui_px(38)))) {
-            st.launch_review_open = false;
-            st.launch_review_approved = false;
-            st.pending_id.clear();
-            st.pending_instance_dir.clear();
-            ImGui::CloseCurrentPopup();
-        }
-    }
-
-    if (ghost_button("Open Settings", ImVec2(ui_px(120), ui_px(28)))) {
-        st.launch_review_open = false;
-        st.sidebar_item = 12;
-        st.active_tab = 4;
-        ImGui::CloseCurrentPopup();
-    }
-
-    // Direct launch only when Microsoft account is available
-    if (!blocked && !st.account.username.empty() && official_launcher_installed) {
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::PushFont(f_small);
-        ImGui::TextColored(k.muted, "Or launch directly:");
-        ImGui::PopFont();
-        ImGui::SameLine();
-        if (ghost_button("Launch directly", ImVec2(ui_px(120), ui_px(28)))) {
-            st.launch_review_open = false;
-            st.launch_review_approved = true;
-            st.pending_launch = true;
-            ImGui::CloseCurrentPopup();
-        }
-    }
-    ImGui::EndPopup();
-    st.launch_review_open = open;
-    if (!open) {
-        st.launch_review_approved = false;
-        st.pending_id.clear();
-        st.pending_instance_dir.clear();
-    }
 }
 
 void draw_downloads_panel(UiState& st) {
@@ -13424,11 +16059,38 @@ static void handle_keyboard_navigation(UiState& st) {
     }
 }
 
+void draw_visual_fixture_notice() {
+    // A fixture capture may deliberately use representative records to make
+    // dense states reviewable. Keep that boundary visible in every image so
+    // sample server, Bedrock, account, and download values cannot be read as
+    // live product evidence when the screenshot is shared on its own.
+    const float available_width = ImGui::GetContentRegionAvail().x;
+    const char* detail = available_width < ui_px(860.0f)
+        ? "Local sample data only; live state is untouched."
+        : "Local representative data only; no live account, file, provider, or game state is used.";
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_px(10.0f), ui_px(5.0f)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, k.surface);
+    ImGui::PushStyleColor(ImGuiCol_Border, k.brand_dk);
+    ImGui::BeginChild("##visual_fixture_notice", ImVec2(0, ui_px(29.0f)), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                          ImGuiWindowFlags_NoNav);
+    ImGui::PushFont(f_small);
+    ImGui::TextColored(k.brand_hov, "VISUAL QA FIXTURE");
+    ImGui::PopFont();
+    ImGui::SameLine(0.0f, ui_px(10.0f));
+    ImGui::TextColored(k.muted, "%s", detail);
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+    ImGui::Dummy(ImVec2(0, ui_px(8.0f)));
+}
+
 void draw_shell(UiState& st) {
     // One-time background update check. Never touches the network from the
     // render thread; the check runs on a worker and only records state.
     // Safe mode deliberately skips it (and the catalog prefetch below).
-    if (!st.safe_mode && !st.update_check_started.exchange(true)) {
+    if (!st.fixture_mode && !st.safe_mode && !st.update_check_started.exchange(true)) {
         spawn_worker(st, std::thread([&st]() { do_update_check(st); }));
     }
 
@@ -13470,6 +16132,17 @@ void draw_shell(UiState& st) {
     ImGui::SetCursorPosX(0.0f);
     // Keep one page-level scroll surface for the main route. Individual cards
     // stay content-sized, so users do not get trapped in nested scroll areas.
+    // SetNextWindowScroll is intentionally issued before BeginChild: Dear
+    // ImGui applies SetScrollY() on a later Begin(), while a fixture screenshot
+    // needs a settled viewport in the frame it captures. The cached range is
+    // measured at the end of the preceding layout frame.
+    if (st.fixture_mode && st.fixture_scroll_position > 0 &&
+        st.fixture_scroll_host_max_y > 0.0f) {
+        const float requested_scroll = st.fixture_scroll_position == 1
+            ? st.fixture_scroll_host_max_y * 0.5f
+            : st.fixture_scroll_host_max_y;
+        ImGui::SetNextWindowScroll(ImVec2(-1.0f, requested_scroll));
+    }
     ImGui::BeginChild("##contentmax", ImVec2(content_width, 0),
                       ImGuiChildFlags_None, ImGuiWindowFlags_None);
     ImGui::PopStyleColor();
@@ -13477,6 +16150,11 @@ void draw_shell(UiState& st) {
     // pages begin. Controls inside a card open theirs through here instead of
     // opening a popup in the card's own window, where the page could never see it.
     open_requested_popup();
+    // The Admin surface shares the authenticated-operation lane with account
+    // work. Drain a completed Admin response before routing the page so a
+    // navigation away from Admin cannot leave that lane permanently reserved.
+    reconcile_admin_background_requests(st);
+    if (st.fixture_mode) draw_visual_fixture_notice();
 
     switch (st.active_tab) {
         case 0:
@@ -13556,6 +16234,21 @@ void draw_shell(UiState& st) {
             break;
     }
 
+    // The capture harness represents the complete scrollable surface without
+    // brittle wheel automation. Record the page range after content layout so
+    // the next frame can apply the requested deterministic position before
+    // drawing. SetScrollY also provides the normal Dear ImGui deferred path
+    // for the first frame that discovers overflow.
+    if (st.fixture_mode && st.fixture_scroll_position > 0) {
+        const float max_scroll = ImGui::GetScrollMaxY();
+        st.fixture_scroll_host_max_y = max_scroll;
+        if (max_scroll > 0.0f) {
+            const float requested_scroll = st.fixture_scroll_position == 1
+                ? max_scroll * 0.5f
+                : max_scroll;
+            ImGui::SetScrollY(requested_scroll);
+        }
+    }
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::EndChild();
@@ -13586,13 +16279,14 @@ void draw_shell(UiState& st) {
     
     // Account switcher dialog
     draw_account_switcher(st);
+    draw_account_action_dialogs(st);
     
     draw_notice_center(st);
     draw_local_feedback_dialog(st);
     draw_feedback_dialog(st);
     draw_known_issues_dialog(st);
     draw_recovery_dialog(st);
-    draw_launch_review(st);
+    draw_profile_data_confirmation(st);
     draw_downloads_panel(st);
 
     // V3 UI Components Integration
@@ -13699,7 +16393,7 @@ void draw_shell(UiState& st) {
         } else if (search_result.rfind("[Page] ", 0) == 0) {
             const std::string page = search_result.substr(7);
             if (page == "Settings") navigate_to(st, 12, 4);
-            else if (page == "Downloads") { st.sidebar_item = 4; st.active_tab = 17; st.downloads_open = true; }
+            else if (page == "Downloads") open_downloads_surface(st);
             else if (page == "Essentials") navigate_to(st, 23, 23);
             else if (page == "Bedrock Edition") navigate_to(st, 3, 3);
             else if (page == "Servers") navigate_to(st, 8, 8);
@@ -13707,6 +16401,30 @@ void draw_shell(UiState& st) {
     }
 
     // Render notification toasts
+    if (st.fixture_mode && st.fixture_case == "tooltip-nav") {
+        // A fixed, inert tooltip preview lets the evidence matrix verify
+        // tooltip contrast and wrapping without relying on a mouse position.
+        const ImGuiViewport* tooltip_vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(
+            ImVec2(tooltip_vp->WorkPos.x + ui_px(92.0f),
+                   tooltip_vp->WorkPos.y + ui_px(106.0f)),
+            ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_px(6.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui_px(10.0f), ui_px(7.0f)));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, k.surface2);
+        ImGui::PushStyleColor(ImGuiCol_Border, k.border);
+        ImGui::Begin("##fixture_tooltip_nav", nullptr,
+                     ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::TextUnformatted("Servers");
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ui_px(250.0f));
+        ImGui::TextColored(k.muted, "Manage local worlds and supervised server folders.");
+        ImGui::PopTextWrapPos();
+        ImGui::End();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
+    }
     draw_toasts();
 
     // Draw a resize grip in the bottom-right corner so the user has a visual
@@ -13801,7 +16519,12 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             return 0;
         }
         case WM_DESTROY:
-            if (app && app->cfg) {
+            // `--ui-snapshot` deliberately builds a bare, local fixture
+            // configuration.  Persisting it here would overwrite the
+            // reviewer-owned launcher.json beside the executable on every
+            // capture.  Snapshot teardown must be entirely read/write
+            // isolated from the normal launcher configuration.
+            if (app && app->cfg && !app->fixture_mode) {
                 WINDOWPLACEMENT wp{};
                 wp.length = sizeof(wp);
                 if (GetWindowPlacement(hwnd, &wp)) {
@@ -14005,8 +16728,12 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     UiState st;
     st.cfg = cfg;
     st.fixture_mode = options.fixture_mode;
+    g_fixture_font_mode = st.fixture_mode;
     st.safe_mode = options.safe_mode;
     st.capture_path = options.capture_path;
+    st.fixture_root = options.fixture_root;
+    st.fixture_case = options.fixture_case;
+    st.fixture_scroll_position = std::clamp(options.fixture_scroll_position, 0, 2);
     st.capture_after_frames = st.capture_path.empty() ? 0 :
         std::max(1, options.capture_after_frames > 0 ? options.capture_after_frames : 120);
     // Open on the dashboard shown in the reference design.
@@ -14022,7 +16749,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     std::wstring path = self;
     size_t slash = path.find_last_of(L"\\/");
     st.exe_dir = slash == std::wstring::npos ? L"." : path.substr(0, slash);
-    {
+    if (!st.fixture_mode) {
         const std::filesystem::path log_folder = std::filesystem::path(st.exe_dir) / L"logs";
         std::error_code log_error;
         std::filesystem::create_directories(log_folder, log_error);
@@ -14043,7 +16770,10 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     init_theme();
-    apply_theme();
+    // Apply every persisted theme/accessibility preference before the first
+    // frame and font build.  This keeps restart behavior identical to a live
+    // change made from Theme & Accessibility.
+    apply_configured_theme(*st.cfg);
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -14069,7 +16799,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     load_performance_settings(*st.cfg);
     load_social_settings(*st.cfg);
     load_mod_settings(*st.cfg);
-    {
+    if (!st.fixture_mode) {
         std::string account_error;
         std::lock_guard<std::mutex> lock(st.auth_mu);
         st.auth_checked = true;
@@ -14077,11 +16807,16 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
             st.auth_status = "Signed in as " + st.account.username;
         else
             st.auth_status = "No Microsoft account connected";
+    } else {
+        st.auth_checked = true;
+        st.auth_status = "Visual-review fixture: signed out";
     }
-    if (!cfg->supabase_url.empty() && !cfg->supabase_anon_key.empty()) {
+    // A visual fixture intentionally has no account backend. In particular,
+    // do not construct AccountManager here: its singleton loads persisted
+    // account sessions as part of construction even when refresh is disabled.
+    if (!st.fixture_mode && !cfg->supabase_url.empty() && !cfg->supabase_anon_key.empty()) {
         auto& supabase = aml::supabase::SupabaseManager::instance();
-        supabase.initialize(
-            cfg->supabase_url, cfg->supabase_anon_key, cfg->supabase_service_key);
+        supabase.initialize(cfg->supabase_url, cfg->supabase_anon_key);
         // Account services track the real auth state: they start when the user
         // signs in and stop when they sign out. Visual-review fixtures and safe
         // mode never open background account sessions.
@@ -14094,18 +16829,23 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         }
         auto& accounts = aml::account::AccountManager::instance();
         auto session = accounts.get_current_session();
-        if (!session.id.empty()) {
-            if (session.is_expired()) {
-                accounts.refresh_current_session();
-            } else {
-                const bool restored =
-                    supabase.auto_login(session.access_token, session.refresh_token);
-                // A restored session does not fire an auth-state change, so start
-                // the account services directly.
-                if (essentials_enabled && restored) sync_account_services(true);
-                // Kick off an early entitlements fetch from Supabase (Whop-synced
-                // subscription data) so the launcher knows the user's plan on first
-                // render without waiting for the Account page.
+        if (!st.fixture_mode && !st.safe_mode && !session.id.empty()) {
+            // Refreshing an expired protected session rotates the durable
+            // credentials; reload that record before restoring the in-memory
+            // provider session. The CLI follows this same sequence.
+            if (session.is_expired() && accounts.refresh_current_session()) {
+                session = accounts.get_current_session();
+            }
+            const bool restored = !session.access_token.empty() &&
+                supabase.auto_login(session.access_token, session.refresh_token);
+            // A restored session does not fire an auth-state change, so start
+            // account services and entitlement retrieval only after a real,
+            // current in-memory session was established.
+            if (essentials_enabled && restored) {
+                sync_account_services(true);
+                // Kick off an early entitlements fetch from Supabase
+                // (Whop-synced subscription data) so the launcher knows the
+                // user's plan on first render without waiting for Account.
                 aml::entitlements::EntitlementManager::instance().request_refresh_from_supabase();
             }
         }
@@ -14124,7 +16864,7 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         const std::string& page = options.initial_page;
         if (page == "discover") navigate_to(st, 2, 16);
         else if (page == "library" || page == "profiles") navigate_to(st, 3, 6);
-        else if (page == "downloads") navigate_to(st, 17, 17);
+        else if (page == "downloads") open_downloads_surface(st);
         else if (page == "account") navigate_to(st, 12, 15);
         else if (page == "servers") navigate_to(st, 8, 8);
         else if (page == "essentials" || page == "social") navigate_to(st, 23, 23);
@@ -14137,18 +16877,24 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
     }
     if (st.fixture_mode) {
         seed_visual_fixture(st);
-        st.active_tab = options.fixture_tab;
-        st.sidebar_item = options.fixture_sidebar;
-        st.settings_section = options.fixture_settings_section;
-        st.instance_detail_open = options.fixture_profile_detail;
-        st.instance_detail_tab = 0;
-        if (options.fixture_cloud) set_fixture_server_mode(1);
-        if (options.fixture_server_detail_tab >= 0)
-            set_fixture_server_detail(0, options.fixture_server_detail_tab);
-        if (options.fixture_project_detail && !st.home_packs.empty()) {
-            st.project_detail = st.home_packs.front();
-            st.project_detail_open = true;
-            st.project_detail_tab = 0;
+        if (!st.fixture_case.empty()) {
+            apply_visual_fixture_case(st);
+        } else {
+            // Preserve the original programmatic fixture inputs for any
+            // in-process test callers while the CLI uses named cases only.
+            st.active_tab = options.fixture_tab;
+            st.sidebar_item = options.fixture_sidebar;
+            st.settings_section = options.fixture_settings_section;
+            st.instance_detail_open = options.fixture_profile_detail;
+            st.instance_detail_tab = std::max(0, options.fixture_instance_tab);
+            if (options.fixture_cloud) set_fixture_server_mode(1);
+            if (options.fixture_server_detail_tab >= 0)
+                set_fixture_server_detail(0, options.fixture_server_detail_tab);
+            if (options.fixture_project_detail && !st.home_packs.empty())
+                st.project_detail_open = true;
+        }
+        if (st.project_detail_open && !st.home_packs.empty() && st.project_info.slug.empty()) {
+            if (st.project_detail.slug.empty()) st.project_detail = st.home_packs.front();
             st.project_loading = false;
             st.project_info = {};
             st.project_info.slug = st.project_detail.slug;
@@ -14266,18 +17012,16 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
             rebuild_dpi_resources(requested_scale);
         }
 
+        // Play goes straight to the launch worker. Every blocker the preflight
+        // used to list (missing launcher, missing Java, broken bridge, missing
+        // version) is reported by the worker with the real reason, so asking
+        // the player to approve a checklist first only added a click and ran
+        // the Java probes on the draw thread.
         if (st.pending_launch) {
             st.pending_launch = false;
-            if (!st.launch_review_approved) {
-                st.launch_checks = evaluate_launch(st, st.pending_id, st.pending_instance_dir);
-                if (has_failed_launch_check(st.launch_checks, false)) {
-                    st.launch_review_open = true;
-                } else {
-                    start_pending_launch(st);
-                }
-            } else {
-                start_pending_launch(st);
-            }
+            // A visual fixture can never launch a real profile, even if an
+            // interactive test clicked a legacy page action before rendering.
+            if (!st.fixture_mode) start_pending_launch(st);
         }
         if (!st.fixture_mode && !st.java_scanned && !st.fetching) {
             st.java_scanned = true;
@@ -14315,19 +17059,21 @@ bool run_window(config::Config* cfg, const RunOptions& options) {
         ImGui::NewFrame();
 
         if (!st.startup_metrics_logged) {
-            RECT render_client{};
-            GetClientRect(st.hwnd, &render_client);
-            log_line(st, L"[ui] render surface " +
-                std::to_wstring(render_client.right - render_client.left) + L"x" +
-                std::to_wstring(render_client.bottom - render_client.top) + L" at " +
-                std::to_wstring(GetDpiForWindow(st.hwnd)) + L" DPI");
+            if (!st.fixture_mode) {
+                RECT render_client{};
+                GetClientRect(st.hwnd, &render_client);
+                log_line(st, L"[ui] render surface " +
+                    std::to_wstring(render_client.right - render_client.left) + L"x" +
+                    std::to_wstring(render_client.bottom - render_client.top) + L" at " +
+                    std::to_wstring(GetDpiForWindow(st.hwnd)) + L" DPI");
+            }
             st.startup_metrics_logged = true;
             // After first frame renders, merge CJK glyphs so the launcher
             // appears instantly but gains full CJK support on next frame.
             // Uses merge_cjk_deferred_fonts() instead of build_font_atlas()
             // to avoid the Pixels != 0 assertion (ClearFonts() destroys
             // texture data after the OpenGL renderer is active).
-            merge_cjk_deferred_fonts();
+            if (!st.fixture_mode) merge_cjk_deferred_fonts();
         }
 
         // Fire deferred startup network fetches after a few frames so the

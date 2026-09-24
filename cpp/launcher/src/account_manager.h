@@ -123,6 +123,7 @@ public:
     bool disable_2fa(const std::string& code);
     bool verify_2fa_code(const std::string& code);
     aml::supabase::SupabaseSecuritySettings get_security_settings() const;
+    aml::supabase::SupabaseSecuritySettings get_security_settings(std::string* error) const;
     
     // Linked Accounts
     bool link_microsoft_account(const std::string& microsoft_token);
@@ -133,6 +134,18 @@ public:
     // Statistics and Activity
     AccountStats get_account_stats() const;
     std::vector<AccountActivity> get_recent_activity() const;
+    // The passive Account screen snapshots session and identity inputs on the
+    // UI thread, then supplies those copies here from a joined worker.  That
+    // avoids a worker reading mutable local-session state while a user signs
+    // out or switches accounts. refresh_error reports an unavailable remote
+    // source or an incomplete local fallback scan without fabricating an
+    // empty activity history.
+    std::vector<AccountActivity> get_recent_activity(
+        const std::string& expected_user_id,
+        const std::vector<AccountSession>& local_sessions,
+        const std::wstring& instances_dir,
+        std::string* refresh_error,
+        bool* used_local_fallback) const;
     
     // Account Deletion
     bool request_account_deletion();

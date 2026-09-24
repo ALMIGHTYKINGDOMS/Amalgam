@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <cstdint>
 #include <thread>
 
 #include "net.h"
@@ -47,8 +48,15 @@ struct EssentialsSignal {
 struct SupabaseConfig {
     std::string project_url;
     std::string anon_key;
-    std::string service_key;
     int timeout_seconds = 30;
+};
+
+// Keep remote logout scope explicit at every call site. Supabase treats an
+// omitted scope as a broader operation, which is inappropriate for the normal
+// "sign out of this launcher" action.
+enum class SignOutScope {
+    Local,
+    Global,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,7 +111,7 @@ public:
     AuthResponse verify_otp(const std::string& email, const std::string& token,
                             const std::string& type = "signup");
     AuthResponse refresh_token(const std::string& refresh_token);
-    bool sign_out(const std::string& access_token);
+    bool sign_out(const std::string& access_token, SignOutScope scope);
     AuthUser get_user(const std::string& access_token);
     AuthUser update_user(const std::string& access_token, 
                         const std::map<std::string, std::string>& updates);
@@ -115,6 +123,10 @@ public:
     AuthResponse request_account_deletion();
     AuthResponse confirm_account_deletion(const std::string& confirmation_code);
     SupabaseSecuritySettings get_security_settings() const;
+    // The legacy value-only form cannot distinguish an unavailable account
+    // service from a confirmed "2FA not enabled" response.  Passive UI
+    // surfaces use this overload to render an honest retryable error instead.
+    SupabaseSecuritySettings get_security_settings(std::string* error) const;
     
     // OAuth
     std::string get_oauth_url(const std::string& provider, const std::string& redirect_to);
@@ -252,11 +264,15 @@ public:
     // Status
     bool is_authenticated() const;
     bool is_current_user_staff();
-    const AuthUser& current_user() const;
-    const std::string& current_access_token() const;
+    AuthUser current_user() const;
+    std::string current_access_token() const;
     const std::string& project_url() const { return config_.project_url; }
     void set_access_token(const std::string& access_token);
     void set_session(const AuthUser& user);
+    // Clear only in-memory credentials and notify state observers. This does
+    // not make a network sign-out request and is used when a provisional
+    // restore token cannot be validated.
+    void clear_session();
     
     // Events
     void on_auth_state_change(const std::function<void(bool, const AuthUser&)>& callback);
@@ -278,6 +294,10 @@ private:
     std::map<std::string, std::unique_ptr<PollingSubscription>> realtime_subscriptions_;
     
     mutable std::mutex mutex_;
+    // The credential tuple must be copied or replaced as one unit. Realtime
+    // subscription ownership uses `mutex_`; keep auth state isolated so a
+    // callback cannot deadlock a transport request by re-entering Supabase.
+    mutable std::mutex auth_mutex_;
     std::atomic<bool> authenticated_{false};
     
     // Internal helpers
@@ -295,6 +315,7 @@ private:
     std::string get_bearer_header() const;
     std::string url_encode(const std::string& value) const;
     Json::Value parse_response(const std::string& response, std::string* error = nullptr) const;
+    void commit_session(const AuthUser& user, bool notify_auth_observers);
 };
 
 // ---------------------------------------------------------------------------
@@ -536,10 +557,10 @@ class SupabaseManager {
 public:
     static SupabaseManager& instance();
     
-    // Initialize
+    // Desktop clients accept only their public/publishable (legacy anon) key.
+    // Privileged service-role keys are intentionally excluded from this API.
     bool initialize(const std::string& project_url = "",
-                   const std::string& anon_key = "",
-                   const std::string& service_key = "");
+                    const std::string& anon_key = "");
     void shutdown();
     
     // Get client
@@ -550,7 +571,10 @@ public:
                                           const std::map<std::string, std::string>& metadata = {});
     SupabaseClient::AuthResponse sign_in(const std::string& email, const std::string& password);
     SupabaseClient::AuthResponse resend_signup_confirmation(const std::string& email);
-    bool sign_out();
+    SupabaseClient::AuthResponse verify_otp(const std::string& email,
+                                            const std::string& token,
+                                            const std::string& type = "signup");
+    bool sign_out(SignOutScope scope);
     SupabaseUser get_current_user();
     
     // User management
@@ -565,6 +589,7 @@ public:
     SupabaseClient::AuthResponse request_account_deletion();
     SupabaseClient::AuthResponse confirm_account_deletion(const std::string& confirmation_code);
     SupabaseSecuritySettings get_security_settings() const;
+    SupabaseSecuritySettings get_security_settings(std::string* error) const;
     
     // Server management
     std::vector<SupabaseServer> get_servers();
@@ -603,6 +628,10 @@ public:
     // Status
     bool is_initialized() const;
     bool is_authenticated() const;
+    // Changes whenever this process establishes, refreshes, replaces, or
+    // clears Supabase credentials. UI work captures it with the account id so
+    // a same-user sign-out/sign-in cannot inherit an earlier session's result.
+    uint64_t session_generation() const;
     std::string get_project_url() const;
     
     // Auto-login
@@ -680,6 +709,7 @@ private:
     
     std::unique_ptr<SupabaseClient> client_;
     std::atomic<bool> initialized_{false};
+    std::atomic_uint64_t session_generation_{0};
     mutable std::mutex mutex_;
     
     // Prevent copying

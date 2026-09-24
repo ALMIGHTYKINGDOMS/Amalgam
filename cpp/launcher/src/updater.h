@@ -6,9 +6,11 @@
 // manifest endpoint is a backend-owned constant (override-able only for
 // tests/debug via config, never from user input), and every payload is
 // verified by exact size + SHA-256 before it is ever allowed to replace a
-// live file. Replacement is staged outside the running executable and
-// applied by a generated helper batch that keeps a last-known-good backup
-// and restores it on any failure.
+// live file. A signed archive must also contain a validated full-release
+// component manifest and hash inventory. Replacement is staged outside the
+// running executable and applied by a generated helper batch that updates
+// only product-owned components, retains a last-known-good transaction plan,
+// and restores every replaced component on failure.
 
 #include <atomic>
 #include <string>
@@ -24,7 +26,7 @@ struct UpdateInfo {
     std::string download_url;    // https://... backend-owned payload URL
     std::string sha256;          // hex digest of the payload (64 chars)
     std::string signature;       // optional RSA-SHA256 over the PAYLOAD bytes
-    std::string manifest_signature;  // optional RSA-SHA256 over the canonical
+    std::string manifest_signature;  // required RSA-SHA256 over the canonical
                                      // manifest fields (binds version, channel,
                                      // URL, size, hash, min_version)
     std::string min_version;     // lowest launcher version this update supports
@@ -75,9 +77,10 @@ std::wstring default_manifest_url();
 // Validate raw manifest text into UpdateInfo. This is the single validation
 // seam: fetch_manifest() downloads the text and delegates here, and tests
 // exercise the same code with crafted documents. A remote SHA-256 is NOT
-// treated as authentication on its own: payload signatures are verified
-// against a configured public key (see set_signing_public_key) and signed
-// manifests are rejected when no key is configured.
+// authentication on its own. Every accepted manifest must have a valid
+// 64-character SHA-256, a positive bounded payload size, a valid manifest
+// signature, and a configured update-signing public key. The optional payload
+// signature is checked during staging when present.
 bool parse_manifest_text(const std::string& text, UpdateInfo& out, std::string* err);
 
 // Fetch and validate the update manifest. `url` is the backend endpoint,
@@ -99,14 +102,15 @@ bool verify_manifest_signature(const std::string& pem_public_key,
 
 // Configure the payload/manifest-signing public key (PEM, "BEGIN PUBLIC
 // KEY"). The private key must never exist in the repository; signing is a
-// release-engineering step. Until a key is configured, any manifest that
-// carries a signature is rejected (fail closed).
+// release-engineering step. Production initializes this from the build-time
+// embedded PEM. Until a key is configured, every remote manifest is rejected
+// (fail closed). This setter also permits isolated unit-test fixtures.
 void set_signing_public_key(const std::string& pem);
 bool has_signing_key();
 
 // Configure the verification key from the build-time embedded PEM (see
 // AMALGAM_UPDATER_PUBLIC_KEY_FILE). No-op when the release build was
-// configured without a key, leaving signed manifests fail closed.
+// configured without a key, leaving all remote manifests fail closed.
 void init_from_embedded_key();
 
 // Verify an RSA-SHA256 signature over a payload file. `base64_signature` is
@@ -117,23 +121,27 @@ bool verify_payload_signature(const std::string& pem_public_key,
                               const std::wstring& payload_path,
                               std::string* err);
 
-// Download the payload into the staging directory next to the executable
-// and verify exact size + SHA-256. Never touches the running executable.
-// On success `staged_path` is the verified archive path.
+// Revalidate the authenticated manifest, then download the payload into the
+// staging directory next to the executable and verify exact size + SHA-256.
+// Never touches the running executable. On success `staged_path` is the
+// verified archive path.
 bool stage_update(const UpdateInfo& info, const std::wstring& exe_dir,
                   std::wstring& staged_path, std::string* err);
 
-// Prepare the swap for a staged update: extract the payload to a staging
-// directory, validate that it actually contains a launcher executable, and
-// generate the helper batch that (after this process exits) backs up the
-// current executable, replaces it with the new one, and relaunches. Returns
-// the batch path on success.
+// Prepare a full release transaction for a staged update: revalidate the
+// authenticated archive, extract it to staging, validate its component
+// manifest/hash inventory, and generate an all-component helper plan. The
+// helper updates only the declared product files (EXE, DLL, bridges, Bedrock,
+// packaged assets and release metadata); it never addresses live config,
+// profiles, instances, managed Java, or the update workspace. Returns the
+// helper batch path on success.
 bool prepare_apply(const UpdateInfo& info, const std::wstring& exe_dir,
                    const std::wstring& staged_path, std::wstring& helper_path,
                    std::string* err);
 
-// Restore the last-known-good executable over the current one. Used when a
-// staged update must be discarded (e.g. the payload failed validation).
+// Restore every product component recorded by the most recent completed
+// transactional backup. A legacy executable-only backup remains supported for
+// upgrades created by older launcher builds.
 bool rollback_update(const std::wstring& exe_dir, std::string& error);
 
 }  // namespace aml::updater

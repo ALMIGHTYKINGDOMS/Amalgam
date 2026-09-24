@@ -15,6 +15,19 @@ namespace aml::performance {
 
 namespace {
 
+// A missing child is expected before we create a recovery folder or staging
+// file.  MSVC may surface that state as ERROR_FILE_NOT_FOUND/PATH_NOT_FOUND
+// from non-throwing symlink_status, so do not confuse it with a redirected or
+// inaccessible path.
+bool allow_missing_path_error(std::error_code& ec) {
+    if (!ec) return true;
+    if (ec.value() == ERROR_FILE_NOT_FOUND || ec.value() == ERROR_PATH_NOT_FOUND) {
+        ec.clear();
+        return true;
+    }
+    return false;
+}
+
 std::string lower(std::string value) {
     for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return value;
@@ -78,6 +91,48 @@ void add_heavy_options(Tuning& tuning) {
         {"renderClouds", "false"}, {"entityShadows", "false"},
         {"mipmapLevels", "1"}, {"enableVsync", "false"}, {"maxFps", "120"}
     };
+}
+
+bool require_real_directory(const std::filesystem::path& directory, const char* label,
+                            std::string* err) {
+    std::error_code ec;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(directory, ec);
+    if (ec) {
+        if (err) *err = std::string("could not inspect ") + label + ": " + ec.message();
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (err) *err = std::string("could not inspect ") + label + " attributes";
+        return false;
+    }
+    if (std::filesystem::is_symlink(status) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !std::filesystem::is_directory(status)) {
+        if (err) *err = std::string(label) + " must be a real directory inside the selected profile";
+        return false;
+    }
+    return true;
+}
+
+bool require_regular_profile_file(const std::filesystem::path& path, const char* label,
+                                  std::string* err) {
+    std::error_code ec;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(path, ec);
+    if (ec) {
+        if (err) *err = std::string("could not inspect ") + label + ": " + ec.message();
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (err) *err = std::string("could not inspect ") + label + " attributes";
+        return false;
+    }
+    if (std::filesystem::is_symlink(status) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !std::filesystem::is_regular_file(status)) {
+        if (err) *err = std::string(label) + " must be a regular file inside the selected profile";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -228,18 +283,94 @@ bool apply_game_options(const std::wstring& instance_dir, const std::string& pro
 }
 
 bool restore_game_options(const std::wstring& instance_dir, std::string* err) {
-    const std::wstring backup = instance_dir + L"\\options.txt.amalgam-original";
-    const std::wstring path = instance_dir + L"\\options.txt";
-    if (!net::file_exists(backup)) {
-        if (err) *err = "no Amalgam options backup exists";
+    if (err) err->clear();
+    const std::filesystem::path profile(instance_dir);
+    if (!require_real_directory(profile, "selected profile directory", err)) return false;
+    const std::filesystem::path backup_path = profile / L"options.txt.amalgam-original";
+    const std::filesystem::path options_path = profile / L"options.txt";
+    if (!require_regular_profile_file(backup_path, "Amalgam options backup", err)) {
         return false;
     }
-    if (!CopyFileW(backup.c_str(), path.c_str(), FALSE)) {
-        if (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS) {
-            DeleteFileW(path.c_str());
-            if (CopyFileW(backup.c_str(), path.c_str(), FALSE)) return true;
+    std::error_code ec;
+    const std::filesystem::file_status options_status =
+        std::filesystem::symlink_status(options_path, ec);
+    if (!allow_missing_path_error(ec) || (std::filesystem::exists(options_status) &&
+               (std::filesystem::is_symlink(options_status) ||
+                !std::filesystem::is_regular_file(options_status)))) {
+        if (err) *err = ec ? "could not inspect current game options: " + ec.message()
+                           : "current game options must be a regular file inside the selected profile";
+        return false;
+    }
+    const std::wstring backup = backup_path.wstring();
+    const std::wstring path = options_path.wstring();
+    // Never delete the current options before a replacement is ready. Preserve
+    // the current state in a recoverable per-profile folder, stage the known
+    // original, then atomically replace options.txt on the same volume.
+    const std::filesystem::path recovery_dir =
+        profile / L".amalgam-backups";
+    const std::filesystem::file_status recovery_status =
+        std::filesystem::symlink_status(recovery_dir, ec);
+    if (!allow_missing_path_error(ec) || (std::filesystem::exists(recovery_status) &&
+               (std::filesystem::is_symlink(recovery_status) ||
+                !std::filesystem::is_directory(recovery_status)))) {
+        if (err) *err = ec ? "could not inspect the options recovery folder: " + ec.message()
+                           : "options recovery folder must remain inside the selected profile";
+        return false;
+    }
+    std::filesystem::create_directories(recovery_dir, ec);
+    if (ec) {
+        if (err) *err = "could not create the options recovery folder";
+        return false;
+    }
+    if (!require_real_directory(recovery_dir, "options recovery folder", err)) return false;
+
+    if (std::filesystem::exists(options_status)) {
+        std::filesystem::path recovery;
+        bool copied_current = false;
+        for (unsigned int attempt = 0; attempt < 100; ++attempt) {
+            recovery = recovery_dir /
+                (L"options-before-restore-" + std::to_wstring(GetTickCount64()) +
+                 L"-" + std::to_wstring(attempt) + L".txt");
+            const bool recovery_exists = std::filesystem::exists(recovery, ec);
+            if (!allow_missing_path_error(ec)) {
+                if (err) *err = "could not inspect options recovery file: " + ec.message();
+                return false;
+            }
+            if (recovery_exists) continue;
+            if (CopyFileW(path.c_str(), recovery.c_str(), FALSE)) {
+                copied_current = true;
+                break;
+            }
         }
-        if (err) *err = "could not restore original options";
+        if (!copied_current) {
+            if (err) *err = "could not preserve current options before restore";
+            return false;
+        }
+    }
+
+    const std::wstring staged = path + L".amalgam-restore-staging";
+    const std::filesystem::path staged_path(staged);
+    const std::filesystem::file_status staged_status = std::filesystem::symlink_status(staged_path, ec);
+    if (!allow_missing_path_error(ec) || (std::filesystem::exists(staged_status) &&
+               (std::filesystem::is_symlink(staged_status) ||
+                !std::filesystem::is_regular_file(staged_status)))) {
+        if (err) *err = ec ? "could not inspect options restore staging file: " + ec.message()
+                           : "options restore staging path is invalid";
+        return false;
+    }
+    if (std::filesystem::exists(staged_status)) std::filesystem::remove(staged_path, ec);
+    if (ec) {
+        if (err) *err = "could not clear options restore staging file: " + ec.message();
+        return false;
+    }
+    if (!CopyFileW(backup.c_str(), staged.c_str(), FALSE)) {
+        if (err) *err = "could not stage original options for restore";
+        return false;
+    }
+    if (!MoveFileExW(staged.c_str(), path.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(staged.c_str());
+        if (err) *err = "could not activate restored options";
         return false;
     }
     return true;

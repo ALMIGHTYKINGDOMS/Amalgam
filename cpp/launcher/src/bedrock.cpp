@@ -222,7 +222,27 @@ bool profile_backup_path(const BedrockProfile& profile, const BedrockBackupEntry
 
     std::filesystem::path root;
     if (!profile_root_path(profile, root, err)) return false;
-    return absolute_path(root / L"backups" / net::to_wide(backup.id), output, err);
+    std::error_code ec;
+    const auto profile_status = std::filesystem::symlink_status(root, ec);
+    if (ec || !std::filesystem::is_directory(profile_status) ||
+        std::filesystem::is_symlink(profile_status)) {
+        if (err) {
+            *err = ec ? "cannot inspect Bedrock profile: " + ec.message()
+                      : "Bedrock profile is not a safe directory: " + root.string();
+        }
+        return false;
+    }
+    const std::filesystem::path backups_root = root / L"backups";
+    const auto backups_status = std::filesystem::symlink_status(backups_root, ec);
+    if (ec || !std::filesystem::is_directory(backups_status) ||
+        std::filesystem::is_symlink(backups_status)) {
+        if (err) {
+            *err = ec ? "cannot inspect Bedrock backups: " + ec.message()
+                      : "Bedrock backups are not in a safe directory: " + backups_root.string();
+        }
+        return false;
+    }
+    return absolute_path(backups_root / net::to_wide(backup.id), output, err);
 }
 
 bool ensure_directory(const std::filesystem::path& path, std::string* err,
@@ -359,6 +379,110 @@ bool copy_directory(const std::filesystem::path& source,
     if (!std::filesystem::is_directory(destination, ec) || ec) {
         if (err) *err = ec ? "cannot verify copied directory: " + ec.message()
                            : "copy did not create a directory";
+        return false;
+    }
+    return true;
+}
+
+// A restore may only replace live worlds after the staged copy represents the
+// exact backup tree.  std::filesystem::copy reports I/O failures, but a full
+// structure, size, and SHA-256 comparison catches an incomplete or altered
+// staged tree before any current world data is moved.
+bool verify_directory_copy(const std::filesystem::path& source,
+                           const std::filesystem::path& destination,
+                           std::string* err) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(source, ec) || ec) {
+        if (err) *err = ec ? "cannot inspect source backup: " + ec.message()
+                           : "source backup directory is missing";
+        return false;
+    }
+    if (!std::filesystem::is_directory(destination, ec) || ec) {
+        if (err) *err = ec ? "cannot inspect staged restore: " + ec.message()
+                           : "staged restore directory is missing";
+        return false;
+    }
+
+    std::filesystem::recursive_directory_iterator it(source, ec);
+    const std::filesystem::recursive_directory_iterator end;
+    while (it != end) {
+        if (ec) {
+            if (err) *err = "cannot enumerate source backup: " + ec.message();
+            return false;
+        }
+        const std::filesystem::path source_entry = it->path();
+        std::error_code entry_ec;
+        const auto source_status = it->symlink_status(entry_ec);
+        if (entry_ec) {
+            if (err) *err = "cannot inspect source backup entry: " + entry_ec.message();
+            return false;
+        }
+        if (std::filesystem::is_symlink(source_status)) {
+            if (err) *err = "Bedrock backup contains an unsupported symbolic link";
+            return false;
+        }
+
+        const std::filesystem::path relative = source_entry.lexically_relative(source);
+        bool unsafe_relative = relative.empty() || relative.is_absolute();
+        for (const auto& component : relative) {
+            if (component == L"." || component == L"..") {
+                unsafe_relative = true;
+                break;
+            }
+        }
+        if (unsafe_relative) {
+            if (err) *err = "Bedrock backup contains an unsafe relative path";
+            return false;
+        }
+        const std::filesystem::path staged_entry = destination / relative;
+        const auto staged_status = std::filesystem::symlink_status(staged_entry, entry_ec);
+        if (entry_ec) {
+            if (err) *err = "cannot inspect staged restore entry: " + entry_ec.message();
+            return false;
+        }
+        if (std::filesystem::is_symlink(staged_status)) {
+            if (err) *err = "staged restore contains an unexpected symbolic link";
+            return false;
+        }
+
+        if (std::filesystem::is_directory(source_status)) {
+            if (!std::filesystem::is_directory(staged_status)) {
+                if (err) *err = "staged restore is missing a backup directory";
+                return false;
+            }
+        } else if (std::filesystem::is_regular_file(source_status)) {
+            if (!std::filesystem::is_regular_file(staged_status)) {
+                if (err) *err = "staged restore is missing a backup file";
+                return false;
+            }
+            const uintmax_t source_size = std::filesystem::file_size(source_entry, entry_ec);
+            if (entry_ec) {
+                if (err) *err = "cannot measure source backup file: " + entry_ec.message();
+                return false;
+            }
+            const uintmax_t staged_size = std::filesystem::file_size(staged_entry, entry_ec);
+            if (entry_ec) {
+                if (err) *err = "cannot measure staged restore file: " + entry_ec.message();
+                return false;
+            }
+            if (source_size != staged_size) {
+                if (err) *err = "staged restore file size does not match the backup";
+                return false;
+            }
+            const std::string source_hash = net::sha256_file(source_entry.wstring());
+            const std::string staged_hash = net::sha256_file(staged_entry.wstring());
+            if (source_hash.empty() || staged_hash.empty() || source_hash != staged_hash) {
+                if (err) *err = "staged restore file hash does not match the backup";
+                return false;
+            }
+        } else {
+            if (err) *err = "Bedrock backup contains an unsupported file type";
+            return false;
+        }
+        it.increment(ec);
+    }
+    if (ec) {
+        if (err) *err = "cannot finish enumerating source backup: " + ec.message();
         return false;
     }
     return true;
@@ -504,6 +628,19 @@ bool launch(std::string* err) {
 }
 
 std::wstring data_dir(std::string* err) {
+#if defined(AML_BEDROCK_TESTING)
+    // The native Bedrock regression target is intentionally independent from
+    // the installed UWP package and all user profile data.  Production builds
+    // do not compile this override.
+    const std::wstring test_data_dir = get_env(L"AMALGAM_BEDROCK_TEST_DATA_DIR");
+    if (!test_data_dir.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(test_data_dir, ec) && !ec) return test_data_dir;
+        if (err) *err = ec ? "cannot inspect Bedrock test data directory: " + ec.message()
+                           : "Bedrock test data directory does not exist";
+        return L"";
+    }
+#endif
     return detect(err);
 }
 
@@ -1253,6 +1390,66 @@ std::vector<BedrockWorldEntry> list_worlds(const BedrockProfile& profile,
     return worlds;
 }
 
+bool delete_world(const BedrockProfile& profile, const std::string& world_folder,
+                  std::string* err) {
+    if (err) err->clear();
+    if (world_folder.empty() || !safe_path_component(net::to_wide(world_folder))) {
+        if (err) *err = "invalid Bedrock world folder";
+        return false;
+    }
+
+    std::filesystem::path profile_root;
+    if (!profile_root_path(profile, profile_root, err)) return false;
+    std::error_code ec;
+    const auto profile_status = std::filesystem::symlink_status(profile_root, ec);
+    if (ec || !std::filesystem::is_directory(profile_status) ||
+        std::filesystem::is_symlink(profile_status)) {
+        if (err) {
+            *err = ec ? "cannot inspect Bedrock profile: " + ec.message()
+                      : "Bedrock profile is not a safe directory: " + profile_root.string();
+        }
+        return false;
+    }
+    const std::filesystem::path saves_dir = profile_root / L"saves";
+    const auto saves_status = std::filesystem::symlink_status(saves_dir, ec);
+    if (ec || !std::filesystem::is_directory(saves_status) ||
+        std::filesystem::is_symlink(saves_status)) {
+        if (err) {
+            *err = ec ? "cannot inspect Bedrock worlds: " + ec.message()
+                      : "Bedrock worlds are not in a safe directory: " + saves_dir.string();
+        }
+        return false;
+    }
+    const std::filesystem::path world_dir = saves_dir / net::to_wide(world_folder);
+    const auto status = std::filesystem::symlink_status(world_dir, ec);
+    if (ec) {
+        if (err) *err = "cannot inspect Bedrock world: " + ec.message();
+        return false;
+    }
+    if (status.type() == std::filesystem::file_type::not_found) {
+        if (err) *err = "Bedrock world not found: " + world_dir.string();
+        return false;
+    }
+    if (!std::filesystem::is_directory(status) || std::filesystem::is_symlink(status)) {
+        if (err) *err = "Bedrock world is not a safe directory: " + world_dir.string();
+        return false;
+    }
+
+    const uintmax_t removed = std::filesystem::remove_all(world_dir, ec);
+    if (ec) {
+        if (err) {
+            *err = "cannot delete Bedrock world: " + ec.message() +
+                   ". Some world content may already have been removed; refresh before retrying.";
+        }
+        return false;
+    }
+    if (removed == 0) {
+        if (err) *err = "Bedrock world was not deleted";
+        return false;
+    }
+    return true;
+}
+
 bool backup_world(const BedrockProfile& profile, const std::string& world_folder,
                   std::wstring& out_path, std::string* err) {
     if (err) err->clear();
@@ -1707,26 +1904,107 @@ bool restore_backup(const BedrockProfile& profile, const BedrockBackupEntry& bac
     if (!profile_root_path(profile, profile_root, err)) return false;
     const std::filesystem::path dst = profile_root / L"saves";
     std::error_code ec;
-    if (!std::filesystem::is_directory(src, ec) || ec) {
+    const auto source_status = std::filesystem::symlink_status(src, ec);
+    if (ec || !std::filesystem::is_directory(source_status) ||
+        std::filesystem::is_symlink(source_status)) {
         if (err) *err = ec ? "cannot inspect Bedrock backup: " + ec.message()
-                           : "Bedrock backup not found: " + src.string();
+                            : "Bedrock backup is not a safe directory: " + src.string();
         return false;
     }
-    std::filesystem::remove_all(dst, ec);
-    if (ec) {
-        if (err) *err = "Restore failed while removing current worlds: " + ec.message();
-        return false;
-    }
+
     if (!ensure_directory(profile_root, err, "Bedrock profile directory")) return false;
-    std::filesystem::copy(src, dst,
-                          std::filesystem::copy_options::recursive, ec);
+    const std::filesystem::path backup_dir = profile_root / L"backups";
+    if (!ensure_directory(backup_dir, err, "Bedrock backup directory")) return false;
+
+    const auto destination_status = std::filesystem::symlink_status(dst, ec);
     if (ec) {
-        if (err) *err = "Restore failed: " + ec.message();
+        if (err) *err = "cannot inspect current Bedrock worlds: " + ec.message();
         return false;
     }
-    if (!std::filesystem::is_directory(dst, ec) || ec) {
-        if (err) *err = ec ? "cannot verify restored worlds: " + ec.message()
-                           : "restored worlds directory was not created";
+    const bool has_current_worlds = destination_status.type() != std::filesystem::file_type::not_found;
+    if (has_current_worlds &&
+        (!std::filesystem::is_directory(destination_status) ||
+         std::filesystem::is_symlink(destination_status))) {
+        if (err) *err = "current Bedrock worlds are not a safe directory";
+        return false;
+    }
+
+    // Copy and verify the selected backup in a fresh sibling directory before
+    // the live saves path changes.  Keeping the stage beside the destination
+    // makes its later rename a same-volume operation.
+    std::filesystem::path staged;
+    if (!unique_child(profile_root, "restore-stage-" + backup.id, staged, err)) return false;
+    auto discard_staged = [&](std::string& message) {
+        std::string cleanup_error;
+        if (!remove_tree(staged, &cleanup_error)) {
+            if (!message.empty()) message += "; ";
+            message += cleanup_error;
+        }
+    };
+    if (!copy_directory(src, staged, err)) {
+        std::string message = err && !err->empty() ? *err : "failed to stage Bedrock backup";
+        discard_staged(message);
+        if (err) *err = message;
+        return false;
+    }
+    std::string verification_error;
+    if (!verify_directory_copy(src, staged, &verification_error)) {
+        discard_staged(verification_error);
+        if (err) *err = verification_error;
+        return false;
+    }
+
+    std::filesystem::path safety_backup;
+    if (has_current_worlds) {
+        time_t now = time(nullptr);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", localtime(&now));
+        if (!unique_child(backup_dir, "pre_restore_" + std::string(ts), safety_backup, err)) {
+            std::string message = err && !err->empty() ? *err : "cannot create automatic pre-restore backup path";
+            discard_staged(message);
+            if (err) *err = message;
+            return false;
+        }
+
+        // The current worlds are preserved by an atomic same-volume rename
+        // into the normal backups collection.  We never delete live worlds as
+        // part of a restore.
+        std::filesystem::rename(dst, safety_backup, ec);
+        if (ec) {
+            std::string message = "Restore failed while preserving current worlds: " + ec.message();
+            discard_staged(message);
+            if (err) *err = message;
+            return false;
+        }
+    }
+
+#if defined(AML_BEDROCK_TESTING)
+    // Exercise the post-preservation rollback path without relying on fragile
+    // Windows file-lock behavior in the native regression suite.
+    if (!get_env(L"AMALGAM_BEDROCK_TEST_FAIL_ACTIVATION").empty()) {
+        ec = std::error_code(ERROR_ACCESS_DENIED, std::system_category());
+    } else {
+        std::filesystem::rename(staged, dst, ec);
+    }
+#else
+    std::filesystem::rename(staged, dst, ec);
+#endif
+    if (ec) {
+        std::string message = "Restore failed while activating the verified backup: " + ec.message();
+        if (has_current_worlds) {
+            std::error_code rollback_ec;
+            std::filesystem::rename(safety_backup, dst, rollback_ec);
+            if (rollback_ec) {
+                message += "; automatic rollback could not move prior worlds back, but they remain safely at " +
+                           safety_backup.string();
+            } else {
+                discard_staged(message);
+                message += "; original worlds were restored automatically";
+            }
+        } else {
+            message += "; the verified staged copy remains at " + staged.string();
+        }
+        if (err) *err = message;
         return false;
     }
     return true;
@@ -1738,14 +2016,25 @@ bool delete_backup(const BedrockProfile& profile, const BedrockBackupEntry& back
     std::filesystem::path path;
     if (!profile_backup_path(profile, backup, path, err)) return false;
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec)) {
-        if (err) *err = ec ? "cannot inspect Bedrock backup: " + ec.message()
-                           : "Bedrock backup not found: " + path.string();
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec) {
+        if (err) *err = "cannot inspect Bedrock backup: " + ec.message();
+        return false;
+    }
+    if (status.type() == std::filesystem::file_type::not_found) {
+        if (err) *err = "Bedrock backup not found: " + path.string();
+        return false;
+    }
+    if (!std::filesystem::is_directory(status) || std::filesystem::is_symlink(status)) {
+        if (err) *err = "Bedrock backup is not a safe directory: " + path.string();
         return false;
     }
     const uintmax_t removed = std::filesystem::remove_all(path, ec);
     if (ec) {
-        if (err) *err = "cannot delete Bedrock backup: " + ec.message();
+        if (err) {
+            *err = "cannot delete Bedrock backup: " + ec.message() +
+                   ". Some backup content may already have been removed; refresh before retrying.";
+        }
         return false;
     }
     if (removed == 0) {

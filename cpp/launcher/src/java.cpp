@@ -254,6 +254,66 @@ bool JavaRuntimeValidator::ValidateJava(const JavaRuntime& runtime, std::string*
     return checked.major == runtime.major && !checked.home.empty();
 }
 
+std::wstring normalize_configured_runtime_home(const std::wstring& configured_path) {
+    if (configured_path.empty()) return std::wstring();
+
+    std::filesystem::path path(configured_path);
+    path = path.lexically_normal();
+    std::wstring normalized = path.wstring();
+    while (normalized.size() > 3 &&
+           (normalized.back() == L'\\' || normalized.back() == L'/')) {
+        normalized.pop_back();
+    }
+    if (normalized.empty()) return std::wstring();
+
+    std::filesystem::path normalized_path(normalized);
+    const std::wstring leaf = normalized_path.filename().wstring();
+    const auto equal_ignoring_case = [](const std::wstring& a, const wchar_t* b) {
+        return _wcsicmp(a.c_str(), b) == 0;
+    };
+    if (equal_ignoring_case(leaf, L"java.exe") || equal_ignoring_case(leaf, L"javaw.exe")) {
+        // ...\bin\java[ w ].exe -> Java home, not the bin directory.
+        return normalized_path.parent_path().parent_path().wstring();
+    }
+    if (equal_ignoring_case(leaf, L"bin")) {
+        // Accept the common convenience form C:\\JDK\\bin as well.  The
+        // subsequent validator reports a missing sibling java.exe if this was
+        // not actually a runtime bin directory, rather than probing bin\\bin.
+        return normalized_path.parent_path().wstring();
+    }
+    return normalized;
+}
+
+bool ValidateConfiguredRuntime(const std::wstring& configured_path, int expected_major,
+                              JavaRuntime* runtime, std::string* error) {
+    if (runtime) *runtime = JavaRuntime();
+    if (configured_path.empty()) {
+        if (error) *error = "configured Java path is empty";
+        return false;
+    }
+    if (expected_major <= 0) {
+        if (error) *error = "requested Java major version is invalid";
+        return false;
+    }
+
+    JavaRuntime candidate;
+    candidate.major = expected_major;
+    candidate.home = normalize_configured_runtime_home(configured_path);
+    candidate.executable = candidate.home + L"\\bin\\java.exe";
+    candidate.javaw = candidate.home + L"\\bin\\javaw.exe";
+    if (candidate.home.empty()) {
+        if (error) *error = "configured Java path has no runtime home";
+        return false;
+    }
+    if (!JavaRuntimeValidator::ValidateJava(candidate, error)) return false;
+
+    // Preserve the normalized executable locations for the caller, while the
+    // existing validator has already proven that java.exe reports exactly the
+    // requested runtime major.
+    if (runtime) *runtime = candidate;
+    return true;
+}
+
 JavaRuntimeRegistry::JavaRuntimeRegistry(std::wstring root) : root_(std::move(root)) {}
 
 JavaRuntime JavaRuntimeRegistry::GetRuntime(int major) const {

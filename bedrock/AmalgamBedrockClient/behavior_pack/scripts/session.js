@@ -1,11 +1,11 @@
-import { getState, updateSession } from "./util/state.js";
+import { getPlayerSession, updatePlayerSession } from "./util/state.js";
 
 export function startSession(player) {
-  updateSession({ startedAt: Date.now(), playerName: player?.name ?? "Player" });
+  updatePlayerSession(player, { startedAt: Date.now(), playerName: player?.name ?? "Player" });
 }
 
-export function sessionSummary() {
-  const session = getState().session;
+export function sessionSummary(player) {
+  const session = getPlayerSession(player);
   return {
     worldName: session.worldName || "Current World",
     dimension: session.dimension || "unknown",

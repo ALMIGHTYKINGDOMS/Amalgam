@@ -6,6 +6,73 @@ import fs from "node:fs";
 import path from "node:path";
 import { appendConsoleLine, recoverConsoleLog } from "./console-log.js";
 
+// server_instances.id is a PostgreSQL UUID. Keep the storage key tied to that
+// immutable control-plane identity, rather than to a mutable, user-provided
+// display name. The explicit validation also makes this boundary fail closed
+// if a malformed operation reaches the agent.
+const SERVER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Keep server.properties as a typed, one-line key/value document.  Accepting
+// arbitrary keys or newlines here would let an operation payload add unrelated
+// settings (for example, an injected online-mode=false line).  The allow-list
+// covers the standard Java server properties that Amalgam deliberately exposes
+// while keeping the filesystem and process boundary closed to surprise keys.
+const SERVER_PROPERTY_DEFAULTS = Object.freeze({
+  "server-port": 25565,
+  "max-players": 20,
+  "motd": "An Amalgam Server",
+  "gamemode": "survival",
+  "difficulty": "normal",
+  "whitelist": false,
+  "online-mode": true,
+  "level-name": "world",
+  "level-seed": "",
+  "view-distance": 10,
+  "simulation-distance": 10,
+  "max-world-size": 29999984,
+  "pvp": true,
+  "allow-nether": true,
+  "spawn-protection": 16,
+  "enable-command-block": false,
+  "spawn-monsters": true,
+  "spawn-animals": true,
+  "spawn-npcs": true,
+  "generate-structures": true,
+  "allow-flight": false,
+  "force-gamemode": false,
+  "hardcore": false,
+  "white-list": false,
+  "enforce-whitelist": false,
+  "rate-limit": 0,
+  "prevent-proxy-connections": false,
+  "use-native-transport": true,
+  "entity-broadcast-range-percentage": 100,
+});
+
+const ALLOWED_SERVER_PROPERTIES = new Set([
+  ...Object.keys(SERVER_PROPERTY_DEFAULTS),
+  "accepts-transfers", "broadcast-console-to-ops", "broadcast-rcon-to-ops",
+  "bug-report-link", "debug", "enable-jmx-monitoring", "enable-query", "enable-rcon",
+  "enable-status", "enforce-secure-profile", "function-permission-level", "generator-settings",
+  "hide-online-players", "initial-disabled-packs", "initial-enabled-packs", "level-type",
+  "log-ips", "max-chained-neighbor-updates", "max-tick-time", "network-compression-threshold",
+  "op-permission-level", "pause-when-empty-seconds", "query.port", "rcon.password", "rcon.port",
+  "region-file-compression", "require-resource-pack", "resource-pack", "resource-pack-id",
+  "resource-pack-prompt", "resource-pack-sha1", "server-ip", "sync-chunk-writes",
+  "text-filtering-config",
+]);
+
+function serverStorageKey(serverId) {
+  if (typeof serverId !== "string" || !SERVER_ID_PATTERN.test(serverId)) {
+    throw new Error("Server ID must be a UUID before it can be used for storage");
+  }
+
+  // UUIDs are case-insensitive, while filesystem case behavior differs by
+  // platform. Canonicalizing prevents case-only aliases from creating a
+  // second directory for the same database identity.
+  return `server-${serverId.toLowerCase()}`;
+}
+
 /**
  * Manages running Minecraft server processes for this node.
  */
@@ -23,11 +90,28 @@ export class ServerProcessManager {
   }
 
   /**
-   * Get the working directory for a server.
+   * Get the working directory for a server. The display name deliberately has
+   * no role here: names can change and different names can sanitize to the
+   * same filesystem segment.
    */
-  getServerDir(serverId, serverName) {
-    const safeName = (serverName || serverId).replace(/[^a-zA-Z0-9_-]/g, "_");
-    return path.join(this.serversDir, safeName);
+  getServerDir(serverId) {
+    const serversRoot = path.resolve(this.serversDir);
+    const serverDir = path.resolve(serversRoot, serverStorageKey(serverId));
+    const relative = path.relative(serversRoot, serverDir);
+
+    // Defense in depth for future changes to the storage-key format. A valid
+    // UUID is already path-safe, but every filesystem mutation relies on this
+    // method, so it must never return a path outside the managed root.
+    if (
+      !relative ||
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+    ) {
+      throw new Error("Resolved server directory is outside the managed servers root");
+    }
+
+    return serverDir;
   }
 
   /**
@@ -334,21 +418,98 @@ export class ServerProcessManager {
     const relative = path.relative(backupsDir, candidate);
 
     // Restore is allowed only from a child directory of this server's backup
-    // directory. This prevents an operation payload from deleting the world
-    // and copying arbitrary files from the host filesystem.
-    if (!backupPath || relative.startsWith("..") || path.isAbsolute(relative)) {
+    // directory. This prevents an operation payload from replacing the world
+    // with arbitrary files from the host filesystem.
+    if (
+      !backupPath ||
+      !relative ||
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+    ) {
       return { success: false, error: "Backup path must be inside this server's backups directory" };
     }
     if (!fs.existsSync(candidate) || !fs.statSync(candidate).isDirectory()) {
       return { success: false, error: "Backup path not found" };
     }
 
+    // Never delete the live world before the replacement is complete. Build a
+    // full replacement in a unique sibling directory first, then use same-root
+    // renames to swap it into place. The previous world remains in a rollback
+    // container until the new world is active.
+    let stagedWorldDir = null;
+    let rollbackContainer = null;
+    let rollbackWorldDir = null;
     try {
-      if (fs.existsSync(worldDir)) fs.rmSync(worldDir, { recursive: true, force: true });
-      copyDirRecursive(candidate, worldDir);
+      stagedWorldDir = fs.mkdtempSync(path.join(serverDir, ".amalgam-restore-stage-"));
+      copyDirRecursive(candidate, stagedWorldDir);
+
+      if (fs.existsSync(worldDir)) {
+        rollbackContainer = fs.mkdtempSync(
+          path.join(serverDir, ".amalgam-restore-rollback-")
+        );
+        rollbackWorldDir = path.join(rollbackContainer, worldName);
+        fs.renameSync(worldDir, rollbackWorldDir);
+      }
+
+      // Both paths are direct children of serverDir, so this is a same-volume
+      // directory rename rather than a copy-overwrite operation.
+      fs.renameSync(stagedWorldDir, worldDir);
+      stagedWorldDir = null;
+
+      if (rollbackContainer) {
+        try {
+          fs.rmSync(rollbackContainer, { recursive: true, force: true });
+        } catch (cleanupError) {
+          // The replacement is already live. Retaining an old-world rollback
+          // is safer than reporting a failed restore or deleting it blindly.
+          console.warn(`[lifecycle] Restore rollback cleanup failed: ${cleanupError.message}`);
+        }
+      }
       return { success: true };
     } catch (err) {
-      return { success: false, error: err.message };
+      let recoveryError = null;
+
+      // If the old world was moved aside but the replacement was not promoted,
+      // put it back. Do not overwrite a destination that exists unexpectedly:
+      // in that case leave the rollback intact and give the caller its path.
+      if (
+        rollbackWorldDir &&
+        fs.existsSync(rollbackWorldDir) &&
+        !fs.existsSync(worldDir)
+      ) {
+        try {
+          fs.renameSync(rollbackWorldDir, worldDir);
+          try {
+            fs.rmdirSync(rollbackContainer);
+          } catch {
+            // An empty temporary rollback container is harmless.
+          }
+          rollbackContainer = null;
+          rollbackWorldDir = null;
+        } catch (rollbackErr) {
+          recoveryError = rollbackErr;
+        }
+      }
+
+      if (stagedWorldDir && fs.existsSync(stagedWorldDir)) {
+        try {
+          fs.rmSync(stagedWorldDir, { recursive: true, force: true });
+        } catch {
+          // Preserve an incomplete staging directory for operator inspection
+          // rather than letting cleanup hide the original failure.
+        }
+      }
+
+      const message = err instanceof Error ? err.message : String(err);
+      const result = { success: false, error: message };
+      if (rollbackWorldDir && fs.existsSync(rollbackWorldDir)) {
+        result.recovery_path = rollbackWorldDir;
+      }
+      if (recoveryError) {
+        result.error += `; rollback failed: ${recoveryError.message}`;
+      }
+      return result;
     }
   }
 
@@ -358,69 +519,55 @@ export class ServerProcessManager {
   applySettings(instance, settings) {
     const serverDir = this.getServerDir(instance.id, instance.name);
     const propsPath = path.join(serverDir, "server.properties");
-
-    const defaults = {
-      "server-port": instance.port || 25565,
-      "max-players": instance.max_players || 20,
-      "motd": instance.motd || "An Amalgam Server",
-      "gamemode": instance.gamemode || "survival",
-      "difficulty": instance.difficulty || "normal",
+    const props = {
+      ...SERVER_PROPERTY_DEFAULTS,
+      "server-port": instance.port || SERVER_PROPERTY_DEFAULTS["server-port"],
+      "max-players": instance.max_players || SERVER_PROPERTY_DEFAULTS["max-players"],
+      "motd": instance.motd || SERVER_PROPERTY_DEFAULTS.motd,
+      "gamemode": instance.gamemode || SERVER_PROPERTY_DEFAULTS.gamemode,
+      "difficulty": instance.difficulty || SERVER_PROPERTY_DEFAULTS.difficulty,
       "whitelist": instance.whitelist_enabled || false,
       "online-mode": instance.online_mode !== false,
-      "level-name": safePathSegment(instance.world_name || "world", "world"),
-      "level-seed": "",
-      "view-distance": 10,
-      "simulation-distance": 10,
-      "max-world-size": 29999984,
-      "pvp": true,
-      "allow-nether": true,
-      "spawn-protection": 16,
-      "enable-command-block": false,
-      "spawn-monsters": true,
-      "spawn-animals": true,
-      "spawn-npcs": true,
-      "generate-structures": true,
-      "allow-flight": false,
-      "force-gamemode": false,
-      "hardcore": false,
-      "white-list": false,
-      "enforce-whitelist": false,
-      "rate-limit": 0,
-      "prevent-proxy-connections": false,
-      "use-native-transport": true,
-      "entity-broadcast-range-percentage": 100,
+      "level-name": instance.world_name || SERVER_PROPERTY_DEFAULTS["level-name"],
     };
 
-    // Merge provided settings
-    const props = { ...defaults, ...settings };
+    try {
+      applyPropertyOverrides(props, settings, "operation settings");
 
-    // Convert JSONB server_properties from template
-    if (instance.metadata && typeof instance.metadata === "object") {
-      for (const [key, value] of Object.entries(instance.metadata)) {
-        if (key.startsWith("sp_")) {
-          props[key.slice(3)] = value;
+      // Convert the explicitly supported sp_<property> template metadata.
+      // Other metadata remains metadata; it must not become a server property.
+      if (instance.metadata && typeof instance.metadata === "object") {
+        const templateProperties = Object.create(null);
+        for (const [key, value] of Object.entries(instance.metadata)) {
+          if (key.startsWith("sp_")) templateProperties[key.slice(3)] = value;
         }
+        applyPropertyOverrides(props, templateProperties, "template metadata");
       }
+
+      // Defense in depth: the world folder name is a filesystem path on disk,
+      // so it must never come from an untrusted payload unsanitized. A hostile
+      // level-name could otherwise make the server write its world outside the
+      // server directory (and outside the backup/restore sandbox).
+      props["level-name"] = safePathSegment(props["level-name"] || "", "world");
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
 
-    // Defense in depth: the world folder name is a filesystem path on disk,
-    // so it must never come from an untrusted payload unsanitized. A hostile
-    // level-name could otherwise make the server write its world outside the
-    // server directory (and outside the backup/restore sandbox).
-    props["level-name"] = safePathSegment(props["level-name"] || "", "world");
-
     const lines = Object.entries(props)
-      .map(([key, value]) => {
-        const val = typeof value === "boolean" ? String(value) : String(value);
-        return `${key}=${val}`;
-      })
+      .map(([key, value]) => `${key}=${String(value)}`)
       .join("\n");
+    const tempPath = `${propsPath}.amalgam-tmp-${process.pid}-${Date.now()}`;
 
     try {
-      fs.writeFileSync(propsPath, lines + "\n", "utf-8");
+      fs.mkdirSync(serverDir, { recursive: true });
+      fs.writeFileSync(tempPath, lines + "\n", "utf-8");
+      // Renaming a fully written sibling prevents an interrupted write from
+      // leaving a partially constructed server.properties in the live slot.
+      fs.renameSync(tempPath, propsPath);
       return { success: true };
     } catch (err) {
-      return { success: false, error: err.message };
+      try { fs.rmSync(tempPath, { force: true }); } catch {}
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 }
@@ -428,6 +575,26 @@ export class ServerProcessManager {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function applyPropertyOverrides(props, overrides, source) {
+  if (overrides === null || typeof overrides !== "object" || Array.isArray(overrides)) {
+    throw new Error(`${source} must be an object`);
+  }
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!ALLOWED_SERVER_PROPERTIES.has(key)) {
+      throw new Error(`Unsupported server property in ${source}: ${key}`);
+    }
+    if (!["string", "number", "boolean"].includes(typeof value) ||
+        (typeof value === "number" && !Number.isFinite(value))) {
+      throw new Error(`Server property ${key} in ${source} must be a finite primitive value`);
+    }
+    if (/[\r\n\0]/.test(String(value))) {
+      throw new Error(`Server property ${key} in ${source} must not contain line breaks or NUL`);
+    }
+    props[key] = value;
+  }
+}
 
 export function appendConsoleData(managed, data, source, flushRemainder = false) {
   const remainderKey = source === "system" ? "stderrRemainder" : "stdoutRemainder";

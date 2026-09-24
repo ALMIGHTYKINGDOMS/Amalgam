@@ -1,7 +1,7 @@
-import { getState } from "./util/state.js";
+import { getPlayerSettings } from "./util/state.js";
 
 export function notify(player, title, body = "") {
-  if (!getState().settings.notificationsEnabled || !player) return;
+  if (!getPlayerSettings(player).notificationsEnabled || !player) return;
   const safeTitle = String(title).slice(0, 80);
   const safeBody = String(body).slice(0, 180);
   try {

@@ -1,5 +1,5 @@
 import { system } from "@minecraft/server";
-import { getState } from "./util/state.js";
+import { getPlayerSettings } from "./util/state.js";
 import { sessionSummary } from "./session.js";
 
 function formatLocation(location) {
@@ -7,9 +7,9 @@ function formatLocation(location) {
 }
 
 export function renderHud(player) {
-  const state = getState();
-  if (!state.settings.enabled || !state.settings.hudEnabled || !player) return;
-  const summary = sessionSummary();
+  const settings = getPlayerSettings(player);
+  if (!settings.enabled || !settings.hudEnabled || !player) return;
+  const summary = sessionSummary(player);
   const location = formatLocation(player.location);
   const dimension = summary.dimension.replace("minecraft:", "");
   const text = `§dAMALGAM §8• §f${summary.worldName}\n§7${dimension} §8• §7${location} §8• §aLocal client`;

@@ -7,6 +7,7 @@
 #include "import_pack.h"
 #include "instances.h"
 #include "java.h"
+#include "json.h"
 #include "launch.h"
 #include "official_launcher_bridge.h"
 #include "model.h"
@@ -16,11 +17,14 @@
 #include "readiness.h"
 #include "provider_config.h"
 #include "services.h"
+#include "server_types.h"
 #include "ui.h"
 #include "updater.h"
 
 #include <windows.h>
 #include <shellapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <algorithm>
 #include <cctype>
@@ -31,6 +35,7 @@
 #include <fstream>
 #include <io.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -91,7 +96,7 @@ bool is_cli_invocation(int argc, wchar_t** argv) {
            has_arg(argc, argv, L"--java-install") ||
            has_arg(argc, argv, L"--check-prereqs") || has_arg(argc, argv, L"--login") ||
            has_arg(argc, argv, L"--logout") || has_arg(argc, argv, L"--doctor") ||
-           has_arg(argc, argv, L"--ui-snapshot") ||
+           has_arg(argc, argv, L"--ui-snapshot") || has_arg(argc, argv, L"--list-ui-fixtures") ||
            has_arg(argc, argv, L"--server-transport-probe") ||
            has_arg(argc, argv, L"--client-bridge-probe") ||
            has_arg(argc, argv, L"--inspect") || has_arg(argc, argv, L"--launch") ||
@@ -140,6 +145,7 @@ void print_cli_help() {
         "\n"
         "Release and QA tooling:\n"
         "  --check-update [url]                validate a signed update manifest\n"
+        "  --list-ui-fixtures                  print the canonical snapshot-fixture inventory as JSON\n"
         "  --ui-snapshot <out.png> [w] [h] [page]\n"
         "  --server-transport-probe <dir> <java.exe>\n"
         "  --client-bridge-probe <dir>\n"
@@ -602,8 +608,7 @@ aml::mods::ApiCfg cli_api_cfg() {
         // and in Discover without ever shipping the provider secret.
         if (!c.supabase_url.empty() && !c.supabase_anon_key.empty()) {
             auto& supabase = aml::supabase::SupabaseManager::instance();
-            supabase.initialize(c.supabase_url, c.supabase_anon_key,
-                                c.supabase_service_key);
+            supabase.initialize(c.supabase_url, c.supabase_anon_key);
             auto& accounts = aml::account::AccountManager::instance();
             auto session = accounts.get_current_session();
             if (!session.id.empty()) {
@@ -660,7 +665,10 @@ int cli_check_update(int argc, wchar_t* argv[]) {
 
 int cli_ui_snapshot(int argc, wchar_t** argv) {
     if (argc < 3) {
-        std::printf("usage: --ui-snapshot <out.png> [width] [height] [home|discover|library|profile|project|downloads|settings|account|servers|server-detail|server-console|bedrock|essentials|admin|java|backups|logs|config|theme|performance|social|mods]\n");
+        std::printf(
+            "usage: --ui-snapshot <out.png> [width] [height] "
+            "[fixture-case[@top|middle|bottom]]\n"
+            "       use --help for the release visual-QA fixture groups\n");
         return 1;
     }
     wchar_t self[MAX_PATH]{};
@@ -668,14 +676,15 @@ int cli_ui_snapshot(int argc, wchar_t** argv) {
     std::wstring exe = self;
     const size_t slash = exe.find_last_of(L"\\/");
     const std::wstring exe_dir = slash == std::wstring::npos ? L"." : exe.substr(0, slash);
+    // Snapshot fixtures never load the reviewer's launcher.json. That file can
+    // contain personal paths, preferences, and provider credentials; a visual
+    // evidence run needs stable, non-secret defaults instead.
     aml::config::Config cfg;
-    if (!load_launcher_config(exe_dir, cfg)) {
-        cfg.base_dir = exe_dir;
-        cfg.assets_dir = exe_dir + L"\\assets";
-        cfg.java_cache_dir = aml::java::managed_root();
-        cfg.loader = "auto";
-        cfg.addon = true;
-    }
+    cfg.base_dir = exe_dir;
+    cfg.assets_dir = exe_dir + L"\\assets";
+    cfg.java_cache_dir = exe_dir + L"\\fixture-java";
+    cfg.loader = "auto";
+    cfg.addon = true;
     auto positive_dimension = [](const std::wstring& value, int fallback) {
         if (value.empty()) return fallback;
         wchar_t* end = nullptr;
@@ -685,96 +694,64 @@ int cli_ui_snapshot(int argc, wchar_t** argv) {
     };
     aml::ui::RunOptions options;
     options.fixture_mode = true;
+    // A visual fixture must be hermetic: never run update checks, open a
+    // network session, or inherit a reviewer-owned launcher state.
+    options.safe_mode = true;
     options.capture_path = arg_at(argc, argv, 2);
     options.capture_after_frames = 180;
     options.initial_width = positive_dimension(arg_at(argc, argv, 3), 1440);
     options.initial_height = positive_dimension(arg_at(argc, argv, 4), 900);
-    const std::string route = lowercase(aml::net::to_utf8(arg_at(argc, argv, 5)));
-    if (route == "discover") {
-        options.fixture_tab = 16;
-        options.fixture_sidebar = 2;
-    } else if (route == "library") {
-        options.fixture_tab = 6;
-        options.fixture_sidebar = 3;
-    } else if (route == "profile") {
-        options.fixture_tab = 6;
-        options.fixture_sidebar = 3;
-        options.fixture_profile_detail = true;
-    } else if (route == "project") {
-        options.fixture_tab = 1;
-        options.fixture_sidebar = 2;
-        options.fixture_project_detail = true;
-    } else if (route == "downloads") {
-        options.fixture_tab = 17;
-        options.fixture_sidebar = 17;
-    } else if (route == "settings") {
-        options.fixture_tab = 4;
-        options.fixture_sidebar = 12;
-        options.fixture_settings_section = 3;
-    } else if (route == "settings0") {
-        options.fixture_tab = 4;
-        options.fixture_sidebar = 12;
-        options.fixture_settings_section = 0;
-    } else if (route == "admin") {
-        options.fixture_tab = 4;
-        options.fixture_sidebar = 12;
-        options.fixture_settings_section = 12;
-    } else if (route == "account") {
-        options.fixture_tab = 15;
-        options.fixture_sidebar = 12;
-    } else if (route == "servers") {
-        options.fixture_tab = 8;
-        options.fixture_sidebar = 8;
-    } else if (route == "server-detail") {
-        options.fixture_tab = 8;
-        options.fixture_sidebar = 8;
-        options.fixture_server_detail_tab = 0;
-    } else if (route == "server-console") {
-        options.fixture_tab = 8;
-        options.fixture_sidebar = 8;
-        options.fixture_server_detail_tab = 1;
-    } else if (route == "cloud") {
-        options.fixture_tab = 8;
-        options.fixture_sidebar = 8;
-        options.fixture_cloud = true;
-    } else if (route == "bedrock") {
-        options.fixture_tab = 3;
-        options.fixture_sidebar = 17;
-    } else if (route == "essentials") {
-        options.fixture_tab = 23;
-        options.fixture_sidebar = 23;
-    } else if (route == "java") {
-        options.fixture_tab = 11;
-        options.fixture_sidebar = 12;
-    } else if (route == "backups") {
-        options.fixture_tab = 12;
-        options.fixture_sidebar = 12;
-    } else if (route == "logs") {
-        options.fixture_tab = 13;
-        options.fixture_sidebar = 12;
-    } else if (route == "config") {
-        options.fixture_tab = 14;
-        options.fixture_sidebar = 12;
-    } else if (route == "theme") {
-        options.fixture_tab = 22;
-        options.fixture_sidebar = 12;
-    } else if (route == "performance") {
-        options.fixture_tab = 21;
-        options.fixture_sidebar = 12;
-    } else if (route == "social") {
-        options.fixture_tab = 23;
-        options.fixture_sidebar = 23;
-    } else if (route == "mods") {
-        options.fixture_tab = 20;
-        options.fixture_sidebar = 2;
-    } else if (!route.empty() && route != "home") {
-        std::printf("unknown ui snapshot route: %s\n", route.c_str());
+    std::string route = lowercase(aml::net::to_utf8(arg_at(argc, argv, 5)));
+    if (route.empty()) route = "home";
+    const size_t scroll_marker = route.rfind('@');
+    if (scroll_marker != std::string::npos) {
+        const std::string scroll = route.substr(scroll_marker + 1);
+        route.erase(scroll_marker);
+        if (scroll == "top") options.fixture_scroll_position = 0;
+        else if (scroll == "middle") options.fixture_scroll_position = 1;
+        else if (scroll == "bottom") options.fixture_scroll_position = 2;
+        else {
+            std::printf("unknown snapshot scroll position: %s\n", scroll.c_str());
+            return 1;
+        }
+    }
+    if (!aml::ui::is_visual_fixture_case(route)) {
+        std::printf("unknown ui snapshot fixture: %s\n", route.c_str());
         return 1;
     }
+    options.fixture_case = route;
+    std::error_code fixture_path_error;
+    std::filesystem::path fixture_parent =
+        std::filesystem::path(options.capture_path).parent_path();
+    if (fixture_parent.empty()) fixture_parent = std::filesystem::current_path(fixture_path_error);
+    // Each capture owns its fixture root. This prevents a populated-state
+    // screenshot (for example a seeded screenshot grid) from contaminating a
+    // later empty-state capture in the same evidence run.
+    const std::filesystem::path capture_file(options.capture_path);
+    const std::wstring fixture_leaf = capture_file.stem().empty()
+        ? std::wstring(L"capture")
+        : capture_file.stem().wstring();
+    options.fixture_root =
+        (fixture_parent / L"fixture-data" / fixture_leaf).lexically_normal().wstring();
     const bool ok = aml::ui::run_window(&cfg, options);
     std::wprintf(L"ui snapshot %s: %s\n", ok ? L"created" : L"failed",
                  options.capture_path.c_str());
     return ok ? 0 : 1;
+}
+
+// The capture runner probes this command before opening any snapshot window.
+// Keep the output machine-readable and entirely local: it exposes identifiers
+// only, never player configuration, UI state, credentials, or fixtures' data.
+int cli_list_ui_fixtures() {
+    const auto& fixtures = aml::ui::visual_fixture_cases();
+    aml::Json result = aml::Json::obj();
+    result.set("schemaVersion", aml::Json::num(1));
+    result.set("fixtureCount", aml::Json::num(static_cast<int64_t>(fixtures.size())));
+    aml::Json entries = aml::Json::arr();
+    for (const auto& fixture : fixtures) entries.push(aml::Json::str(fixture));
+    result.set("fixtures", std::move(entries));
+    std::printf("%s\n", result.dump().c_str());
+    return 0;
 }
 
 int cli_server_transport_probe(int argc, wchar_t** argv) {
@@ -808,6 +785,58 @@ int cli_server_transport_probe(int argc, wchar_t** argv) {
         return 6;
     }
     std::wprintf(L"server java root: %s\n", supervisor_root.c_str());
+
+    // The port has to come from this probe's own registry, not a real one, and
+    // it has to be a port no process on this machine already holds: a probe
+    // that only passes on a machine with a free 25565 cannot run alongside the
+    // user's own server. Ask the OS for an unused port and register it there.
+    unsigned short probe_port = 0;
+    {
+        WSADATA wsa{};
+        SOCKET probe_socket = INVALID_SOCKET;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+            probe_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (probe_socket != INVALID_SOCKET) {
+                sockaddr_in address{};
+                address.sin_family = AF_INET;
+                address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                address.sin_port = 0;
+                if (bind(probe_socket, reinterpret_cast<sockaddr*>(&address),
+                         sizeof(address)) == 0) {
+                    int address_size = sizeof(address);
+                    if (getsockname(probe_socket, reinterpret_cast<sockaddr*>(&address),
+                                    &address_size) == 0) {
+                        probe_port = ntohs(address.sin_port);
+                    }
+                }
+                closesocket(probe_socket);
+            }
+            WSACleanup();
+        }
+    }
+    if (probe_port == 0) {
+        SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
+        std::printf("server transport probe could not reserve a port to test with\n");
+        return 7;
+    }
+    {
+        aml::Json registry = aml::Json::arr();
+        aml::Json entry = aml::Json::obj();
+        entry["name"] = "probe";
+        entry["minecraft_version"] = "1.20.1";
+        // Exercise the real response-file launch path. The CMake fixture puts
+        // Forge's win_args.txt below a workspace whose absolute path contains
+        // spaces, so unquoted @ paths fail before EchoServer can report READY.
+        entry["software"] = static_cast<int>(aml::server::ServerSoftware::Forge);
+        entry["port"] = static_cast<int>(probe_port);
+        entry["max_players"] = 1;
+        entry["allocated_ram_mb"] = 512;
+        registry.push(std::move(entry));
+        std::string write_error;
+        aml::json_write_file(std::filesystem::path(root) / L"servers.json", registry,
+                             &write_error);
+    }
+
     std::string error;
     if (!manager->start_local_server("probe", aml::net::to_utf8(java_path), 512, &error)) {
         SetEnvironmentVariableW(L"AMALGAM_SERVER_ROOT", nullptr);
@@ -1264,6 +1293,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
         else if (has_arg(argc, argv, L"--login")) result = cli_login();
         else if (has_arg(argc, argv, L"--logout")) result = cli_logout();
         else if (has_arg(argc, argv, L"--doctor")) result = cli_doctor(argc, argv);
+        else if (has_arg(argc, argv, L"--list-ui-fixtures")) result = cli_list_ui_fixtures();
         else if (has_arg(argc, argv, L"--ui-snapshot")) result = cli_ui_snapshot(argc, argv);
         else if (has_arg(argc, argv, L"--server-transport-probe"))
             result = cli_server_transport_probe(argc, argv);

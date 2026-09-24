@@ -1,31 +1,33 @@
-import { world } from "@minecraft/server";
 import { warn } from "./util/logger.js";
 
-const KEY = "amalgam:settings";
+const KEY = "amalgam:settings-v2";
 
-export function loadSettings(fallback) {
+function normalizedSettings(settings, fallback) {
+  const source = { ...fallback, ...settings };
+  return {
+    enabled: Boolean(source.enabled),
+    hudEnabled: Boolean(source.hudEnabled),
+    notificationsEnabled: Boolean(source.notificationsEnabled),
+    language: String(source.language ?? "en_us").slice(0, 16)
+  };
+}
+
+export function loadSettings(player, fallback) {
   try {
-    const raw = world.getDynamicProperty(KEY);
+    const raw = player?.getDynamicProperty(KEY);
     if (typeof raw !== "string" || !raw) return { ...fallback };
     const parsed = JSON.parse(raw);
-    return { ...fallback, ...parsed };
+    return normalizedSettings(parsed, fallback);
   } catch (e) {
     warn("storage", `settings load skipped: ${e}`);
     return { ...fallback };
   }
 }
 
-export function saveSettings(settings) {
+export function saveSettings(player, settings) {
   try {
-    world.setDynamicProperty(KEY, JSON.stringify({
-      enabled: Boolean(settings.enabled),
-      hudEnabled: Boolean(settings.hudEnabled),
-      notificationsEnabled: Boolean(settings.notificationsEnabled),
-      hudPreset: String(settings.hudPreset).slice(0, 24),
-      hudScale: Math.max(0.75, Math.min(1.5, Number(settings.hudScale) || 1)),
-      hudOpacity: Math.max(0.2, Math.min(1, Number(settings.hudOpacity) || 0.92)),
-      language: String(settings.language).slice(0, 16)
-    }));
+    if (!player) return false;
+    player.setDynamicProperty(KEY, JSON.stringify(normalizedSettings(settings, {})));
     return true;
   } catch (e) {
     warn("storage", `settings save skipped: ${e}`);
@@ -33,6 +35,6 @@ export function saveSettings(settings) {
   }
 }
 
-export function resetSettings() {
-  try { world.setDynamicProperty(KEY, undefined); } catch { /* optional */ }
+export function resetSettings(player) {
+  try { player?.setDynamicProperty(KEY, undefined); } catch { /* optional */ }
 }

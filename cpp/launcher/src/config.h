@@ -2,6 +2,7 @@
 
 #include <string>
 #include <cstdint>
+#include <ctime>
 #include <map>
 #include <utility>
 #include <vector>
@@ -68,7 +69,11 @@ struct Config {
     std::string curseforge_key;
     std::string supabase_url;
     std::string supabase_anon_key;
-    std::string supabase_service_key;
+    // A desktop launcher must never retain a privileged Supabase service-role
+    // key.  This flag lets callers surface a safe migration notice when a
+    // legacy configuration contained one; its value is deliberately discarded
+    // without attempting DPAPI decryption.
+    bool legacy_supabase_service_key_ignored = false;
     // Public client-safe endpoints for the Amalgam online services. Never
     // store secrets here — only URLs that are safe to ship in the client.
     std::string website_url;
@@ -91,9 +96,23 @@ struct Config {
 
     // Theme / Appearance
     std::string theme = "default_dark";
+    // The persisted base text size is intentionally bounded to a usable
+    // desktop range.  The UI applies this as a real font scale; it is not a
+    // cosmetic preview-only preference.
+    float theme_font_size = 14.0f;
 
     // Accessibility
+    bool high_contrast_mode = false;
+    bool reduced_motion = false;
+    // A semantic palette adjustment for people who need stronger separation
+    // between common color pairs.  Profile values are deliberately descriptive
+    // rather than claiming to simulate a medical condition.
+    bool color_vision_palette = false;
+    std::string color_vision_profile = "red_green";
     bool keyboard_navigation = false;
+    // Retained for ABI/config compatibility only.  The launcher does not yet
+    // expose control-level screen-reader semantics, so this is always false
+    // when preferences are normalized and is not presented as a user setting.
     bool screen_reader_support = false;
 
     // Localization
@@ -118,10 +137,19 @@ struct Config {
     bool mod_check_on_startup = true;
     bool mod_show_beta = false;
 
-    // Theme custom colors (role -> "#RRGGBBAA")
+    // Theme custom colors (role -> "#RRGGBB" or "#RRGGBBAA")
     std::map<std::string, std::string> theme_custom_colors;
-    float theme_font_size = 14.0f;
 };
+
+// Keeps values from a manually edited or older launcher.json inside the range
+// the running launcher genuinely supports.  This is intentionally public so
+// focused tests and future configuration surfaces share exactly one contract.
+void normalize_presentation_preferences(Config& config);
+
+// Formats an already-local calendar time using the launcher's persisted,
+// supported date/time preferences.  Keeping the transformation pure makes it
+// deterministic to test and lets all UI surfaces use the same contract.
+std::string format_local_date_time(const std::tm& local_time, const Config& config);
 
 bool load(const std::wstring& path, Config& out);
 bool save(const std::wstring& path, const Config& c);

@@ -4,9 +4,10 @@ import { openMenu } from "./menu.js";
 import { renderHud } from "./hud.js";
 import { readPlayerState } from "./player.js";
 import { startSession } from "./session.js";
+import { loadClientSettings } from "./settings.js";
 import { notify } from "./notifications.js";
 import { info } from "./util/logger.js";
-import { getState } from "./util/state.js";
+import { clearPlayerState, isPlayerMenuOpen } from "./util/state.js";
 
 // Keep the world adapter private to the pack; hud.js uses it only for its loop.
 globalThis.__amalgamWorld = world;
@@ -14,10 +15,11 @@ bootstrap();
 
 world.afterEvents.playerSpawn.subscribe((event) => {
   const player = event.player;
+  loadClientSettings(player);
   readPlayerState(player);
   if (event.initialSpawn) {
     startSession(player);
-    notify(player, "Amalgam Bedrock Client", "Loaded in supported beta mode. Use /scriptevent amalgam:menu for the client menu.");
+    notify(player, "Amalgam Bedrock Client", "Loaded in supported stable mode. Use /scriptevent amalgam:menu for the client menu.");
   }
   renderHud(player);
 });
@@ -34,7 +36,7 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
 world.afterEvents.itemUse.subscribe((event) => {
   const player = event.source;
   const item = event.itemStack;
-  if (!player || item?.typeId !== "minecraft:compass" || !player.isSneaking || getState().menuOpen) return;
+  if (!player || item?.typeId !== "minecraft:compass" || !player.isSneaking || isPlayerMenuOpen(player)) return;
   openMenu(player).catch((error) => info("menu", `compass trigger failed: ${error}`));
 });
 
@@ -44,3 +46,7 @@ system.runInterval(() => {
     renderHud(player);
   }
 }, 10);
+
+world.afterEvents.playerLeave.subscribe((event) => {
+  clearPlayerState(event.playerId);
+});

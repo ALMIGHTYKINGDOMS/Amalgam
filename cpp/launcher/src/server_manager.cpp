@@ -197,31 +197,30 @@ bool ServerManager::start_server(const std::string& server_id) {
         return false;
     }
     
-    std::thread([this, server_id]() {
-        std::string error;
-        auto& svc = aml::services::ServiceManager::instance();
-        auto* server_service = svc.servers();
-        bool ok = server_service &&
-                  server_service->start_local_server(server_id, "", 2048, &error);
-        
-        Server s = get_server(server_id);
-        if (s.id.empty()) return;
-        
-        if (ok) {
-            // Process creation is not a health check. Keep the server in a
-            // transitional state until check_server_health verifies it.
-            s.status = ServerStatus::Starting;
-            s.online = false;
-            s.ping_ms = -1;
-        } else {
-            s.status = ServerStatus::Error;
-            s.online = false;
-            s.ping_ms = -1;
-        }
-        update_server(s);
-    }).detach();
-    
-    return true;
+    // This method is currently reached only through the Admin mutation worker.
+    // Complete the local lifecycle operation on that owned worker rather than
+    // spawning an unowned detached tail that could outlive the manager or its
+    // authenticated session.
+    std::string error;
+    auto& svc = aml::services::ServiceManager::instance();
+    auto* server_service = svc.servers();
+    const bool ok = server_service &&
+        server_service->start_local_server(server_id, "", 2048, &error);
+
+    Server updated = get_server(server_id);
+    if (updated.id.empty()) return false;
+    if (ok) {
+        // Process creation is not a health check. Keep the server in a
+        // transitional state until check_server_health verifies it.
+        updated.status = ServerStatus::Starting;
+        updated.online = false;
+        updated.ping_ms = -1;
+    } else {
+        updated.status = ServerStatus::Error;
+        updated.online = false;
+        updated.ping_ms = -1;
+    }
+    return update_server(updated) && ok;
 }
 
 bool ServerManager::stop_server(const std::string& server_id) {
@@ -240,22 +239,17 @@ bool ServerManager::stop_server(const std::string& server_id) {
         return false;
     }
     
-    std::thread([this, server_id]() {
-        std::string error;
-        auto& svc = aml::services::ServiceManager::instance();
-        auto* server_service = svc.servers();
-        bool ok = server_service && server_service->stop_local_server(server_id, &error);
-        
-        Server s = get_server(server_id);
-        if (s.id.empty()) return;
-        
-        s.status = ok ? ServerStatus::Stopped : ServerStatus::Error;
-        s.online = false;
-        s.ping_ms = -1;
-        update_server(s);
-    }).detach();
-    
-    return true;
+    std::string error;
+    auto& svc = aml::services::ServiceManager::instance();
+    auto* server_service = svc.servers();
+    const bool ok = server_service && server_service->stop_local_server(server_id, &error);
+
+    Server updated = get_server(server_id);
+    if (updated.id.empty()) return false;
+    updated.status = ok ? ServerStatus::Stopped : ServerStatus::Error;
+    updated.online = false;
+    updated.ping_ms = -1;
+    return update_server(updated) && ok;
 }
 
 bool ServerManager::restart_server(const std::string& server_id) {
@@ -274,42 +268,35 @@ bool ServerManager::restart_server(const std::string& server_id) {
         return false;
     }
     
-    std::thread([this, server_id]() {
-        auto& svc = aml::services::ServiceManager::instance();
-        std::string error;
-        auto* server_service = svc.servers();
-        bool stopped = server_service && server_service->stop_local_server(server_id, &error);
-        
-        Server s = get_server(server_id);
-        if (s.id.empty()) return;
+    auto& svc = aml::services::ServiceManager::instance();
+    std::string error;
+    auto* server_service = svc.servers();
+    const bool stopped = server_service && server_service->stop_local_server(server_id, &error);
 
-        if (!stopped) {
-            s.status = ServerStatus::Error;
-            s.online = false;
-            s.ping_ms = -1;
-            update_server(s);
-            return;
-        }
-        
-        bool ok = server_service &&
-                  server_service->start_local_server(server_id, "", 2048, &error);
-        
-        s = get_server(server_id);
-        if (s.id.empty()) return;
-        
-        if (ok) {
-            s.status = ServerStatus::Starting;
-            s.online = false;
-            s.ping_ms = -1;
-        } else {
-            s.status = ServerStatus::Error;
-            s.online = false;
-            s.ping_ms = -1;
-        }
-        update_server(s);
-    }).detach();
-    
-    return true;
+    Server updated = get_server(server_id);
+    if (updated.id.empty()) return false;
+    if (!stopped) {
+        updated.status = ServerStatus::Error;
+        updated.online = false;
+        updated.ping_ms = -1;
+        update_server(updated);
+        return false;
+    }
+
+    const bool ok = server_service &&
+        server_service->start_local_server(server_id, "", 2048, &error);
+    updated = get_server(server_id);
+    if (updated.id.empty()) return false;
+    if (ok) {
+        updated.status = ServerStatus::Starting;
+        updated.online = false;
+        updated.ping_ms = -1;
+    } else {
+        updated.status = ServerStatus::Error;
+        updated.online = false;
+        updated.ping_ms = -1;
+    }
+    return update_server(updated) && ok;
 }
 
 bool ServerManager::send_command(const std::string& server_id, const std::string& command) {
@@ -354,7 +341,12 @@ void ServerManager::start_monitoring() {
     monitor_thread_ = std::thread([this]() {
         while (monitoring_) {
             check_server_health();
-            std::this_thread::sleep_for(std::chrono::seconds(30));
+            // Keep shutdown responsive without changing the 30-second health
+            // cadence. The singleton destructor otherwise waits for a naked
+            // long sleep before it can join this worker.
+            for (int second = 0; second < 30 && monitoring_; ++second) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
     });
 }
@@ -408,61 +400,86 @@ void ServerManager::check_server_health() {
         return connect_result == 0;
     };
 
-    std::vector<Server> health_updates;
+    // Snapshot under the lock, then perform potentially multi-second probes
+    // without blocking the server list, lifecycle actions, or UI reads.
+    std::vector<Server> probe_targets;
     {
         std::lock_guard<std::mutex> lock(servers_mu_);
+        probe_targets = servers_;
+    }
 
-        for (auto& server : servers_) {
-            if (server.status == ServerStatus::Stopping) continue;
+    struct HealthUpdate {
+        Server observed;
+        ServerStatus expected_status = ServerStatus::Stopped;
+    };
+    std::vector<HealthUpdate> health_updates;
+    for (auto server : probe_targets) {
+        if (server.status == ServerStatus::Stopping) continue;
+        const bool should_probe = server.status == ServerStatus::Running ||
+                                  server.status == ServerStatus::Starting ||
+                                  server.status == ServerStatus::Restarting ||
+                                  server.online;
+        if (!should_probe) continue;
 
-            const bool should_probe = server.status == ServerStatus::Running ||
-                                      server.status == ServerStatus::Starting ||
-                                      server.status == ServerStatus::Restarting ||
-                                      server.online;
-            if (!should_probe) continue;
+        const ServerStatus previous_status = server.status;
+        int measured_ping = -1;
+        bool healthy = false;
+        if (server_service) {
+            aml::services::ServerInfo probe;
+            probe.id = server.id;
+            probe.host = server.host;
+            probe.port = server.port;
+            // This lets the service probe an unregistered remote server with
+            // the supplied endpoint without claiming a process.
+            probe.online = true;
+            healthy = server_service->ping_server(server.id, &probe);
+            if (healthy) measured_ping = probe.ping_ms;
+        } else {
+            healthy = tcp_probe(server, measured_ping);
+        }
 
-            const ServerStatus previous_status = server.status;
-            int measured_ping = -1;
-            bool healthy = false;
+        if (healthy) {
+            server.status = ServerStatus::Running;
+            server.online = true;
+            server.ping_ms = measured_ping;
+            server.last_ping = std::time(nullptr);
+        } else {
+            server.online = false;
+            server.ping_ms = -1;
+            // A stopped server failing a probe is an expected result. An
+            // active server that fails verification must not remain Running.
+            server.status = previous_status == ServerStatus::Stopped
+                ? ServerStatus::Stopped : ServerStatus::Error;
+        }
+        health_updates.push_back({std::move(server), previous_status});
+    }
 
-            if (server_service) {
-                aml::services::ServerInfo probe;
-                probe.id = server.id;
-                probe.host = server.host;
-                probe.port = server.port;
-                // This lets the service probe an unregistered remote server
-                // with the supplied endpoint without claiming a process.
-                probe.online = true;
-                healthy = server_service->ping_server(server.id, &probe);
-                if (healthy) measured_ping = probe.ping_ms;
-            } else {
-                healthy = tcp_probe(server, measured_ping);
+    bool applied_update = false;
+    {
+        std::lock_guard<std::mutex> lock(servers_mu_);
+        for (const auto& update : health_updates) {
+            const auto current = std::find_if(servers_.begin(), servers_.end(),
+                [&](const Server& server) { return server.id == update.observed.id; });
+            // A lifecycle operation changed this server while the probe was in
+            // flight. Its explicit state wins over an older health sample.
+            if (current == servers_.end() || current->status != update.expected_status ||
+                current->status == ServerStatus::Stopping) {
+                continue;
             }
-
-            if (healthy) {
-                server.status = ServerStatus::Running;
-                server.online = true;
-                server.ping_ms = measured_ping;
-                server.last_ping = std::time(nullptr);
-            } else {
-                server.online = false;
-                server.ping_ms = -1;
-                // A stopped server failing a probe is an expected result. An
-                // active server that fails verification must not remain Running.
-                server.status = previous_status == ServerStatus::Stopped
-                    ? ServerStatus::Stopped : ServerStatus::Error;
-            }
-
-            health_updates.push_back(server);
+            current->status = update.observed.status;
+            current->online = update.observed.online;
+            current->ping_ms = update.observed.ping_ms;
+            current->last_ping = update.observed.last_ping;
+            applied_update = true;
         }
     }
 
-    // Update in Supabase
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    for (const auto& server : health_updates) {
-        supabase.update_server(convert_to_supabase(server));
-    }
-    if (!health_updates.empty()) save_servers();
+    // Health monitoring is local telemetry. It intentionally never mirrors
+    // status through an ambient authenticated provider session: explicit
+    // Admin lifecycle actions own remote state transitions and their scoped
+    // account worker. This prevents a monitor tick from writing under a
+    // replaced account or during shutdown.
+    if (applied_update) save_servers();
 }
 
 // ---------------------------------------------------------------------------
@@ -828,7 +845,9 @@ void ServerManager::start_node_monitoring() {
     node_monitor_thread_ = std::thread([this]() {
         while (node_monitoring_) {
             check_node_health();
-            std::this_thread::sleep_for(std::chrono::seconds(15));
+            for (int second = 0; second < 15 && node_monitoring_; ++second) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
     });
 }
@@ -886,11 +905,8 @@ void ServerManager::check_node_health() {
         }
     }
 
-    // Update in Supabase
-    auto& supabase = aml::supabase::SupabaseManager::instance();
-    for (const auto& node : health_updates) {
-        supabase.update_node(convert_to_supabase_node(node));
-    }
+    // Node probes are likewise local telemetry. Do not issue account-scoped
+    // remote writes from this persistent monitoring thread.
     if (!health_updates.empty()) save_nodes();
 }
 

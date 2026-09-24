@@ -172,7 +172,6 @@ Edit `launcher.json`:
     "microsoft_client_id": "YOUR_AZURE_CLIENT_ID",
     "supabase_url": "https://nnrrmvaxnoknthpwvttt.supabase.co",
     "supabase_anon_key": "YOUR_SUPABASE_ANON_KEY",
-    "supabase_service_key": "YOUR_SUPABASE_SERVICE_KEY",
     "website_url": "https://amalgam-mc.com/",
     "api_url": "",
     "username": "",
@@ -180,17 +179,16 @@ Edit `launcher.json`:
 }
 ```
 
-### 3.3 Get Supabase Keys
+### 3.3 Get the Launcher's Public Supabase Values
 
 1. Go to https://supabase.com/dashboard
 2. Select your project
 3. Go to **Settings** → **API**
 4. Copy:
    - **Project URL** (for `supabase_url`)
-   - **anon public** key (for `supabase_anon_key`)
-   - **service_role** key (for `supabase_service_key`)
+   - **public anon / publishable client key** (for `supabase_anon_key`)
 
-**⚠️ SECURITY WARNING:** The `supabase_service_key` grants admin access. Never ship it in the client binary. Store it securely and only use it for server-side operations.
+**⚠️ SECURITY BOUNDARY:** `launcher.json` must not contain `supabase_service_key`, a `service_role` key, a secret key, or any other privileged Supabase credential — not even as an empty compatibility field. Privileged keys belong only in server-side secret management, such as the Supabase Edge Function environment, and must be accessed only by trusted server-side code.
 
 ---
 
@@ -347,7 +345,8 @@ The launcher reports errors via:
 
 Before distributing to beta testers:
 
-- [ ] No `supabase_service_key` in client binary
+- [ ] No `supabase_service_key` property or other privileged Supabase credential in `launcher.json`, the client binary, installer, or release package
+- [ ] Privileged Supabase keys are configured only in server-side secret management / Supabase Edge Function environments
 - [ ] No Azure client secret in client binary
 - [ ] No API keys in logs or error reports
 - [ ] RLS policies enforced on all tables

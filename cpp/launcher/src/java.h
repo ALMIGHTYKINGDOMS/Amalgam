@@ -58,6 +58,19 @@ public:
     static bool ValidateJava(const JavaRuntime& runtime, std::string* error = nullptr);
 };
 
+// Normalizes the documented per-profile forms of a Java runtime location:
+// a Java home, its bin directory, or bin\java.exe / bin\javaw.exe.  This is
+// lexical only; callers that will execute Java must use
+// ValidateConfiguredRuntime() as well.
+std::wstring normalize_configured_runtime_home(const std::wstring& configured_path);
+
+// Resolves and validates a user-configured Java location.  The validator runs
+// the sibling java.exe and requires its actual major version to match
+// expected_major, so a profile cannot accidentally launch with a different
+// JRE merely because the configured path exists.
+bool ValidateConfiguredRuntime(const std::wstring& configured_path, int expected_major,
+                              JavaRuntime* runtime, std::string* error = nullptr);
+
 class JavaRuntimeRegistry {
 public:
     explicit JavaRuntimeRegistry(std::wstring root);

@@ -7,21 +7,89 @@ param(
     [string]$PfxPassword,
     [string]$TimestampUrl = "http://timestamp.digicert.com",
     # sha256 is the modern default; sha1 only for legacy targets.
+    [ValidateSet("sha256", "sha1")]
     [string]$DigestAlg = "sha256",
+    # The signing order is deliberate. Stage binaries first, regenerate the
+    # package metadata/ZIP, build the installer from that signed stage, then
+    # sign the installer. A one-shot "sign everything" mode is intentionally
+    # not offered because it produces stale package hashes.
+    [switch]$StageBinariesOnly,
+    [switch]$InstallerOnly,
+    [string]$StageDir = "",
+    [string]$InstallerPath = "",
     [switch]$WhatIf
 )
 
-# Signs the three release artifacts with Authenticode and verifies the result.
-# Without a certificate this script documents exactly what is missing; run it
-# once the release certificate is installed on the signing machine.
+# Signs exactly one release phase and verifies it. Private keys and PFX
+# passwords are never echoed. See docs/release-gates.md for the required
+# production sequence.
 $ErrorActionPreference = "Stop"
+if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
+    throw "Version may contain only letters, digits, dots, underscores, and hyphens"
+}
+if (($StageBinariesOnly -and $InstallerOnly) -or
+    (-not $StageBinariesOnly -and -not $InstallerOnly)) {
+    throw "Choose exactly one signing phase: -StageBinariesOnly or -InstallerOnly"
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$launcher = Join-Path $root "dist\amalgam-$Version\amalgam_launcher.exe"
-$dll = Join-Path $root "dist\amalgam-$Version\amalgam.dll"
-$installer = Join-Path $root "dist\installer\AmalgamLauncher-$Version-Setup.exe"
-$artifacts = @($launcher, $dll, $installer)
-foreach ($a in $artifacts) {
-    if (-not (Test-Path $a)) { throw "Missing artifact: $a" }
+if ([string]::IsNullOrWhiteSpace($StageDir)) {
+    $StageDir = Join-Path $root "dist\amalgam-$Version"
+}
+if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
+    $InstallerPath = Join-Path $root "dist\installer\AmalgamLauncher-$Version-Setup.exe"
+}
+
+if ($StageBinariesOnly) {
+    $StageDir = (Resolve-Path -LiteralPath $StageDir).Path
+    $artifacts = @(
+        (Join-Path $StageDir "amalgam_launcher.exe"),
+        (Join-Path $StageDir "amalgam.dll")
+    )
+    $phase = "staged launcher and DLL"
+} else {
+    $artifacts = @([IO.Path]::GetFullPath($InstallerPath))
+    $phase = "installer"
+}
+foreach ($artifact in $artifacts) {
+    if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
+        throw "Missing $phase artifact: $artifact"
+    }
+}
+
+if ($PfxPath) {
+    if (-not (Test-Path -LiteralPath $PfxPath -PathType Leaf)) {
+        throw "PFX file is missing: $PfxPath"
+    }
+    if ([string]::IsNullOrEmpty($PfxPassword)) {
+        throw "-PfxPassword is required with -PfxPath"
+    }
+    $certArgs = @("/f", $PfxPath, "/p", $PfxPassword)
+    $displayCertArgs = @("/f", $PfxPath, "/p", "<redacted>")
+    Write-Output "signing $phase with PFX: $PfxPath"
+} elseif ($Subject) {
+    $certArgs = @("/n", $Subject)
+    $displayCertArgs = $certArgs
+    Write-Output "signing $phase with store certificate matching: $Subject"
+} else {
+    Write-Output ""
+    Write-Output "NO CERTIFICATE CONFIGURED. A release is signed in two phases:"
+    Write-Output "  1. sign-release.ps1 -StageBinariesOnly (launcher and DLL)"
+    Write-Output "  2. package-release.ps1 -FinalizeExistingStage -RequireSignedStagedBinaries"
+    Write-Output "  3. build-installer.ps1 from that finalized stage"
+    Write-Output "  4. sign-release.ps1 -InstallerOnly"
+    Write-Output ""
+    throw "no signing identity given (-Subject or -PfxPath)"
+}
+
+$common = @("sign", "/fd", $DigestAlg, "/td", "sha256", "/tr", $TimestampUrl) + $certArgs
+$displayCommon = @("sign", "/fd", $DigestAlg, "/td", "sha256", "/tr", $TimestampUrl) + $displayCertArgs
+if ($WhatIf) {
+    foreach ($artifact in $artifacts) {
+        Write-Output "(what-if) signtool $($displayCommon -join ' ') `"$artifact`""
+    }
+    Write-Output "No artifact was modified."
+    return
 }
 
 $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe",
@@ -31,44 +99,28 @@ $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\sign
 if (-not $signtool) { throw "signtool.exe not found; install the Windows SDK" }
 Write-Output "signtool: $($signtool.FullName)"
 
-if ($PfxPath) {
-    if (-not $PfxPassword) { throw "-PfxPassword is required with -PfxPath" }
-    $certArgs = @("/f", $PfxPath, "/p", $PfxPassword)
-    Write-Output "signing with PFX: $PfxPath"
-} elseif ($Subject) {
-    $certArgs = @("/n", $Subject)
-    Write-Output "signing with store certificate matching: $Subject"
-} else {
-    Write-Output ""
-    Write-Output "NO CERTIFICATE CONFIGURED. To complete the public-release gate:"
-    Write-Output "  1. Obtain an OV/EV code-signing certificate from your CA."
-    Write-Output "  2. Install it: Certutil -user -f PFX -p <password> <file>.pfx  (or import to the machine store)."
-    Write-Output "  3. Re-run:  tools\sign-release.ps1 -Version $Version -Subject '<cert CN>'"
-    Write-Output "             (or -PfxPath <file>.pfx -PfxPassword <password>)"
-    Write-Output "  4. Re-run tools\release-gate.ps1 -Version $Version -RequireSigned"
-    Write-Output ""
-    throw "no signing identity given (-Subject or -PfxPath)"
-}
-
-$common = @("sign", "/fd", $DigestAlg, "/td", "sha256", "/tr", $TimestampUrl) + $certArgs
-foreach ($a in $artifacts) {
-    Write-Output "signing $(Split-Path -Leaf $a)..."
-    if ($WhatIf) { Write-Output "(what-if) signtool $($common -join ' ') `"$a`""; continue }
-    & $signtool.FullName @common $a
-    if ($LASTEXITCODE -ne 0) { throw "signtool failed for $a (exit $LASTEXITCODE)" }
+foreach ($artifact in $artifacts) {
+    Write-Output "signing $(Split-Path -Leaf $artifact)..."
+    & $signtool.FullName @common $artifact
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed for $artifact (exit $LASTEXITCODE)" }
 }
 
 Write-Output ""
-Write-Output "verifying signatures..."
-$unsigned = @()
-foreach ($a in $artifacts) {
-    $sig = Get-AuthenticodeSignature -LiteralPath $a
-    if ($sig.Status -eq "Valid") {
-        Write-Output "OK  $(Split-Path -Leaf $a)  signed by $($sig.SignerCertificate.Subject)"
+Write-Output "verifying $phase signatures..."
+$invalid = @()
+foreach ($artifact in $artifacts) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $artifact
+    if ($signature.Status -eq "Valid") {
+        Write-Output "OK  $(Split-Path -Leaf $artifact)  signed by $($signature.SignerCertificate.Subject)"
     } else {
-        $unsigned += "$(Split-Path -Leaf $a): $($sig.Status)"
+        $invalid += "$(Split-Path -Leaf $artifact): $($signature.Status)"
     }
 }
-if ($unsigned.Count -gt 0) { throw "signature verification failed: $($unsigned -join '; ')" }
+if ($invalid.Count -gt 0) { throw "signature verification failed: $($invalid -join '; ')" }
+
 Write-Output ""
-Write-Output "All artifacts signed and verified. Next: tools\release-gate.ps1 -Version $Version -RequireSigned"
+if ($StageBinariesOnly) {
+    Write-Output "Staged binaries signed and verified. Next: tools\package-release.ps1 -Version $Version -FinalizeExistingStage -RequireSignedStagedBinaries"
+} else {
+    Write-Output "Installer signed and verified. Next: tools\verify-signing.ps1 -RequireSigned -RequireSameSigner -RequireComponentManifest"
+}

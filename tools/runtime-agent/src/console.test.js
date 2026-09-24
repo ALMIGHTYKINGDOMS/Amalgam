@@ -19,3 +19,17 @@ test("parseMinecraftMetrics extracts server diagnostics", () => {
   assert.equal(metrics.heapMaxMb, 1024);
   assert.equal(metrics.gcCount, 1);
 });
+
+test("parseMinecraftMetrics preserves missing diagnostics as unknown", () => {
+  const metrics = parseMinecraftMetrics([]);
+  assert.equal(metrics.tps, null);
+  assert.equal(metrics.mspt, null);
+  assert.equal(metrics.playerCount, null);
+  assert.equal(metrics.entityCount, null);
+  assert.equal(metrics.chunkCount, null);
+  assert.equal(metrics.threadCount, null);
+  assert.equal(metrics.heapUsedMb, null);
+  assert.equal(metrics.heapMaxMb, null);
+  assert.equal(metrics.gcCount, null);
+  assert.equal(metrics.gcTimeMs, null);
+});

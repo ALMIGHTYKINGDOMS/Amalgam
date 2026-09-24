@@ -17,6 +17,13 @@ namespace aml::supabase {
 
 namespace {
 
+// Every account call needs the project URL and publishable key from
+// launcher.json.  Without them there is no client and no request is made, so
+// returning a default AuthResponse (empty error) leaves the UI reporting an
+// empty string as if the credentials were wrong.  This wording is what
+// humanize_error() renders as "account services are not configured".
+const char kNotConfigured[] = "Supabase client not initialized: no project configured";
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -174,7 +181,7 @@ std::string make_http_request(const std::string& method, const std::string& url,
 // ---------------------------------------------------------------------------
 
 SupabaseClient::SupabaseClient(const SupabaseConfig& config) : config_(config) {
-    // Use the provided keys
+    // Use the supplied public client endpoint/key configuration.
     if (config_.project_url.empty()) {
         config_.project_url.clear();
     }
@@ -196,6 +203,7 @@ std::string SupabaseClient::get_auth_header() const {
 }
 
 std::string SupabaseClient::get_bearer_header() const {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
     if (current_access_token_.empty()) {
         return get_auth_header();
     }
@@ -304,16 +312,7 @@ SupabaseClient::AuthResponse SupabaseClient::sign_up(
     response.refresh_token = response.user.refresh_token;
     response.expires_at = response.user.expires_at;
     
-    // Store tokens
-    current_access_token_ = response.user.access_token;
-    current_refresh_token_ = response.user.refresh_token;
-    current_user_ = response.user;
-    authenticated_ = !current_access_token_.empty();
-    
-    // Notify callbacks
-    if (authenticated_) {
-        for (auto& cb : auth_callbacks_) cb(true, current_user_);
-    }
+    commit_session(response.user, !response.user.access_token.empty());
     
     return response;
 }
@@ -348,16 +347,7 @@ SupabaseClient::AuthResponse SupabaseClient::sign_in(
     response.refresh_token = response.user.refresh_token;
     response.expires_at = response.user.expires_at;
     
-    // Store tokens
-    current_access_token_ = response.user.access_token;
-    current_refresh_token_ = response.user.refresh_token;
-    current_user_ = response.user;
-    authenticated_ = true;
-    
-    // Notify callbacks
-    for (auto& cb : auth_callbacks_) {
-        cb(true, current_user_);
-    }
+    commit_session(response.user, !response.user.access_token.empty());
     
     return response;
 }
@@ -433,16 +423,7 @@ SupabaseClient::AuthResponse SupabaseClient::verify_otp(
     response.refresh_token = response.user.refresh_token;
     response.expires_at = response.user.expires_at;
     
-    // Store tokens
-    current_access_token_ = response.user.access_token;
-    current_refresh_token_ = response.user.refresh_token;
-    current_user_ = response.user;
-    authenticated_ = true;
-    
-    // Notify callbacks
-    for (auto& cb : auth_callbacks_) {
-        cb(true, current_user_);
-    }
+    commit_session(response.user, !response.user.access_token.empty());
     
     return response;
 }
@@ -481,35 +462,26 @@ SupabaseClient::AuthResponse SupabaseClient::refresh_token(const std::string& re
     response.user.refresh_token = response.refresh_token;
     response.user.expires_at = response.expires_at;
     
-    // Update tokens
-    current_access_token_ = response.access_token;
-    current_refresh_token_ = response.refresh_token;
-    current_user_ = response.user;
-    authenticated_ = !current_access_token_.empty();
+    commit_session(response.user, false);
     
     return response;
 }
 
-bool SupabaseClient::sign_out(const std::string& access_token) {
+bool SupabaseClient::sign_out(const std::string& access_token, SignOutScope scope) {
     // The client keeps the active token internally; retain the parameter for
     // API compatibility with callers that pass the token they are retiring.
     (void)access_token;
     std::string error;
-    make_auth_request("logout", Json::Value(), &error);
+    const char* endpoint = scope == SignOutScope::Global
+        ? "logout?scope=global"
+        : "logout?scope=local";
+    make_auth_request(endpoint, Json::Value(), &error);
     // Logout is normally a 204 response, so a successful request has no body.
     // The network helper records transport and non-2xx failures in error.
     const bool remote_success = error.empty();
     
     // Always clear local credentials, even when the remote request fails.
-    current_access_token_.clear();
-    current_refresh_token_.clear();
-    current_user_ = AuthUser();
-    authenticated_ = false;
-    
-    // Notify callbacks
-    for (auto& cb : auth_callbacks_) {
-        cb(false, current_user_);
-    }
+    clear_session();
     
     return remote_success;
 }
@@ -561,9 +533,12 @@ SupabaseClient::AuthUser SupabaseClient::update_user(
     user.access_token = access_token;
     
     // Update current user
-    for (const auto& [key, value] : updates) {
-        if (key == "email") current_user_.email = value;
-        if (key == "password") {/* password updated */}
+    {
+        std::lock_guard<std::mutex> lock(auth_mutex_);
+        for (const auto& [key, value] : updates) {
+            if (key == "email") current_user_.email = value;
+            if (key == "password") {/* password updated */}
+        }
     }
     
     return user;
@@ -597,10 +572,13 @@ SupabaseClient::AuthResponse SupabaseClient::change_password(
     }
     response.success = true;
     fill_auth_user(response.user, parsed);
-    response.user.access_token = current_access_token_;
-    response.user.refresh_token = current_refresh_token_;
-    response.user.expires_at = current_user_.expires_at;
-    current_user_ = response.user;
+    {
+        std::lock_guard<std::mutex> lock(auth_mutex_);
+        response.user.access_token = current_access_token_;
+        response.user.refresh_token = current_refresh_token_;
+        response.user.expires_at = current_user_.expires_at;
+        current_user_ = response.user;
+    }
     return response;
 }
 
@@ -695,17 +673,31 @@ SupabaseClient::AuthResponse SupabaseClient::confirm_account_deletion(const std:
 }
 
 SupabaseSecuritySettings SupabaseClient::get_security_settings() const {
+    return get_security_settings(nullptr);
+}
+
+SupabaseSecuritySettings SupabaseClient::get_security_settings(std::string* error_out) const {
     std::string error;
     std::string result = make_auth_request("user/security", Json::Value(), &error, "GET");
-    
+
     SupabaseSecuritySettings settings;
-    
+
     if (result.empty()) {
+        if (error_out) {
+            *error_out = error.empty()
+                ? "The account service returned no security details."
+                : error;
+        }
         return settings;
     }
-    
+
     Json::Value parsed = parse_response(result, &error);
     if (parsed.isNull()) {
+        if (error_out) {
+            *error_out = error.empty()
+                ? "The account service returned unreadable security details."
+                : error;
+        }
         return settings;
     }
     
@@ -728,6 +720,7 @@ SupabaseSecuritySettings SupabaseClient::get_security_settings() const {
     
     settings.last_password_change = parsed["last_password_change"].asInt64();
     
+    if (error_out) error_out->clear();
     return settings;
 }
 
@@ -772,16 +765,10 @@ SupabaseClient::AuthResponse SupabaseClient::exchange_oauth_code(
     response.refresh_token = parsed["refresh_token"].asString();
     response.expires_at = parsed["expires_at"].asInt64();
     
-    // Store tokens
-    current_access_token_ = response.access_token;
-    current_refresh_token_ = response.refresh_token;
-    current_user_ = response.user;
-    authenticated_ = true;
-    
-    // Notify callbacks
-    for (auto& cb : auth_callbacks_) {
-        cb(true, current_user_);
-    }
+    response.user.access_token = response.access_token;
+    response.user.refresh_token = response.refresh_token;
+    response.user.expires_at = response.expires_at;
+    commit_session(response.user, !response.user.access_token.empty());
     
     return response;
 }
@@ -1390,7 +1377,7 @@ SupabaseClient::DBResult SupabaseClient::rpc(const std::string& function_name,
 }
 
 bool SupabaseClient::is_current_user_staff() {
-    if (!authenticated_) return false;
+    if (!is_authenticated()) return false;
     const DBResult result = rpc("is_project_staff");
     return result.success && !result.data.empty() && result.data.front().as_bool();
 }
@@ -1400,31 +1387,65 @@ bool SupabaseClient::is_current_user_staff() {
 // ---------------------------------------------------------------------------
 
 bool SupabaseClient::is_authenticated() const {
-    return authenticated_;
+    std::lock_guard<std::mutex> lock(auth_mutex_);
+    return authenticated_.load(std::memory_order_acquire);
 }
 
-const SupabaseClient::AuthUser& SupabaseClient::current_user() const {
+SupabaseClient::AuthUser SupabaseClient::current_user() const {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
     return current_user_;
 }
 
-const std::string& SupabaseClient::current_access_token() const {
+std::string SupabaseClient::current_access_token() const {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
     return current_access_token_;
 }
 
 void SupabaseClient::set_access_token(const std::string& access_token) {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
     current_access_token_ = access_token;
 }
 
 void SupabaseClient::set_session(const AuthUser& user) {
-    current_user_ = user;
-    current_access_token_ = user.access_token;
-    current_refresh_token_ = user.refresh_token;
-    authenticated_ = !current_user_.id.empty() && !current_access_token_.empty();
+    commit_session(user, false);
+}
+
+void SupabaseClient::clear_session() {
+    std::vector<std::function<void(bool, const AuthUser&)>> callbacks;
+    AuthUser cleared;
+    {
+        std::lock_guard<std::mutex> lock(auth_mutex_);
+        current_access_token_.clear();
+        current_refresh_token_.clear();
+        current_user_ = cleared;
+        authenticated_.store(false, std::memory_order_release);
+        callbacks = auth_callbacks_;
+    }
+    for (auto& callback : callbacks) {
+        callback(false, cleared);
+    }
 }
 
 void SupabaseClient::on_auth_state_change(
     const std::function<void(bool, const AuthUser&)>& callback) {
+    std::lock_guard<std::mutex> lock(auth_mutex_);
     auth_callbacks_.push_back(callback);
+}
+
+void SupabaseClient::commit_session(const AuthUser& user, bool notify_auth_observers) {
+    std::vector<std::function<void(bool, const AuthUser&)>> callbacks;
+    const bool authenticated = !user.id.empty() && !user.access_token.empty();
+    {
+        std::lock_guard<std::mutex> lock(auth_mutex_);
+        current_user_ = user;
+        current_access_token_ = user.access_token;
+        current_refresh_token_ = user.refresh_token;
+        authenticated_.store(authenticated, std::memory_order_release);
+        if (authenticated && notify_auth_observers) callbacks = auth_callbacks_;
+    }
+    for (auto& callback : callbacks) {
+        callback(true, user);
+    }
 }
 
 void SupabaseClient::on_realtime_message(
@@ -1448,14 +1469,12 @@ SupabaseManager& SupabaseManager::instance() {
 }
 
 bool SupabaseManager::initialize(const std::string& project_url,
-                                const std::string& anon_key,
-                                const std::string& service_key) {
+                                 const std::string& anon_key) {
     if (initialized_) return true;
     
     SupabaseConfig config;
     if (!project_url.empty()) config.project_url = project_url;
     if (!anon_key.empty()) config.anon_key = anon_key;
-    if (!service_key.empty()) config.service_key = service_key;
     
     client_ = std::make_unique<SupabaseClient>(config);
     initialized_ = true;
@@ -1464,6 +1483,10 @@ bool SupabaseManager::initialize(const std::string& project_url,
 }
 
 void SupabaseManager::shutdown() {
+    // Any captured UI/session scope becomes invalid before the client is
+    // released, preventing an in-flight worker from applying stale results at
+    // teardown.
+    session_generation_.fetch_add(1, std::memory_order_acq_rel);
     client_.reset();
     initialized_ = false;
 }
@@ -1475,25 +1498,47 @@ SupabaseClient* SupabaseManager::client() {
 SupabaseClient::AuthResponse SupabaseManager::sign_up(
     const std::string& email, const std::string& password,
     const std::map<std::string, std::string>& metadata) {
-    if (!client_) return SupabaseClient::AuthResponse();
-    return client_->sign_up(email, password, metadata);
+    if (!client_) return SupabaseClient::AuthResponse(false, kNotConfigured);
+    auto response = client_->sign_up(email, password, metadata);
+    if (response.success && !response.user.id.empty() && !response.access_token.empty()) {
+        session_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return response;
 }
 
 SupabaseClient::AuthResponse SupabaseManager::sign_in(
     const std::string& email, const std::string& password) {
-    if (!client_) return SupabaseClient::AuthResponse();
-    return client_->sign_in(email, password);
+    if (!client_) return SupabaseClient::AuthResponse(false, kNotConfigured);
+    auto response = client_->sign_in(email, password);
+    if (response.success && !response.user.id.empty() && !response.access_token.empty()) {
+        session_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return response;
 }
 
 SupabaseClient::AuthResponse SupabaseManager::resend_signup_confirmation(
     const std::string& email) {
-    if (!client_) return SupabaseClient::AuthResponse();
+    if (!client_) return SupabaseClient::AuthResponse(false, kNotConfigured);
     return client_->resend_signup_confirmation(email);
 }
 
-bool SupabaseManager::sign_out() {
+SupabaseClient::AuthResponse SupabaseManager::verify_otp(
+    const std::string& email, const std::string& token, const std::string& type) {
+    if (!client_) return SupabaseClient::AuthResponse(false, kNotConfigured);
+    auto response = client_->verify_otp(email, token, type);
+    if (response.success && !response.user.id.empty() && !response.access_token.empty()) {
+        session_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return response;
+}
+
+bool SupabaseManager::sign_out(SignOutScope scope) {
+    // Invalidate captured UI scopes before the remote request. `sign_out`
+    // always clears the local client credentials, including on a transport
+    // failure, so there is no valid path that should retain the old epoch.
+    session_generation_.fetch_add(1, std::memory_order_acq_rel);
     if (!client_) return false;
-    return client_->sign_out(client_->current_access_token());
+    return client_->sign_out(client_->current_access_token(), scope);
 }
 
 SupabaseUser SupabaseManager::get_current_user() {
@@ -1540,17 +1585,17 @@ SupabaseClient::AuthResponse SupabaseManager::change_password(
 }
 
 SupabaseClient::AuthResponse SupabaseManager::request_password_reset(const std::string& email) {
-    if (!client_) {
-        return {false, "Client not initialized"};
-    }
+    if (!client_) return {false, kNotConfigured};
     return client_->request_password_reset(email);
 }
 
 SupabaseClient::AuthResponse SupabaseManager::refresh_token(const std::string& refresh_token) {
-    if (!client_) {
-        return {false, "Client not initialized"};
+    if (!client_) return {false, kNotConfigured};
+    auto response = client_->refresh_token(refresh_token);
+    if (response.success && !response.user.id.empty() && !response.access_token.empty()) {
+        session_generation_.fetch_add(1, std::memory_order_acq_rel);
     }
-    return client_->refresh_token(refresh_token);
+    return response;
 }
 
 SupabaseClient::AuthResponse SupabaseManager::enable_2fa(const std::string& code) {
@@ -1589,10 +1634,15 @@ SupabaseClient::AuthResponse SupabaseManager::confirm_account_deletion(const std
 }
 
 SupabaseSecuritySettings SupabaseManager::get_security_settings() const {
+    return get_security_settings(nullptr);
+}
+
+SupabaseSecuritySettings SupabaseManager::get_security_settings(std::string* error) const {
     if (!client_ || !client_->is_authenticated()) {
+        if (error) *error = "Your Amalgam session is no longer available.";
         return SupabaseSecuritySettings();
     }
-    return client_->get_security_settings();
+    return client_->get_security_settings(error);
 }
 
 std::vector<SupabaseServer> SupabaseManager::get_servers() {
@@ -2267,6 +2317,10 @@ bool SupabaseManager::is_authenticated() const {
     return client_->is_authenticated();
 }
 
+uint64_t SupabaseManager::session_generation() const {
+    return session_generation_.load(std::memory_order_acquire);
+}
+
 std::string SupabaseManager::get_project_url() const {
     return client_ ? client_->project_url() : std::string();
 }
@@ -2280,6 +2334,7 @@ bool SupabaseManager::auto_login(const std::string& access_token, const std::str
     if (!user.id.empty()) {
         user.refresh_token = refresh_token;
         client_->set_session(user);
+        session_generation_.fetch_add(1, std::memory_order_acq_rel);
         return true;
     }
     
@@ -2288,10 +2343,15 @@ bool SupabaseManager::auto_login(const std::string& access_token, const std::str
         auto response = client_->refresh_token(refresh_token);
         if (response.success && !response.user.id.empty()) {
             client_->set_session(response.user);
+            session_generation_.fetch_add(1, std::memory_order_acq_rel);
             return true;
         }
     }
-    
+    // `set_access_token` above is provisional. A terminal validation failure
+    // must not leave that token (or a prior user object) available to later
+    // request construction.
+    client_->clear_session();
+    session_generation_.fetch_add(1, std::memory_order_acq_rel);
     return false;
 }
 

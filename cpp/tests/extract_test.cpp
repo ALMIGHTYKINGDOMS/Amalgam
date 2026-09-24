@@ -28,6 +28,22 @@ int main() {
             return 1;
         }
     }
+    // at_file_argument(): Java-style response files keep the @ prefix outside
+    // the quoted path, so Windows passes one argument whose first byte is @.
+    {
+        std::wstring r = aml::extract::at_file_argument(L"C:\\Server Folder\\win_args.txt");
+        if (r != L"@\"C:\\Server Folder\\win_args.txt\"") {
+            std::cerr << "at_file_argument() did not preserve a spaced @ path\n";
+            return 1;
+        }
+    }
+    {
+        std::wstring r = aml::extract::at_file_argument(L"C:\\Server\\win_args.txt");
+        if (r != L"@C:\\Server\\win_args.txt") {
+            std::cerr << "at_file_argument() changed a plain @ path\n";
+            return 1;
+        }
+    }
     // parent_of(): normal path
     {
         std::wstring r = aml::extract::parent_of(L"C:\\foo\\bar\\baz.txt");

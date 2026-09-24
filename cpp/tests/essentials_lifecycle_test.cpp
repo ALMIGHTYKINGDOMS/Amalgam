@@ -81,6 +81,23 @@ bool test_backend_calls_are_safe_without_configuration() {
     assert(supabase.get_friend_requests().empty());
     assert(supabase.get_friends_presence().empty());
     assert(!supabase.update_presence("offline"));
+
+    // The account entry points must name the missing configuration. Returning an
+    // empty failure leaves the sign-in form reporting an empty string, which
+    // reads to the user as a wrong email or password; humanize_error() maps this
+    // wording to the account-services-not-configured sentence instead.
+    const auto sign_in = supabase.sign_in("someone@example.com", "correct-horse-battery");
+    const auto sign_up = supabase.sign_up("someone@example.com", "correct-horse-battery", {});
+    const auto reset = supabase.request_password_reset("someone@example.com");
+    for (const auto* response : {&sign_in, &sign_up, &reset}) {
+        if (response->success ||
+            response->error.find("Supabase") == std::string::npos ||
+            response->error.find("not initialized") == std::string::npos) {
+            std::printf("FAIL: unconfigured account call did not name the missing backend: '%s'\n",
+                        response->error.c_str());
+            return false;
+        }
+    }
     return true;
 }
 

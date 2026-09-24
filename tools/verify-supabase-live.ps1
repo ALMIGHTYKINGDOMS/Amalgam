@@ -17,6 +17,9 @@ $baseUrl = "https://$ProjectRef.supabase.co"
 $headers = @{}
 if (-not [string]::IsNullOrWhiteSpace($PublishableKey)) {
     $headers["apikey"] = $PublishableKey
+    # Supabase's current Data API requires the public key in both headers for
+    # direct REST/Edge Function checks.  The launcher does the same.
+    $headers["Authorization"] = "Bearer $PublishableKey"
 }
 
 function Invoke-Status([string]$Uri, [string]$Method = "GET", [hashtable]$RequestHeaders = @{}) {
@@ -37,9 +40,31 @@ function Invoke-Status([string]$Uri, [string]$Method = "GET", [hashtable]$Reques
 }
 
 $auth = Invoke-Status "$baseUrl/auth/v1/settings" "GET" $headers
+if ([string]::IsNullOrWhiteSpace($PublishableKey) -and $auth.Status -eq 401) {
+    throw @"
+No publishable key was supplied. Supabase answers 401 to every request without one,
+so this run would prove nothing. Set SUPABASE_PUBLISHABLE_KEY, or put the project's
+publishable (anon) key in the launcher's launcher.json as supabase_anon_key.
+"@
+}
 if ($auth.Status -ne 200) {
     throw "Supabase Auth endpoint check failed with HTTP $($auth.Status)."
 }
+
+# Supabase removed the OpenAPI schema response for anon/publishable keys. Test
+# representative REST resources directly instead of probing /rest/v1/.
+$clientTables = @("modpack_metadata", "network_servers")
+$failedTables = @()
+foreach ($table in $clientTables) {
+    $tableCheck = Invoke-Status "$baseUrl/rest/v1/${table}?select=*&limit=1" "GET" $headers
+    if ($tableCheck.Status -ne 200) {
+        $failedTables += "$table (HTTP $($tableCheck.Status))"
+    }
+}
+if ($failedTables.Count -gt 0) {
+    throw "Representative launcher table checks failed in ${ProjectRef}: $($failedTables -join ', ')."
+}
+Write-Output "Schema: PASS ($($clientTables.Count) representative launcher tables reachable)"
 
 $curseforgeUrl = "$baseUrl/functions/v1/curseforge-catalog"
 $curseforge = Invoke-Status $curseforgeUrl "POST" $headers

@@ -85,6 +85,102 @@ int main() {
         return 1;
     }
 
+    // The Mod Manager can remove a disabled mod too. Its physical filename
+    // carries the state suffix, while profile metadata uses the original mod
+    // name. Verify the recovery path and metadata cleanup preserve both.
+    const fs::path disabled_mod = root / "profile" / "mods" / "disabled-fixture.jar.disabled";
+    const fs::path mod_recovery = root / "profile" / ".amalgam-trash" / "content" / "mods";
+    if (!write_file(disabled_mod, "disabled mod") ||
+        !write_file(root / "profile" / "amalgam-local-content.json",
+                    R"({"entries":[{"file":"disabled-fixture.jar","type":"mod"}]})")) {
+        std::cerr << "FAILED: disabled mod recovery fixture\n";
+        return 1;
+    }
+    aml::instances::ContentEntry disabled_entry;
+    disabled_entry.path = disabled_mod.wstring();
+    disabled_entry.filename = "disabled-fixture.jar";
+    disabled_entry.type = aml::instances::ContentType::Mod;
+    std::wstring disabled_recovery;
+    error.clear();
+    if (!aml::instances::move_content_to_trash(instance, disabled_entry, &disabled_recovery, &error) ||
+        !error.empty() || fs::exists(disabled_mod) || !fs::exists(disabled_recovery) ||
+        fs::path(disabled_recovery).parent_path() != mod_recovery ||
+        read_file(root / "profile" / "amalgam-local-content.json").find(disabled_entry.filename) != std::string::npos) {
+        std::cerr << "FAILED: disabled mod recovery handling " << error << "\n";
+        return 1;
+    }
+
+    // The confirmation UI snapshots the chosen file before the recovery move.
+    // A replacement at the same path must be detected rather than moving an
+    // unexpectedly changed file after the user has already confirmed.
+    const fs::path snapshot_mod = root / "profile" / "mods" / "snapshot-fixture.jar";
+    if (!write_file(snapshot_mod, "first payload")) {
+        std::cerr << "FAILED: content snapshot fixture\n";
+        return 1;
+    }
+    aml::instances::ContentEntry snapshot_entry;
+    snapshot_entry.path = snapshot_mod.wstring();
+    snapshot_entry.filename = "snapshot-fixture.jar";
+    snapshot_entry.type = aml::instances::ContentType::Mod;
+    aml::instances::ContentFileSnapshot snapshot;
+    error.clear();
+    if (!aml::instances::capture_content_file_snapshot(instance, snapshot_entry, snapshot, &error) ||
+        !aml::instances::content_file_matches_snapshot(instance, snapshot_entry, snapshot, &error) ||
+        !aml::instances::set_content_enabled(instance, snapshot_entry, false, &error) ||
+        fs::exists(snapshot_mod) || !fs::exists(snapshot_mod.wstring() + L".disabled")) {
+        std::cerr << "FAILED: profile-qualified content toggle " << error << "\n";
+        return 1;
+    }
+    snapshot_entry.path += L".disabled";
+    snapshot_entry.filename += ".disabled";
+    error.clear();
+    if (!aml::instances::set_content_enabled(instance, snapshot_entry, true, &error) ||
+        !fs::exists(snapshot_mod)) {
+        std::cerr << "FAILED: profile-qualified content re-enable " << error << "\n";
+        return 1;
+    }
+    snapshot_entry.path = snapshot_mod.wstring();
+    snapshot_entry.filename = "snapshot-fixture.jar";
+    if (!write_file(snapshot_mod, "replacement payload with a different length") ||
+        aml::instances::content_file_matches_snapshot(instance, snapshot_entry, snapshot, &error) ||
+        error.empty()) {
+        std::cerr << "FAILED: stale content snapshot was accepted\n";
+        return 1;
+    }
+
+    // A redirected mods directory must never allow a recovery action to move
+    // an external file.  Some locked-down Windows environments do not permit
+    // creating test symlinks; exercise the assertion whenever the OS allows
+    // it without turning that platform restriction into a false test failure.
+    const fs::path external_mods = root / "external-mods";
+    const fs::path redirected_profile = root / "redirected-profile";
+    const fs::path external_mod = external_mods / "outside.jar";
+    fs::create_directories(external_mods);
+    fs::create_directories(redirected_profile);
+    if (!write_file(external_mod, "outside")) {
+        std::cerr << "FAILED: redirected profile fixture\n";
+        return 1;
+    }
+    std::error_code link_error;
+    fs::create_directory_symlink(external_mods, redirected_profile / "mods", link_error);
+    if (!link_error) {
+        aml::instances::Instance redirected_instance;
+        redirected_instance.directory = redirected_profile.wstring();
+        aml::instances::ContentEntry redirected_entry;
+        redirected_entry.path = (redirected_profile / "mods" / "outside.jar").wstring();
+        redirected_entry.filename = "outside.jar";
+        redirected_entry.type = aml::instances::ContentType::Mod;
+        aml::instances::ContentFileSnapshot redirected_snapshot;
+        error.clear();
+        if (aml::instances::capture_content_file_snapshot(
+                redirected_instance, redirected_entry, redirected_snapshot, &error) ||
+            aml::instances::move_content_to_trash(redirected_instance, redirected_entry, nullptr, &error) ||
+            !fs::exists(external_mod)) {
+            std::cerr << "FAILED: redirected content root was accepted " << error << "\n";
+            return 1;
+        }
+    }
+
     fs::path restore_profile = root / "restore-profile";
     fs::create_directories(restore_profile / "mods");
     fs::create_directories(restore_profile / "config");
@@ -189,14 +285,15 @@ int main() {
 
     const fs::path removable_profile = root / "instances" / "remove-me";
     fs::create_directories(removable_profile / "mods");
-    if (!write_file(removable_profile / "instance.json", "profile") ||
+    aml::instances::Instance removable;
+    removable.id = "remove-me";
+    removable.name = "Remove Me";
+    removable.directory = removable_profile.wstring();
+    if (!aml::instances::save(removable, &error) ||
         !write_file(removable_profile / "mods" / "keep.jar", "keep")) {
         std::cerr << "FAILED: profile recovery fixture\n";
         return 1;
     }
-    aml::instances::Instance removable;
-    removable.id = "remove-me";
-    removable.directory = removable_profile.wstring();
     const fs::path profile_recovery = removable_profile.parent_path() / L".amalgam-profile-recovery";
     if (!aml::instances::remove(removable, &error) || fs::exists(removable_profile) ||
         !fs::exists(profile_recovery) || std::filesystem::is_empty(profile_recovery) ||

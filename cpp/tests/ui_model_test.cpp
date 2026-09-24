@@ -35,6 +35,24 @@ int main() {
     assert(aml::ui_model::contains_case_insensitive("Fabric Optimized", "fabric"));
     assert(aml::ui_model::contains_case_insensitive("Fabric Optimized", "OPT"));
     assert(!aml::ui_model::contains_case_insensitive("Fabric", "forge"));
+
+    // Content inventory state must not confuse the first asynchronous scan,
+    // a genuinely empty profile, and a search/category that hides real files.
+    using aml::ui_model::ProfileContentPresentation;
+    assert(aml::ui_model::profile_content_presentation(false, "", 0, 0) ==
+           ProfileContentPresentation::Loading);
+    // The renderer supplies the unfiltered count here, so a retained search
+    // or content-type tab cannot turn a truly empty inventory into a filter
+    // miss.
+    assert(aml::ui_model::profile_content_presentation(true, "", 0, 0) ==
+           ProfileContentPresentation::EmptyInventory);
+    assert(aml::ui_model::profile_content_presentation(true, "", 2, 0) ==
+           ProfileContentPresentation::EmptyFiltered);
+    assert(aml::ui_model::profile_content_presentation(true, "", 2, 1) ==
+           ProfileContentPresentation::Ready);
+    assert(aml::ui_model::profile_content_presentation(true, "directory unavailable", 0, 0) ==
+           ProfileContentPresentation::Error);
+
     assert(aml::ui_model::clamp_selection(4, 0) == 0);
     assert(aml::ui_model::clamp_selection(-2, 3) == 0);
     assert(aml::ui_model::clamp_selection(8, 3) == 2);
@@ -42,6 +60,32 @@ int main() {
     assert(aml::ui_model::normalize_progress(2.0f) == 1.0f);
     assert(aml::ui_model::normalize_progress(
                std::numeric_limits<float>::quiet_NaN()) == 0.0f);
+    using aml::ui_model::StatCardProgressPolarity;
+    using aml::ui_model::StatCardProgressTone;
+    // Capacity stays high-is-risky, while health is high-is-good. This makes
+    // a healthy 19.8/20 TPS bar retain its semantic green accent instead of
+    // being classified as a critical full-capacity reading.
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.95f, StatCardProgressPolarity::HigherIsWorse) ==
+           StatCardProgressTone::Critical);
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.80f, StatCardProgressPolarity::HigherIsWorse) ==
+           StatCardProgressTone::Warning);
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.65f, StatCardProgressPolarity::HigherIsWorse) ==
+           StatCardProgressTone::Accent);
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.95f, StatCardProgressPolarity::HigherIsBetter) ==
+           StatCardProgressTone::Accent);
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.80f, StatCardProgressPolarity::HigherIsBetter) ==
+           StatCardProgressTone::Warning);
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.65f, StatCardProgressPolarity::HigherIsBetter) ==
+           StatCardProgressTone::Critical);
+    assert(aml::ui_model::stat_card_progress_tone(
+               0.95f, StatCardProgressPolarity::AccentOnly) ==
+           StatCardProgressTone::Accent);
     assert(std::string(aml::ui_model::operation_state_name(
                aml::ui_model::OperationState::Paused)) == "Paused");
 
@@ -107,5 +151,31 @@ int main() {
     assert(aml::ui_model::count_label(1, "issue") == "1 issue");
     assert(aml::ui_model::count_label(0, "world") == "0 worlds");
     assert(aml::ui_model::count_label(2, "screenshot") == "2 screenshots");
+
+    // A content row's two trailing columns are reserved by the width of the text
+    // they hold, so the longest type name ("Resource Packs  68.5 KB  Enabled")
+    // cannot run into the source column, and the source column keeps the row's
+    // right margin instead of drifting with the name's length.
+    const float row = 900.0f, gutter = 20.0f, margin = 4.0f;
+    const float type_w = 205.0f, source_w = 33.0f;
+    const auto columns = aml::ui_model::list_row_columns(row, source_w, type_w, margin, gutter);
+    assert(near(row - columns.middle_reserve + type_w, row - columns.trailing_reserve - gutter));
+    assert(near(row - columns.trailing_reserve + source_w, row - margin));
+    assert(near(columns.name_width, row - columns.middle_reserve - gutter));
+    // The fixed reserves this replaced (330 / 160) left the type column 150px
+    // for 205px of text, which is the overlap the screenshots showed.
+    assert(columns.middle_reserve - columns.trailing_reserve > 205.0f);
+    // A narrower row shrinks the name, never the columns.
+    const auto tight = aml::ui_model::list_row_columns(620.0f, source_w, type_w, margin, gutter);
+    assert(near(tight.middle_reserve, columns.middle_reserve));
+    assert(tight.name_width < columns.name_width && tight.name_width > 0.0f);
+    // A short type name must not drag the source column off the margin either.
+    const auto short_type = aml::ui_model::list_row_columns(row, source_w, 60.0f, margin, gutter);
+    assert(near(short_type.trailing_reserve, columns.trailing_reserve));
+    // A world row reserves its button cluster and puts the size beside it.
+    const auto world = aml::ui_model::list_row_columns(row, 240.0f, 48.0f, margin, gutter);
+    assert(near(world.trailing_reserve, 244.0f));
+    assert(near(world.middle_reserve, 244.0f + gutter + 48.0f));
+    assert(world.name_width > 0.0f);
     return 0;
 }

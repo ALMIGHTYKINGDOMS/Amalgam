@@ -147,6 +147,13 @@ extern ImFont* f_small;
 extern ImFont* f_mono;
 extern float g_ui_scale;
 
+// Rebuilds the visual palette from the persisted theme and accessibility
+// preferences.  It is deliberately shared by startup, reload, and the Theme
+// page so a saved preference never becomes a preview-only state.
+void apply_theme();
+void apply_configured_theme(const config::Config& config);
+void set_theme_font_size(float base_size);
+
 inline float ui_px(float value) { return value * g_ui_scale; }
 inline ImU32 c32(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
 
@@ -207,6 +214,10 @@ std::string format_date(int64_t timestamp);
 void page_title(const char* title, const char* subtitle = nullptr);
 bool primary_button(const char* label, const ImVec2& size = ImVec2(0, 0), bool loading = false, bool disabled = false);
 bool ghost_button(const char* label, const ImVec2& size = ImVec2(0, 0), bool disabled = false);
+// A restrained red-outline action for irreversible or high-impact actions.
+// It intentionally remains visually separate from the normal purple primary
+// action, and still uses the same keyboard/focus behavior as other buttons.
+bool danger_button(const char* label, const ImVec2& size = ImVec2(0, 0), bool disabled = false);
 void card_begin(const char* id, const ImVec2& size = ImVec2(0, 0), bool hoverable = false);
 void card_end(bool was_hoverable = false);
 void progress_bar(float progress, const ImVec2& size = ImVec2(0, 0),
@@ -215,6 +226,7 @@ void draw_breadcrumbs(const std::vector<std::string>& crumbs);
 void draw_health_badge(ImDrawList* dl, const ImVec2& pos, const char* status, const ImVec4& color);
 bool quick_search_dialog(std::string* selected_result);
 void open_quick_search();
+void reset_quick_search_fixture_state();
 bool g_quick_search_open();
 std::string g_quick_search_query();
 void g_quick_search_set_results(const std::vector<std::string>& results);
@@ -235,6 +247,7 @@ void draw_profile_card_enhanced(const char* name, const char* loader, const char
                                 const ImVec4& health_color, const char* health_status);
 void draw_sidebar_compact_item(const char* icon, bool active, const char* tooltip);
 void show_toast(const char* title, const char* message, const ImVec4& color, float duration);
+void clear_toasts();
 void draw_toasts();
 void draw_search_highlight(const char* text, const char* search_query);
 
@@ -274,6 +287,17 @@ void draw_account_button_with_wizard(UiState& st);
 void draw_account_page(UiState& st);
 void draw_account_button_enhanced(UiState& st);
 void draw_account_switcher(UiState& st);
+void draw_account_action_dialogs(UiState& st);
+void open_account_tab(UiState& st, int tab);
+void request_amalgam_sign_out(UiState& st);
+void request_remove_local_session(UiState& st, const std::string& session_id);
+void request_remove_all_local_accounts(UiState& st);
+void request_minecraft_disconnect(UiState& st);
+
+// Account services are restarted on the render thread after a serialized
+// session restore/switch because auto-login intentionally does not emit an
+// auth-state callback.
+void sync_account_services(bool authenticated);
 
 // ---------------------------------------------------------------------------
 // Bedrock UI (defined in bedrock_ui.cpp)
@@ -290,14 +314,25 @@ void draw_bedrock_addons(UiState& st);
 // ---------------------------------------------------------------------------
 void draw_admin_page(UiState& st);
 void draw_admin_login(UiState& st);
+// Starts a staff-role verification on the account-aware background lane. The
+// render thread never calls the role RPC directly.
+void request_admin_staff_access_check(UiState& st, bool force = false);
+bool admin_staff_access_check_in_progress(const UiState& st);
+void note_admin_local_password_unlock();
+// Drains the identity-scoped Admin background lane even while another route is
+// visible, preventing an undelivered result from blocking account operations.
+void reconcile_admin_background_requests(UiState& st);
 
 // ---------------------------------------------------------------------------
 // Server V2 UI (defined in server_ui.cpp)
 // ---------------------------------------------------------------------------
 void draw_server_manager(UiState& st);
 bool server_ui_has_live_server(UiState& st);
+void reset_fixture_server_state();
 void set_fixture_server_mode(int mode);
 void set_fixture_server_detail(int server_index, int tab);
+void set_fixture_server_destructive_overlay(const std::string& fixture_case);
+void set_fixture_server_create_open(bool open);
 
 // ---------------------------------------------------------------------------
 // Cloud Hosting UI (defined in cloud_ui.cpp)
@@ -374,11 +409,16 @@ void draw_divider(float padding = 0.0f);
 void draw_meta_line(const char* label, const char* value);
 void draw_meta_line_colored(const char* label, const char* value, const ImVec4& value_color);
 
-// Stat card: metric label + large value + optional progress bar + optional icon.
+// Stat card: metric label + large value + optional progress bar. Capacity
+// metrics retain the historic high-is-risky default; health metrics can opt
+// into inverse polarity or an exact semantic progress color.
 // Returns the total height drawn so callers can align cards.
 float draw_stat_card(const char* label, const char* value, float progress = -1.0f,
                      const ImVec4& accent = ImVec4(-1,-1,-1,-1),
-                     float width = 0.0f);
+                     float width = 0.0f,
+                     ui_model::StatCardProgressPolarity polarity =
+                         ui_model::StatCardProgressPolarity::HigherIsWorse,
+                     const ImVec4* progress_color = nullptr);
 
 // Circular progress indicator drawn at pos with given radius.
 void draw_circle_progress(const ImVec2& center, float radius, float progress,

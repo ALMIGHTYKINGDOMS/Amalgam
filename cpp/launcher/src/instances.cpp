@@ -18,7 +18,23 @@ namespace aml::instances {
 
 namespace {
 
+bool require_real_directory(const std::filesystem::path& directory, const char* label,
+                            std::string* err);
+
 namespace fs = std::filesystem;
+
+// MSVC's non-throwing symlink_status may report ERROR_FILE_NOT_FOUND or
+// ERROR_PATH_NOT_FOUND for a path that is simply not created yet.  Callers
+// that intentionally create the path after inspection must distinguish that
+// expected absence from an unsafe or inaccessible path.
+bool allow_missing_path_error(std::error_code& ec) {
+    if (!ec) return true;
+    if (ec.value() == ERROR_FILE_NOT_FOUND || ec.value() == ERROR_PATH_NOT_FOUND) {
+        ec.clear();
+        return true;
+    }
+    return false;
+}
 
 int64_t now_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -131,26 +147,85 @@ bool create(const std::wstring& instances_dir, const Instance& source, Instance&
 
 bool duplicate(const Instance& source, const std::wstring& instances_dir, const std::string& new_name,
                Instance& out, std::string* err) {
+    if (err) err->clear();
+    ProfileIdentitySnapshot source_identity;
+    if (!capture_profile_identity(source, source_identity, err)) return false;
+
     fs::path root(instances_dir);
+    if (root.empty()) {
+        if (err) *err = "profile library directory is missing";
+        return false;
+    }
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    if (ec) {
+        if (err) *err = "could not create profile library directory: " + ec.message();
+        return false;
+    }
+    const fs::file_status root_status = fs::symlink_status(root, ec);
+    if (ec || fs::is_symlink(root_status) || !fs::is_directory(root_status)) {
+        if (err) *err = ec ? "could not inspect profile library directory: " + ec.message()
+                           : "profile library directory must not be redirected";
+        return false;
+    }
+
     std::string base = safe_id(new_name.empty() ? source.name : new_name);
     fs::path target = root / base;
     int suffix = 2;
-    while (fs::exists(target)) target = root / (base + "-" + std::to_string(suffix++));
-    std::error_code ec;
-    fs::create_directories(target, ec);
-    fs::copy(fs::path(source.directory), target,
-             fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    while (fs::exists(target, ec) && !ec)
+        target = root / (base + "-" + std::to_string(suffix++));
     if (ec) {
+        if (err) *err = "could not choose duplicate profile directory: " + ec.message();
+        return false;
+    }
+
+    // Copy into a sibling staging directory first. A failed copy must never
+    // leave a partially indexed profile in the active library.
+    const std::wstring staging_base =
+        L".amalgam-duplicate-stage-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(GetTickCount64());
+    fs::path staging = root / staging_base;
+    for (int stage_suffix = 2; fs::exists(staging, ec) && !ec; ++stage_suffix)
+        staging = root / (staging_base + L"-" + std::to_wstring(stage_suffix));
+    if (ec) {
+        if (err) *err = "could not prepare duplicate staging directory: " + ec.message();
+        return false;
+    }
+
+    fs::copy(fs::path(source.directory), staging,
+             fs::copy_options::recursive | fs::copy_options::skip_symlinks, ec);
+    if (ec) {
+        std::error_code cleanup_error;
+        fs::remove_all(staging, cleanup_error);
         if (err) *err = "duplicate failed: " + ec.message();
         return false;
     }
-    out = source;
-    out.id = target.filename().string();
-    out.name = new_name.empty() ? source.name + " Copy" : new_name;
-    out.directory = target.wstring();
-    out.last_played = 0;
-    out.favorite = false;
-    if (!save(out, err)) return false;
+
+    Instance duplicate = source;
+    duplicate.id = target.filename().string();
+    duplicate.name = new_name.empty() ? source.name + " Copy" : new_name;
+    duplicate.directory = staging.wstring();
+    duplicate.last_played = 0;
+    duplicate.favorite = false;
+    if (!save(duplicate, err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(staging, cleanup_error);
+        return false;
+    }
+    if (!profile_identity_matches(source, source_identity, err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(staging, cleanup_error);
+        return false;
+    }
+    fs::rename(staging, target, ec);
+    if (ec) {
+        std::error_code cleanup_error;
+        fs::remove_all(staging, cleanup_error);
+        if (err) *err = "could not activate duplicated profile: " + ec.message();
+        return false;
+    }
+    duplicate.directory = target.wstring();
+    out = std::move(duplicate);
     return true;
 }
 
@@ -210,8 +285,11 @@ fs::path unique_recovery_destination(const fs::path& directory, const std::wstri
     const std::wstring prefix = std::to_wstring(now_seconds()) + L"-";
     fs::path destination = directory / (prefix + name);
     int suffix = 2;
-    while (fs::exists(destination, ec) && !ec)
+    while (fs::exists(destination, ec)) {
+        if (!allow_missing_path_error(ec)) return {};
         destination = directory / (prefix + std::to_wstring(suffix++) + L"-" + name);
+    }
+    if (!allow_missing_path_error(ec)) return {};
     return destination;
 }
 
@@ -225,8 +303,11 @@ bool prepare_metadata_prune(const fs::path& path, const std::string& filename,
                             std::vector<MetadataMutation>& out, std::string* err) {
     std::error_code ec;
     if (!fs::exists(path, ec)) {
-        if (ec && err) *err = ec.message();
-        return !ec;
+        if (!allow_missing_path_error(ec)) {
+            if (err) *err = ec.message();
+            return false;
+        }
+        return true;
     }
     Json original;
     std::string parse_error;
@@ -257,11 +338,14 @@ bool validate_world_source(const Instance& instance, const std::wstring& source,
                            std::string* err) {
     world = fs::path(source);
     std::error_code ec;
-    if (!fs::exists(world, ec) || ec || !fs::is_directory(world, ec)) {
+    if (!require_real_directory(fs::path(instance.directory), "selected profile directory", err)) return false;
+    const fs::path saves = fs::path(instance.directory) / L"saves";
+    if (!require_real_directory(saves, "profile worlds directory", err)) return false;
+    const fs::file_status world_status = fs::symlink_status(world, ec);
+    if (ec || fs::is_symlink(world_status) || !fs::is_directory(world_status)) {
         if (err) *err = ec ? ec.message() : "world directory does not exist";
         return false;
     }
-    const fs::path saves = fs::path(instance.directory) / L"saves";
     if (!is_direct_child(world, saves, err, "world")) return false;
     const std::wstring name = world.filename().wstring();
     if (!safe_filename(name) || name.rfind(L".amalgam-", 0) == 0) {
@@ -271,7 +355,307 @@ bool validate_world_source(const Instance& instance, const std::wstring& source,
     return true;
 }
 
+bool require_real_directory(const fs::path& directory, const char* label, std::string* err) {
+    std::error_code ec;
+    const fs::file_status status = fs::symlink_status(directory, ec);
+    if (ec) {
+        if (err) *err = std::string("could not inspect ") + label + ": " + ec.message();
+        return false;
+    }
+    if (!fs::exists(status)) {
+        if (err) *err = std::string(label) + " does not exist";
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (err) *err = std::string("could not inspect ") + label + " attributes";
+        return false;
+    }
+    if (fs::is_symlink(status) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !fs::is_directory(status)) {
+        if (err) *err = std::string(label) + " must be a real profile directory";
+        return false;
+    }
+    return true;
+}
+
+bool normalized_profile_path(const fs::path& path, std::wstring& out, std::string* err) {
+    std::error_code ec;
+    const fs::path absolute = fs::absolute(path, ec);
+    if (ec) {
+        if (err) *err = "could not resolve selected profile path: " + ec.message();
+        return false;
+    }
+    out = absolute.lexically_normal().wstring();
+    return !out.empty();
+}
+
+bool same_profile_path(const fs::path& left, const fs::path& right, std::string* err) {
+    std::wstring normalized_left;
+    std::wstring normalized_right;
+    if (!normalized_profile_path(left, normalized_left, err) ||
+        !normalized_profile_path(right, normalized_right, err)) {
+        return false;
+    }
+    return _wcsicmp(normalized_left.c_str(), normalized_right.c_str()) == 0;
+}
+
+bool same_persisted_profile_metadata(const Instance& left, const Instance& right) {
+    return left.id == right.id &&
+           left.name == right.name &&
+           left.minecraft_version == right.minecraft_version &&
+           left.loader == right.loader &&
+           left.loader_version == right.loader_version &&
+           left.performance_profile == right.performance_profile &&
+           left.java_path == right.java_path &&
+           left.icon_url == right.icon_url &&
+           left.pack_source == right.pack_source &&
+           left.pack_project == right.pack_project &&
+           left.pack_version == right.pack_version &&
+           left.pack_modified == right.pack_modified &&
+           left.group == right.group &&
+           left.memory_mb == right.memory_mb &&
+           left.last_played == right.last_played &&
+           left.favorite == right.favorite &&
+           left.is_ai_profile == right.is_ai_profile &&
+           left.ai_mode == right.ai_mode &&
+           left.ai_live_vision == right.ai_live_vision;
+}
+
+bool validate_profile_identity(const Instance& instance, std::string* err) {
+    if (instance.directory.empty() || instance.id.empty()) {
+        if (err) *err = "the selected profile is missing its identity; refresh the Library and try again";
+        return false;
+    }
+
+    const fs::path directory(instance.directory);
+    if (!require_real_directory(directory, "selected profile directory", err)) return false;
+
+    const std::wstring expected_name = net::to_wide(instance.id);
+    if (!safe_filename(expected_name) ||
+        _wcsicmp(directory.filename().wstring().c_str(), expected_name.c_str()) != 0) {
+        if (err) *err = "the selected profile no longer matches its managed directory; refresh the Library and try again";
+        return false;
+    }
+
+    const fs::path metadata = directory / L"instance.json";
+    std::error_code ec;
+    const fs::file_status metadata_status = fs::symlink_status(metadata, ec);
+    if (ec) {
+        if (err) *err = "could not inspect selected profile metadata: " + ec.message();
+        return false;
+    }
+    if (fs::is_symlink(metadata_status) || !fs::is_regular_file(metadata_status)) {
+        if (err) *err = "selected profile metadata must be a regular file inside the profile";
+        return false;
+    }
+
+    Instance persisted;
+    std::string load_error;
+    if (!from_json(directory.wstring(), persisted, &load_error)) {
+        if (err) *err = "could not verify selected profile metadata: " + load_error;
+        return false;
+    }
+    if (persisted.id != instance.id) {
+        if (err) *err = "the selected profile changed or was moved; refresh the Library and try again";
+        return false;
+    }
+    if (!same_persisted_profile_metadata(instance, persisted)) {
+        if (err) *err = "the selected profile changed since it was loaded; refresh the Library and try again";
+        return false;
+    }
+    return true;
+}
+
+bool validate_managed_content_source(const Instance& instance, const ContentEntry& entry,
+                                     fs::path& source, fs::path& content_root,
+                                     std::string* err) {
+    const wchar_t* root_name = content_root_name(entry.type);
+    if (!root_name) {
+        if (err) *err = "this content type is not managed by the selected profile";
+        return false;
+    }
+    if (instance.directory.empty() || entry.path.empty()) {
+        if (err) *err = "the selected content file is no longer available";
+        return false;
+    }
+
+    source = fs::path(entry.path);
+    std::error_code ec;
+    const fs::file_status source_status = fs::symlink_status(source, ec);
+    if (ec) {
+        if (err) *err = "could not inspect content file: " + ec.message();
+        return false;
+    }
+    const DWORD source_attributes = GetFileAttributesW(source.c_str());
+    if (source_attributes == INVALID_FILE_ATTRIBUTES) {
+        if (err) *err = "could not inspect content file attributes";
+        return false;
+    }
+    if (fs::is_symlink(source_status) || (source_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !fs::is_regular_file(source_status)) {
+        if (err) *err = "content file must be a regular file inside this profile";
+        return false;
+    }
+
+    content_root = fs::path(instance.directory) / root_name;
+    if (!require_real_directory(content_root, "profile content directory", err)) return false;
+    if (!is_direct_child(source, content_root, err, "content file")) return false;
+
+    const std::wstring source_name = source.filename().wstring();
+    if (!safe_filename(source_name)) {
+        if (err) *err = "content filename is unsafe";
+        return false;
+    }
+    return true;
+}
+
+bool prepare_recovery_directory(const Instance& instance, const wchar_t* root_name,
+                                fs::path& trash, std::string* err) {
+    const fs::path profile(instance.directory);
+    const fs::path trash_root = profile / L".amalgam-trash";
+    const fs::path content_root = trash_root / L"content";
+    trash = content_root / root_name;
+
+    // Do not follow a redirected recovery directory.  A profile itself may be
+    // stored on a supported redirected drive, but recovery must remain a
+    // normal child of that selected profile rather than an arbitrary target.
+    for (const fs::path& component : {trash_root, content_root, trash}) {
+        std::error_code ec;
+        const fs::file_status status = fs::symlink_status(component, ec);
+        if (!allow_missing_path_error(ec)) {
+            if (err) *err = "could not inspect content recovery folder: " + ec.message();
+            return false;
+        }
+        if (fs::exists(status) && (fs::is_symlink(status) || !fs::is_directory(status))) {
+            if (err) *err = "content recovery folder must remain inside the selected profile";
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    fs::create_directories(trash, ec);
+    if (ec) {
+        if (err) *err = "cannot create content recovery folder: " + ec.message();
+        return false;
+    }
+    for (const fs::path& component : {trash_root, content_root, trash}) {
+        if (!require_real_directory(component, "content recovery folder", err)) return false;
+    }
+    return true;
+}
+
+bool prepare_profile_local_directory(const Instance& instance, const fs::path& relative,
+                                     const char* label, fs::path& out, std::string* err) {
+    const fs::path profile(instance.directory);
+    if (!require_real_directory(profile, "selected profile directory", err)) return false;
+    if (relative.empty() || relative.is_absolute() || !relative.root_name().empty() ||
+        !relative.root_directory().empty()) {
+        if (err) *err = std::string(label) + " path is invalid";
+        return false;
+    }
+
+    std::vector<fs::path> directories;
+    fs::path current = profile;
+    for (const auto& part : relative) {
+        if (part.empty() || part == L"." || part == L"..") {
+            if (err) *err = std::string(label) + " path is invalid";
+            return false;
+        }
+        current /= part;
+        directories.push_back(current);
+        std::error_code ec;
+        const fs::file_status status = fs::symlink_status(current, ec);
+        if (!allow_missing_path_error(ec)) {
+            if (err) *err = "could not inspect " + std::string(label) + ": " + ec.message();
+            return false;
+        }
+        if (fs::exists(status) && (fs::is_symlink(status) || !fs::is_directory(status))) {
+            if (err) *err = std::string(label) + " must remain inside the selected profile";
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    fs::create_directories(current, ec);
+    if (ec) {
+        if (err) *err = "cannot create " + std::string(label) + ": " + ec.message();
+        return false;
+    }
+    for (const fs::path& directory : directories) {
+        if (!require_real_directory(directory, label, err)) return false;
+    }
+    out = current;
+    return true;
+}
+
 }  // namespace
+
+bool capture_profile_identity(const Instance& instance, ProfileIdentitySnapshot& out,
+                              std::string* err) {
+    out = {};
+    if (err) err->clear();
+    if (!validate_profile_identity(instance, err)) return false;
+
+    const fs::path metadata = fs::path(instance.directory) / L"instance.json";
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(metadata, ec);
+    if (ec) {
+        if (err) *err = "could not inspect selected profile metadata size: " + ec.message();
+        return false;
+    }
+    const fs::file_time_type modified = fs::last_write_time(metadata, ec);
+    if (ec) {
+        if (err) *err = "could not inspect selected profile metadata timestamp: " + ec.message();
+        return false;
+    }
+    if (!normalized_profile_path(fs::path(instance.directory), out.directory, err)) return false;
+    out.id = instance.id;
+    out.metadata_size = static_cast<uint64_t>(size);
+    out.metadata_last_write_time = modified;
+    return true;
+}
+
+bool profile_identity_matches(const Instance& instance, const ProfileIdentitySnapshot& snapshot,
+                              std::string* err) {
+    if (err) err->clear();
+    if (snapshot.directory.empty() || snapshot.id.empty() || snapshot.id != instance.id) {
+        if (err) *err = "the selected profile changed or was moved; refresh the Library and try again";
+        return false;
+    }
+    std::wstring current_directory;
+    if (!normalized_profile_path(fs::path(instance.directory), current_directory, err)) return false;
+    if (_wcsicmp(snapshot.directory.c_str(), current_directory.c_str()) != 0) {
+        if (err) *err = "the selected profile changed or was moved; refresh the Library and try again";
+        return false;
+    }
+
+    Instance persisted;
+    std::string current_error;
+    if (!from_json(instance.directory, persisted, &current_error)) {
+        if (err) *err = current_error.empty()
+            ? "the selected profile is no longer available; refresh the Library and try again"
+            : current_error;
+        return false;
+    }
+    if (persisted.id != snapshot.id) {
+        if (err) *err = "the selected profile changed or was moved; refresh the Library and try again";
+        return false;
+    }
+    ProfileIdentitySnapshot current;
+    if (!capture_profile_identity(persisted, current, &current_error)) {
+        if (err) *err = current_error.empty()
+            ? "the selected profile is no longer available; refresh the Library and try again"
+            : current_error;
+        return false;
+    }
+    if (current.metadata_size != snapshot.metadata_size ||
+        current.metadata_last_write_time != snapshot.metadata_last_write_time) {
+        if (err) *err = "the selected profile changed while this action was open; refresh the Library and try again";
+        return false;
+    }
+    return true;
+}
 
 std::vector<ContentEntry> list_content(const Instance& instance, std::string* err) {
     std::vector<ContentEntry> result;
@@ -327,7 +711,12 @@ std::vector<ContentEntry> list_content(const Instance& instance, std::string* er
 
 bool set_content_enabled(const ContentEntry& entry, bool enabled, std::string* err) {
     fs::path source(entry.path);
-    if (!fs::exists(source)) {
+    std::error_code ec;
+    const fs::file_status source_status = fs::symlink_status(source, ec);
+    const DWORD source_attributes = GetFileAttributesW(source.c_str());
+    if (ec || source_attributes == INVALID_FILE_ATTRIBUTES ||
+        fs::is_symlink(source_status) || (source_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !fs::is_regular_file(source_status)) {
         if (err) *err = "content file does not exist";
         return false;
     }
@@ -336,10 +725,83 @@ bool set_content_enabled(const ContentEntry& entry, bool enabled, std::string* e
     if (currently_enabled == enabled) return true;
     fs::path target = enabled ? source.parent_path() / name.substr(0, name.size() - 9)
                               : source.parent_path() / (name + L".disabled");
-    std::error_code ec;
+    if (fs::exists(target, ec) || ec) {
+        if (err) *err = ec ? ec.message() : "a content file already exists in the requested state";
+        return false;
+    }
     fs::rename(source, target, ec);
     if (ec && err) *err = ec.message();
     return !ec;
+}
+
+bool set_content_enabled(const Instance& instance, const ContentEntry& entry, bool enabled,
+                         std::string* err) {
+    fs::path source;
+    fs::path content_root;
+    if (!validate_managed_content_source(instance, entry, source, content_root, err)) return false;
+
+    const std::wstring name = source.filename().wstring();
+    const bool currently_enabled = !disabled_suffix(name);
+    if (currently_enabled == enabled) return true;
+
+    const fs::path target = enabled ? source.parent_path() / name.substr(0, name.size() - 9)
+                                    : source.parent_path() / (name + L".disabled");
+    if (!is_direct_child(target, content_root, err, "content target")) return false;
+
+    std::error_code ec;
+    const fs::file_status target_status = fs::symlink_status(target, ec);
+    if (!allow_missing_path_error(ec)) {
+        if (err) *err = "could not inspect content target: " + ec.message();
+        return false;
+    }
+    if (fs::exists(target_status)) {
+        if (err) *err = "a content file already exists in the requested state";
+        return false;
+    }
+    fs::rename(source, target, ec);
+    if (ec && err) *err = "could not change content state: " + ec.message();
+    return !ec;
+}
+
+bool capture_content_file_snapshot(const Instance& instance, const ContentEntry& entry,
+                                   ContentFileSnapshot& out, std::string* err) {
+    out = {};
+    fs::path source;
+    fs::path content_root;
+    if (!validate_managed_content_source(instance, entry, source, content_root, err)) return false;
+
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(source, ec);
+    if (ec) {
+        if (err) *err = "could not inspect content file size: " + ec.message();
+        return false;
+    }
+    const fs::file_time_type modified = fs::last_write_time(source, ec);
+    if (ec) {
+        if (err) *err = "could not inspect content file timestamp: " + ec.message();
+        return false;
+    }
+    out.path = source.wstring();
+    out.type = entry.type;
+    out.size = static_cast<uint64_t>(size);
+    out.last_write_time = modified;
+    return true;
+}
+
+bool content_file_matches_snapshot(const Instance& instance, const ContentEntry& entry,
+                                   const ContentFileSnapshot& snapshot,
+                                   std::string* err) {
+    if (snapshot.path.empty() || snapshot.type != entry.type || snapshot.path != entry.path) {
+        if (err) *err = "the selected content target changed; refresh the list and choose it again";
+        return false;
+    }
+    ContentFileSnapshot current;
+    if (!capture_content_file_snapshot(instance, entry, current, err)) return false;
+    if (current.size != snapshot.size || current.last_write_time != snapshot.last_write_time) {
+        if (err) *err = "the selected content file changed; refresh the list and choose it again";
+        return false;
+    }
+    return true;
 }
 
 bool remove_content(const Instance& instance, const ContentEntry& entry, std::string* err) {
@@ -450,19 +912,10 @@ bool move_content_to_trash(const Instance& instance, const ContentEntry& entry,
         if (err) *err = "this content type cannot be moved to profile recovery";
         return false;
     }
-    const fs::path source(entry.path);
-    std::error_code ec;
-    if (!fs::exists(source, ec) || ec || !fs::is_regular_file(source, ec)) {
-        if (err) *err = ec ? ec.message() : "content file does not exist";
-        return false;
-    }
-    const fs::path content_root = fs::path(instance.directory) / root_name;
-    if (!is_direct_child(source, content_root, err, "content file")) return false;
+    fs::path source;
+    fs::path content_root;
+    if (!validate_managed_content_source(instance, entry, source, content_root, err)) return false;
     const std::wstring source_name = source.filename().wstring();
-    if (!safe_filename(source_name)) {
-        if (err) *err = "content filename is unsafe";
-        return false;
-    }
     std::wstring metadata_name = source_name;
     if (disabled_suffix(metadata_name)) metadata_name.resize(metadata_name.size() - 9);
     const std::string metadata_filename = net::to_utf8(metadata_name);
@@ -475,12 +928,9 @@ bool move_content_to_trash(const Instance& instance, const ContentEntry& entry,
         return false;
     }
 
-    const fs::path trash = fs::path(instance.directory) / L".amalgam-trash" / L"content" / root_name;
-    fs::create_directories(trash, ec);
-    if (ec) {
-        if (err) *err = "cannot create content recovery folder: " + ec.message();
-        return false;
-    }
+    fs::path trash;
+    if (!prepare_recovery_directory(instance, root_name, trash, err)) return false;
+    std::error_code ec;
     const fs::path destination = unique_recovery_destination(trash, source_name, ec);
     if (ec) {
         if (err) *err = "cannot prepare content recovery path: " + ec.message();
@@ -514,28 +964,26 @@ bool move_content_to_trash(const Instance& instance, const ContentEntry& entry,
 
 bool move_screenshot_to_trash(const Instance& instance, const std::wstring& source,
                               std::wstring* out_path, std::string* err) {
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
     const fs::path screenshots = fs::path(instance.directory) / L"screenshots";
     const fs::path file(source);
     std::error_code ec;
-    if (!fs::exists(file, ec) || ec || !fs::is_regular_file(file, ec)) {
+    if (!require_real_directory(screenshots, "profile screenshots directory", err)) return false;
+    const fs::file_status file_status = fs::symlink_status(file, ec);
+    if (ec || fs::is_symlink(file_status) || !fs::is_regular_file(file_status)) {
         if (err) *err = ec ? ec.message() : "screenshot file does not exist";
         return false;
     }
-    if (!fs::equivalent(file.parent_path(), screenshots, ec) || ec) {
-        if (err) *err = ec ? ec.message() : "screenshot is outside the selected profile";
-        return false;
-    }
+    if (!is_direct_child(file, screenshots, err, "screenshot")) return false;
     const std::wstring filename = file.filename().wstring();
     if (!safe_filename(filename)) {
         if (err) *err = "screenshot filename is unsafe";
         return false;
     }
-    const fs::path trash = fs::path(instance.directory) / L".amalgam-trash" / L"screenshots";
-    fs::create_directories(trash, ec);
-    if (ec) {
-        if (err) *err = "cannot create screenshot recovery folder: " + ec.message();
-        return false;
-    }
+    fs::path trash;
+    if (!prepare_profile_local_directory(instance, fs::path(L".amalgam-trash") / L"screenshots",
+                                         "screenshot recovery folder", trash, err)) return false;
     const std::wstring prefix = std::to_wstring(now_seconds()) + L"-";
     fs::path destination = trash / (prefix + filename);
     int suffix = 2;
@@ -543,6 +991,16 @@ bool move_screenshot_to_trash(const Instance& instance, const std::wstring& sour
         destination = trash / (prefix + std::to_wstring(suffix++) + L"-" + filename);
     if (ec) {
         if (err) *err = "cannot prepare screenshot recovery path: " + ec.message();
+        return false;
+    }
+    if (!profile_identity_matches(instance, identity, err) ||
+        !require_real_directory(screenshots, "profile screenshots directory", err) ||
+        !is_direct_child(file, screenshots, err, "screenshot")) {
+        return false;
+    }
+    const fs::file_status current_status = fs::symlink_status(file, ec);
+    if (ec || fs::is_symlink(current_status) || !fs::is_regular_file(current_status)) {
+        if (err) *err = ec ? ec.message() : "screenshot changed; refresh the list and try again";
         return false;
     }
     fs::rename(file, destination, ec);
@@ -556,21 +1014,22 @@ bool move_screenshot_to_trash(const Instance& instance, const std::wstring& sour
 
 bool backup_world(const Instance& instance, const std::wstring& source,
                   std::wstring* out_path, std::string* err) {
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
     fs::path world;
     if (!validate_world_source(instance, source, world, err)) return false;
     std::error_code ec;
-    const fs::path backups = fs::path(instance.directory) / L".amalgam-backups" / L"worlds";
-    fs::create_directories(backups, ec);
-    if (ec) {
-        if (err) *err = "cannot create world backup folder: " + ec.message();
-        return false;
-    }
+    fs::path backups;
+    if (!prepare_profile_local_directory(instance, fs::path(L".amalgam-backups") / L"worlds",
+                                         "world backup folder", backups, err)) return false;
     const fs::path destination = unique_recovery_destination(backups, world.filename().wstring(), ec);
     if (ec) {
         if (err) *err = "cannot prepare world backup path: " + ec.message();
         return false;
     }
-    fs::copy(world, destination, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (!profile_identity_matches(instance, identity, err) ||
+        !validate_world_source(instance, source, world, err)) return false;
+    fs::copy(world, destination, fs::copy_options::recursive | fs::copy_options::skip_symlinks, ec);
     if (ec) {
         std::error_code cleanup_error;
         fs::remove_all(destination, cleanup_error);
@@ -583,20 +1042,21 @@ bool backup_world(const Instance& instance, const std::wstring& source,
 
 bool move_world_to_trash(const Instance& instance, const std::wstring& source,
                          std::wstring* out_path, std::string* err) {
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
     fs::path world;
     if (!validate_world_source(instance, source, world, err)) return false;
     std::error_code ec;
-    const fs::path trash = fs::path(instance.directory) / L".amalgam-trash" / L"worlds";
-    fs::create_directories(trash, ec);
-    if (ec) {
-        if (err) *err = "cannot create world recovery folder: " + ec.message();
-        return false;
-    }
+    fs::path trash;
+    if (!prepare_profile_local_directory(instance, fs::path(L".amalgam-trash") / L"worlds",
+                                         "world recovery folder", trash, err)) return false;
     const fs::path destination = unique_recovery_destination(trash, world.filename().wstring(), ec);
     if (ec) {
         if (err) *err = "cannot prepare world recovery path: " + ec.message();
         return false;
     }
+    if (!profile_identity_matches(instance, identity, err) ||
+        !validate_world_source(instance, source, world, err)) return false;
     fs::rename(world, destination, ec);
     if (ec) {
         if (err) *err = "could not move world to recovery: " + ec.message();
@@ -624,22 +1084,42 @@ fs::path unique_restore_directory(const fs::path& root, const std::wstring& base
 
 bool copy_restore_payload(const fs::path& source_root, const fs::path& destination_root,
                           std::string* err) {
+    if (!require_real_directory(source_root, "restore source", err)) return false;
+    const fs::path destination_parent = destination_root.parent_path();
+    if (destination_parent.empty() ||
+        !require_real_directory(destination_parent, "restore destination folder", err)) {
+        return false;
+    }
     std::error_code ec;
+    const fs::file_status existing_destination = fs::symlink_status(destination_root, ec);
+    if (!allow_missing_path_error(ec) || (fs::exists(existing_destination) &&
+               (fs::is_symlink(existing_destination) || !fs::is_directory(existing_destination)))) {
+        if (err) *err = ec ? "cannot inspect restore payload: " + ec.message()
+                           : "restore payload must remain inside its managed profile folder";
+        return false;
+    }
     fs::create_directories(destination_root, ec);
     if (ec) {
         if (err) *err = "cannot create restore payload: " + ec.message();
         return false;
     }
+    if (!require_real_directory(destination_root, "restore payload", err)) return false;
     for (const wchar_t* root_name : kRestoreRoots) {
         const fs::path source = source_root / root_name;
-        const bool exists = fs::exists(source, ec);
-        if (ec) {
+        const fs::file_status source_status = fs::symlink_status(source, ec);
+        if (!allow_missing_path_error(ec)) {
             if (err) *err = "cannot inspect restore payload: " + ec.message();
             return false;
         }
-        if (!exists) continue;
+        if (!fs::exists(source_status)) continue;
+        if (fs::is_symlink(source_status) || !fs::is_directory(source_status)) {
+            if (err) *err = "restore payload contains a redirected managed folder";
+            return false;
+        }
         fs::copy(source, destination_root / root_name,
-                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                 fs::copy_options::recursive | fs::copy_options::overwrite_existing |
+                     fs::copy_options::skip_symlinks,
+                 ec);
         if (ec) {
             if (err) *err = "restore point copy failed: " + ec.message();
             return false;
@@ -647,12 +1127,16 @@ bool copy_restore_payload(const fs::path& source_root, const fs::path& destinati
     }
     for (const wchar_t* file_name : kRestoreFiles) {
         const fs::path source = source_root / file_name;
-        const bool exists = fs::exists(source, ec);
-        if (ec) {
+        const fs::file_status source_status = fs::symlink_status(source, ec);
+        if (!allow_missing_path_error(ec)) {
             if (err) *err = "cannot inspect restore metadata: " + ec.message();
             return false;
         }
-        if (!exists) continue;
+        if (!fs::exists(source_status)) continue;
+        if (fs::is_symlink(source_status) || !fs::is_regular_file(source_status)) {
+            if (err) *err = "restore metadata must be a regular file";
+            return false;
+        }
         fs::copy_file(source, destination_root / file_name,
                       fs::copy_options::overwrite_existing, ec);
         if (ec) {
@@ -668,23 +1152,44 @@ bool copy_restore_payload(const fs::path& source_root, const fs::path& destinati
 // scope for profile-content restores.
 bool apply_restore_payload(const fs::path& source_root, const fs::path& destination_root,
                            std::string* err) {
+    if (!require_real_directory(source_root, "restore source", err) ||
+        !require_real_directory(destination_root, "selected profile directory", err)) {
+        return false;
+    }
     std::error_code ec;
     for (const wchar_t* root_name : kRestoreRoots) {
         const fs::path source = source_root / root_name;
-        const bool exists = fs::exists(source, ec);
-        if (ec) {
+        const fs::file_status source_status = fs::symlink_status(source, ec);
+        if (!allow_missing_path_error(ec)) {
             if (err) *err = "cannot inspect restore source: " + ec.message();
             return false;
         }
         const fs::path destination = destination_root / root_name;
+        const fs::file_status destination_status = fs::symlink_status(destination, ec);
+        if (!allow_missing_path_error(ec)) {
+            if (err) *err = "cannot inspect restored content destination: " + ec.message();
+            return false;
+        }
+        if (fs::exists(source_status) &&
+            (fs::is_symlink(source_status) || !fs::is_directory(source_status))) {
+            if (err) *err = "restore source contains a redirected managed folder";
+            return false;
+        }
+        if (fs::exists(destination_status) &&
+            (fs::is_symlink(destination_status) || !fs::is_directory(destination_status))) {
+            if (err) *err = "restored content destination is redirected or invalid";
+            return false;
+        }
         fs::remove_all(destination, ec);
         if (ec) {
             if (err) *err = "cannot replace restored content: " + ec.message();
             return false;
         }
-        if (!exists) continue;
+        if (!fs::exists(source_status)) continue;
         fs::copy(source, destination,
-                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                 fs::copy_options::recursive | fs::copy_options::overwrite_existing |
+                     fs::copy_options::skip_symlinks,
+                 ec);
         if (ec) {
             if (err) *err = "restore copy failed: " + ec.message();
             return false;
@@ -692,15 +1197,30 @@ bool apply_restore_payload(const fs::path& source_root, const fs::path& destinat
     }
     for (const wchar_t* file_name : kRestoreFiles) {
         const fs::path source = source_root / file_name;
-        const bool exists = fs::exists(source, ec);
-        if (ec) {
+        const fs::file_status source_status = fs::symlink_status(source, ec);
+        if (!allow_missing_path_error(ec)) {
             if (err) *err = "cannot inspect restore metadata: " + ec.message();
             return false;
         }
         const fs::path destination = destination_root / file_name;
+        const fs::file_status destination_status = fs::symlink_status(destination, ec);
+        if (!allow_missing_path_error(ec)) {
+            if (err) *err = "cannot inspect restored metadata destination: " + ec.message();
+            return false;
+        }
+        if (fs::exists(source_status) &&
+            (fs::is_symlink(source_status) || !fs::is_regular_file(source_status))) {
+            if (err) *err = "restore metadata must be a regular file";
+            return false;
+        }
+        if (fs::exists(destination_status) &&
+            (fs::is_symlink(destination_status) || !fs::is_regular_file(destination_status))) {
+            if (err) *err = "restored metadata destination is redirected or invalid";
+            return false;
+        }
         // Never remove the profile definition merely because an old manually
         // created restore point predates it.
-        if (!exists) {
+        if (!fs::exists(source_status)) {
             if (std::wstring(file_name) != L"instance.json") fs::remove(destination, ec);
         } else {
             fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
@@ -716,7 +1236,11 @@ bool apply_restore_payload(const fs::path& source_root, const fs::path& destinat
 }  // namespace
 
 bool create_restore_point(const Instance& instance, std::wstring* out_path, std::string* err) {
-    const fs::path backup_root = fs::path(instance.directory) / L".amalgam-restore";
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
+    fs::path backup_root;
+    if (!prepare_profile_local_directory(instance, L".amalgam-restore", "profile restore folder",
+                                         backup_root, err)) return false;
     const fs::path target = unique_restore_directory(
         backup_root, std::to_wstring(static_cast<long long>(std::time(nullptr))));
     std::string copy_error;
@@ -726,11 +1250,18 @@ bool create_restore_point(const Instance& instance, std::wstring* out_path, std:
         if (err) *err = copy_error;
         return false;
     }
+    if (!profile_identity_matches(instance, identity, err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(target, cleanup_error);
+        return false;
+    }
     if (out_path) *out_path = target.wstring();
     return true;
 }
 
 bool restore_latest(const Instance& instance, std::string* err) {
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
     const fs::path profile_root(instance.directory);
     const fs::path backup_root = profile_root / L".amalgam-restore";
     std::error_code ec;
@@ -738,9 +1269,12 @@ bool restore_latest(const Instance& instance, std::string* err) {
         if (err) *err = "no restore points found";
         return false;
     }
+    if (!require_real_directory(backup_root, "profile restore folder", err)) return false;
     fs::path latest;
     for (const auto& entry : fs::directory_iterator(backup_root, ec)) {
-        if (ec || !entry.is_directory()) continue;
+        if (ec) break;
+        const fs::file_status status = entry.symlink_status(ec);
+        if (ec || fs::is_symlink(status) || !fs::is_directory(status)) continue;
         if (latest.empty() || entry.path().filename().wstring() > latest.filename().wstring())
             latest = entry.path();
     }
@@ -752,7 +1286,9 @@ bool restore_latest(const Instance& instance, std::string* err) {
     // Stage the requested snapshot before changing the live profile. Then make
     // a normal restore point of the current state: a second Restore action is
     // therefore a real undo, and a failed apply can safely roll back.
-    const fs::path staging_root = profile_root / L".amalgam-restore-staging";
+    fs::path staging_root;
+    if (!prepare_profile_local_directory(instance, L".amalgam-restore-staging",
+                                         "restore staging folder", staging_root, err)) return false;
     const fs::path staged = unique_restore_directory(
         staging_root, L"restore-" + std::to_wstring(static_cast<long long>(std::time(nullptr))));
     std::string stage_error;
@@ -769,6 +1305,11 @@ bool restore_latest(const Instance& instance, std::string* err) {
         std::error_code cleanup_error;
         fs::remove_all(staged, cleanup_error);
         if (err) *err = "restore cancelled: current profile backup failed: " + rollback_error;
+        return false;
+    }
+    if (!profile_identity_matches(instance, identity, err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(staged, cleanup_error);
         return false;
     }
 
@@ -797,18 +1338,17 @@ uint64_t backup_directory_size(const fs::path& root, std::error_code& ec) {
     if (!fs::exists(root, ec)) return 0;
     for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
         if (ec) break;
-        if (!entry.is_regular_file(ec)) continue;
+        const fs::file_status status = entry.symlink_status(ec);
+        if (ec || fs::is_symlink(status) || !fs::is_regular_file(status)) continue;
         total += static_cast<uint64_t>(entry.file_size(ec));
     }
     return total;
 }
 
 bool backup_path_is_owned(const Instance& instance, const fs::path& path) {
+    if (path.empty() || !safe_filename(path.filename().wstring())) return false;
     const fs::path root = fs::path(instance.directory) / L".amalgam-restore";
-    const fs::path normalized_root = fs::absolute(root).lexically_normal();
-    const fs::path normalized_path = fs::absolute(path).lexically_normal();
-    const std::wstring root_text = normalized_root.wstring() + L"\\";
-    return normalized_path.wstring().rfind(root_text, 0) == 0;
+    return same_profile_path(path.parent_path(), root, nullptr);
 }
 
 }  // namespace
@@ -817,10 +1357,20 @@ std::vector<BackupEntry> list_restore_points(const Instance& instance, std::stri
     std::vector<BackupEntry> result;
     const fs::path root = fs::path(instance.directory) / L".amalgam-restore";
     std::error_code ec;
-    if (!fs::exists(root, ec)) return result;
+    const fs::file_status root_status = fs::symlink_status(root, ec);
+    if (!allow_missing_path_error(ec)) {
+        if (err) *err = "could not inspect restore points: " + ec.message();
+        return result;
+    }
+    if (!fs::exists(root_status)) return result;
+    if (fs::is_symlink(root_status) || !fs::is_directory(root_status)) {
+        if (err) *err = "restore points folder must remain inside the selected profile";
+        return result;
+    }
     for (const auto& entry : fs::directory_iterator(root, ec)) {
         if (ec) break;
-        if (!entry.is_directory(ec)) continue;
+        const fs::file_status status = entry.symlink_status(ec);
+        if (ec || fs::is_symlink(status) || !fs::is_directory(status)) continue;
         BackupEntry backup;
         backup.path = entry.path().wstring();
         backup.name = entry.path().filename().string();
@@ -836,11 +1386,22 @@ std::vector<BackupEntry> list_restore_points(const Instance& instance, std::stri
 }
 
 bool remove_restore_point(const Instance& instance, const std::wstring& path, std::string* err) {
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
     if (!backup_path_is_owned(instance, fs::path(path))) {
         if (err) *err = "restore point path is outside the selected profile";
         return false;
     }
+    const fs::path restore_root = fs::path(instance.directory) / L".amalgam-restore";
+    if (!require_real_directory(restore_root, "profile restore folder", err)) return false;
     std::error_code ec;
+    const fs::file_status status = fs::symlink_status(path, ec);
+    if (ec || fs::is_symlink(status) || !fs::is_directory(status)) {
+        if (err) *err = ec ? "could not inspect restore point: " + ec.message()
+                           : "restore point must be a managed folder inside this profile";
+        return false;
+    }
+    if (!profile_identity_matches(instance, identity, err)) return false;
     fs::remove_all(path, ec);
     if (ec) {
         if (err) *err = "could not remove restore point: " + ec.message();
@@ -862,28 +1423,35 @@ const char* content_type_name(ContentType type) {
 
 bool remove(const Instance& instance, std::string* err) {
     if (err) err->clear();
+    ProfileIdentitySnapshot identity;
+    if (!capture_profile_identity(instance, identity, err)) return false;
     const fs::path source(instance.directory);
     std::error_code ec;
-    if (!fs::exists(source, ec) || ec || !fs::is_directory(source, ec)) {
-        if (err) *err = ec ? ec.message() : "profile directory does not exist";
-        return false;
-    }
     const std::wstring name = source.filename().wstring();
     if (!safe_filename(name) || name.rfind(L".amalgam-", 0) == 0 || source.parent_path().empty()) {
         if (err) *err = "profile directory is not safe to move";
         return false;
     }
     const fs::path recovery = source.parent_path() / L".amalgam-profile-recovery";
+    const fs::file_status recovery_status = fs::symlink_status(recovery, ec);
+    if (!allow_missing_path_error(ec) || (fs::exists(recovery_status) &&
+               (fs::is_symlink(recovery_status) || !fs::is_directory(recovery_status)))) {
+        if (err) *err = ec ? "could not inspect profile recovery folder: " + ec.message()
+                           : "profile recovery folder must remain beside the active library";
+        return false;
+    }
     fs::create_directories(recovery, ec);
     if (ec) {
         if (err) *err = "cannot create profile recovery folder: " + ec.message();
         return false;
     }
+    if (!require_real_directory(recovery, "profile recovery folder", err)) return false;
     const fs::path destination = unique_recovery_destination(recovery, name, ec);
     if (ec) {
         if (err) *err = "cannot prepare profile recovery path: " + ec.message();
         return false;
     }
+    if (!profile_identity_matches(instance, identity, err)) return false;
     fs::rename(source, destination, ec);
     if (ec && err) *err = "could not move profile to recovery: " + ec.message();
     return !ec;

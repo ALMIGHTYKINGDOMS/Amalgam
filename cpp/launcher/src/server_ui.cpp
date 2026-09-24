@@ -3,6 +3,7 @@
 #include "services.h"
 #include "server_types.h"
 #include "server_providers.h"
+#include "server_provision.h"
 #include "version_catalog.h"
 #include "essentials_address.h"
 #include "config.h"
@@ -14,12 +15,15 @@
 #include <shlobj.h>
 #include <commdlg.h>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <exception>
 #include <mutex>
+#include <thread>
 
 namespace aml::ui {
 
@@ -31,7 +35,8 @@ static std::wstring servers_json_path() {
     return aml::net::get_local_app_data_path() + L"\\amalgam\\servers.json";
 }
 
-static void save_local_servers(const std::vector<server::ServerConfig>& servers) {
+static bool save_local_servers(const std::vector<server::ServerConfig>& servers,
+                               std::string* error = nullptr) {
     Json arr = Json::arr();
     for (const auto& s : servers) {
         Json obj = Json::obj();
@@ -46,7 +51,13 @@ static void save_local_servers(const std::vector<server::ServerConfig>& servers)
         arr.push(obj);
     }
     std::string err;
-    aml::json_write_file(servers_json_path(), arr, &err);
+    const bool saved = aml::json_write_file(servers_json_path(), arr, &err);
+    if (!saved && error) {
+        *error = err.empty()
+            ? "The launcher could not save the local server list."
+            : err;
+    }
+    return saved;
 }
 
 static void load_local_servers(std::vector<server::ServerConfig>& servers) {
@@ -76,6 +87,45 @@ static bool local_server_supervised(const server::ServerConfig& sv) {
     return aml::services::local_server_manager()->is_local_server_running(sv.name);
 }
 
+// Pull only telemetry the local supervisor can prove.  CPU and working-set
+// memory come from the supervised Windows process; Minecraft-internal TPS and
+// player counts remain unavailable until a server-side health bridge reports
+// them, so the UI never turns zero defaults into fake live values.
+static void refresh_local_server_metrics(UiState& st,
+                                         const server::ServerConfig& server_config) {
+    if (st.fixture_mode || !local_server_supervised(server_config)) {
+        st.server_metrics = server::ServerMetrics();
+        return;
+    }
+
+    std::string error;
+    const auto sample = aml::services::local_server_manager()->get_local_server_metrics(
+        server_config.name, &error);
+    if (!sample.valid) {
+        st.server_metrics = server::ServerMetrics();
+        return;
+    }
+
+    auto& metrics = st.server_metrics;
+    metrics = server::ServerMetrics();
+    metrics.valid = true;
+    metrics.cpu_valid = sample.cpu_valid;
+    metrics.ram_valid = sample.memory_valid;
+    metrics.tps_valid = false;
+    metrics.players_valid = false;
+    metrics.cpu_percent = sample.cpu_percent;
+    if (sample.memory_valid) {
+        constexpr double kMegabyte = 1024.0 * 1024.0;
+        metrics.ram_mb = static_cast<int>(std::max<uint64_t>(1,
+            static_cast<uint64_t>(sample.working_set_bytes / kMegabyte)));
+        metrics.ram_percent = server_config.allocated_ram_mb > 0
+            ? std::clamp(static_cast<float>(sample.working_set_bytes /
+                (kMegabyte * static_cast<double>(server_config.allocated_ram_mb)) * 100.0),
+                         0.0f, 100.0f)
+            : 0.0f;
+    }
+}
+
 static server::ServerStage effective_stage(const UiState& st,
                                            const server::ServerConfig& sv) {
     // Visual-review fixtures seed a running server with no process on purpose.
@@ -88,8 +138,28 @@ static server::ServerStage effective_stage(const UiState& st,
 static void reconcile_local_server_stages(std::vector<server::ServerConfig>& servers) {
     bool changed = false;
     for (auto& sv : servers) {
-        const server::ServerStage stage =
+        server::ServerStage stage =
             server::reconciled_stage(sv, local_server_supervised(sv));
+        if (stage == server::ServerStage::Installing) {
+            // A persisted install means the launcher closed while the files
+            // were being fetched: nothing finished them.
+            stage = server::ServerStage::NotInstalled;
+            sv.status_message = "The server files were not finished in the last session.";
+        } else if (stage == server::ServerStage::Ready &&
+                   !server::runtime_files_present(sv)) {
+            stage = server::ServerStage::NotInstalled;
+            sv.status_message = std::string(server::server_software_name(sv.software)) +
+                                " is not installed in this server folder yet.";
+            if (server::server_software_kind(sv.software) == server::RuntimeKind::Manual) {
+                // Say what a manual runtime needs instead of pointing at a
+                // download that does not exist.
+                aml::server_providers::RuntimeArtifact artifact;
+                std::string reason;
+                aml::server_providers::resolve_runtime(sv.software, sv.minecraft_version,
+                                                       artifact, &reason);
+                if (!artifact.manual_hint.empty()) sv.status_message = artifact.manual_hint;
+            }
+        }
         if (stage != sv.stage) {
             sv.stage = stage;
             changed = true;
@@ -98,9 +168,43 @@ static void reconcile_local_server_stages(std::vector<server::ServerConfig>& ser
     if (changed) save_local_servers(servers);
 }
 
-// Whether any server on this page is supervised and up. Its console and
-// metrics keep moving while it is, so the render loop keeps drawing for it.
+// The runtime download the page is running. It lives outside ServerUIState
+// because the render loop, the page and the worker thread all have to see it:
+// atomics for the flag and progress, a mutex for the text.
+struct RuntimeDownload {
+    std::atomic<bool> active{false};
+    std::atomic<bool> cancel{false};
+    // Only active network transfers observe cancel through net::download's
+    // progress callback. Resolution, unpacking, installer execution, and
+    // final config writing cannot be stopped safely by this job.
+    std::atomic<bool> cancellable{false};
+    std::atomic<bool> cancellation_observed{false};
+    std::atomic<float> progress{0.0f};
+    // The worker publishes its outcome here and never touches the server list:
+    // the page owns that list, so it applies the result on its own thread.
+    std::atomic<bool> finished{false};
+    std::mutex mu;
+    std::string server;
+    std::string phase;
+    std::string outcome;
+    bool success = false;
+    bool cancelled = false;
+};
+
+static RuntimeDownload& runtime_download() {
+    static RuntimeDownload job;
+    return job;
+}
+
+// Whether any server on this page is supervised and up, or a runtime download
+// is running. The console, the metrics and the download's progress all keep
+// moving, so the render loop keeps drawing for this page.
 bool server_ui_has_live_server(UiState& st) {
+    // A visual fixture has no live server by definition.  This helper is
+    // queried by the shared render loop, so protect the boundary here as well
+    // as inside the page renderer.
+    if (st.fixture_mode) return false;
+    if (runtime_download().active.load()) return true;
     for (const auto& sv : st.servers)
         if (local_server_supervised(sv)) return true;
     return false;
@@ -109,6 +213,42 @@ bool server_ui_has_live_server(UiState& st) {
 // ---------------------------------------------------------------------------
 // UI state singleton (codebase pattern)
 // ---------------------------------------------------------------------------
+
+enum class LocalServerAction {
+    Start,
+    Stop,
+    Restart,
+};
+
+// Console, player, and world actions all write to the same supervised-process
+// pipe. Keep their UI intent explicit so the result can be reconciled with the
+// correct field or console without letting a late worker update a different
+// server surface.
+enum class LocalServerCommandOrigin : int64_t {
+    PopupConsole,
+    DetailConsole,
+    Kick,
+    Ban,
+    WhitelistAdd,
+    WhitelistRemove,
+    OpAdd,
+    OpRemove,
+    SaveAll,
+};
+
+// A server name is the service-layer key, but it is not enough to safely
+// reconcile a completed background operation into a mutable launcher list.
+// Keep the saved-server identity and the action inputs together so a rename,
+// re-import, or removal while an operation is in flight cannot update a newer
+// entry by accident.
+struct LocalServerActionTarget {
+    std::string name;
+    std::string server_directory;
+    std::string minecraft_version;
+    server::ServerSoftware software = server::ServerSoftware::Vanilla;
+    int port = 0;
+    int allocated_ram_mb = 0;
+};
 
 struct ServerUIState {
     bool loaded = false;
@@ -119,12 +259,24 @@ struct ServerUIState {
 
     // Create dialog
     std::string create_name;
-    std::string create_version = version_catalog::default_server_version();
+    std::string create_version;
     int create_software_idx = 0;
     int create_ram = 4096;
     int create_max_players = 20;
     int create_port = 25565;
     bool create_eula_accepted = false;
+    std::string create_error;
+
+    // The live version list for the software the create dialog is showing.
+    // `version_software` is the software the list belongs to, so a reply from
+    // an earlier selection cannot be painted as the current one.
+    std::mutex version_mu;
+    int version_software = -1;
+    std::vector<std::string> version_list;
+    bool version_loading = false;
+    bool version_live = false;
+    std::string version_error;
+
 
     // Filters
     int filter_status = 0;
@@ -161,8 +313,14 @@ struct ServerUIState {
     std::string file_preview_name;
     std::string file_preview_content;
     bool file_preview_open = false;
+    // Snapshot-only presentation of the file-row action menu.  This stays
+    // separate from the live menu so a visual fixture cannot inherit a real
+    // path, a filesystem read, or an Explorer launch target.
+    bool fixture_file_context_menu_open = false;
+    std::string fixture_file_context_menu_name;
     bool file_delete_confirm = false;
     std::string file_delete_target;
+    std::string file_delete_error;
 
     // Detail – players
     std::vector<server::ServerPlayer> detail_players;
@@ -176,6 +334,10 @@ struct ServerUIState {
     uint64_t world_size_bytes = 0;
     std::string world_name;
     bool world_dirty = true;
+    bool restore_backup_confirm = false;
+    std::string restore_backup_id;
+    std::string restore_backup_name;
+    std::string restore_backup_error;
 
     // Detail – console (embedded)
     std::string detail_console_filter;
@@ -189,6 +351,25 @@ struct ServerUIState {
     std::string action_failure_action;
     std::string action_failure_server;
     std::string action_failure_cause;
+    std::string action_result_action;
+    std::string action_result_server;
+    std::string action_result_detail;
+
+    // Process control can wait for a graceful stop, Java resolution, or pipe
+    // setup. Keep it in one launcher-owned lane so the render path never waits
+    // and no two controls can issue contradictory commands at once.
+    AsyncUiRequestState local_action_request;
+    bool local_action_target_active = false;
+    LocalServerActionTarget local_action_target;
+
+    // A command write is normally quick, but a blocked process pipe must
+    // never freeze a launcher frame. This is deliberately a separate lane
+    // from lifecycle work so a result can retain its console/form provenance.
+    AsyncUiRequestState local_command_request;
+    bool local_command_target_active = false;
+    LocalServerActionTarget local_command_target;
+
+    std::string remove_server_error;
 };
 
 static ServerUIState& state() {
@@ -201,6 +382,9 @@ static ServerUIState& state() {
 // state) instead of replacing it with a generic line.
 static void report_server_failure(ServerUIState& s, UiState& st, const char* action,
                                  const std::string& server, const std::string& cause) {
+    s.action_result_action.clear();
+    s.action_result_server.clear();
+    s.action_result_detail.clear();
     s.action_failure_action = action;
     s.action_failure_server = server;
     s.action_failure_cause = cause.empty()
@@ -217,30 +401,639 @@ static void clear_server_failure(ServerUIState& s) {
     s.action_failure_cause.clear();
 }
 
+static void clear_server_action_result(ServerUIState& s) {
+    s.action_result_action.clear();
+    s.action_result_server.clear();
+    s.action_result_detail.clear();
+}
+
+static const char* local_server_action_key(LocalServerAction action) {
+    switch (action) {
+        case LocalServerAction::Start:   return "local-server-start";
+        case LocalServerAction::Stop:    return "local-server-stop";
+        case LocalServerAction::Restart: return "local-server-restart";
+    }
+    return "local-server-action";
+}
+
+static const char* local_server_action_label(LocalServerAction action) {
+    switch (action) {
+        case LocalServerAction::Start:   return "Start";
+        case LocalServerAction::Stop:    return "Stop";
+        case LocalServerAction::Restart: return "Restart";
+    }
+    return "Server action";
+}
+
+static const char* local_server_action_label_from_key(const std::string& action) {
+    if (action == "local-server-start") return "Start";
+    if (action == "local-server-stop") return "Stop";
+    if (action == "local-server-restart") return "Restart";
+    return "Server action";
+}
+
+static const char* local_server_action_working_label_from_key(const std::string& action) {
+    if (action == "local-server-start") return "Starting";
+    if (action == "local-server-stop") return "Stopping";
+    if (action == "local-server-restart") return "Restarting";
+    return "Working on";
+}
+
+static LocalServerActionTarget make_local_server_action_target(
+    const server::ServerConfig& server) {
+    LocalServerActionTarget target;
+    target.name = server.name;
+    target.server_directory = server.server_directory;
+    target.minecraft_version = server.minecraft_version;
+    target.software = server.software;
+    target.port = server.port;
+    target.allocated_ram_mb = server.allocated_ram_mb;
+    return target;
+}
+
+static bool local_server_action_target_matches(const server::ServerConfig& server,
+                                               const LocalServerActionTarget& target) {
+    return server.name == target.name &&
+           server.server_directory == target.server_directory &&
+           server.minecraft_version == target.minecraft_version &&
+           server.software == target.software &&
+           server.port == target.port &&
+           server.allocated_ram_mb == target.allocated_ram_mb;
+}
+
+// Return a target only when it resolves to exactly one saved entry. The local
+// service currently uses the name as its key, so accepting an ambiguous saved
+// identity would make a correct worker result unsafe to apply in the UI.
+static server::ServerConfig* find_unique_local_server_action_target(
+    UiState& st, const LocalServerActionTarget& target) {
+    server::ServerConfig* match = nullptr;
+    for (auto& server : st.servers) {
+        if (!local_server_action_target_matches(server, target)) continue;
+        if (match) return nullptr;
+        match = &server;
+    }
+    return match;
+}
+
+static void set_local_server_action_result_target(AsyncUiRequestResult& result,
+                                                   const LocalServerActionTarget& target) {
+    result.payload_a = target.name;
+    result.payload_b = target.server_directory;
+    result.payload_c = target.minecraft_version;
+    result.numbers = {
+        static_cast<int64_t>(target.port),
+        static_cast<int64_t>(target.allocated_ram_mb),
+        static_cast<int64_t>(target.software),
+    };
+}
+
+static bool read_local_server_action_result_target(const AsyncUiRequestResult& result,
+                                                   LocalServerActionTarget& target) {
+    if (result.payload_a.empty() || result.numbers.size() != 3) return false;
+    target.name = result.payload_a;
+    target.server_directory = result.payload_b;
+    target.minecraft_version = result.payload_c;
+    target.port = static_cast<int>(result.numbers[0]);
+    target.allocated_ram_mb = static_cast<int>(result.numbers[1]);
+    target.software = static_cast<server::ServerSoftware>(result.numbers[2]);
+    return true;
+}
+
+static AsyncUiRequestResult run_local_server_action(LocalServerAction action,
+                                                     const LocalServerActionTarget& target) {
+    AsyncUiRequestResult result;
+    result.number_a = -1;  // No stage reconciliation is safe for this result.
+    set_local_server_action_result_target(result, target);
+
+    auto* service = aml::services::local_server_manager();
+    const char* label = local_server_action_label(action);
+    if (!service) {
+        result.title = std::string(label) + " unavailable";
+        result.detail = "The local server service is unavailable. Please restart Amalgam and try again.";
+        return result;
+    }
+
+    std::string error;
+    bool completed = false;
+    switch (action) {
+        case LocalServerAction::Start:
+            completed = service->start_local_server(target.name, "", target.allocated_ram_mb, &error);
+            if (completed) result.number_a = static_cast<int64_t>(server::ServerStage::Running);
+            break;
+        case LocalServerAction::Stop:
+            completed = service->stop_local_server(target.name, &error);
+            if (completed) result.number_a = static_cast<int64_t>(server::ServerStage::Stopped);
+            break;
+        case LocalServerAction::Restart: {
+            const bool stopped = service->stop_local_server(target.name, &error);
+            if (!stopped) break;
+            completed = service->start_local_server(target.name, "", target.allocated_ram_mb, &error);
+            // A restart that successfully stopped the process but could not
+            // start it again still has a truthful local state: stopped.
+            result.number_a = static_cast<int64_t>(completed
+                ? server::ServerStage::Running
+                : server::ServerStage::Stopped);
+            break;
+        }
+    }
+
+    result.success = completed;
+    result.title = completed ? std::string(label) + " complete"
+                             : std::string(label) + " failed";
+    if (completed) {
+        result.detail = std::string("Amalgam completed the local-only ") +
+            label + " action for \"" + target.name + "\".";
+    } else {
+        result.detail = error.empty()
+            ? "The local server service did not report why the request could not complete."
+            : error;
+    }
+    return result;
+}
+
+static bool local_server_action_lane_busy(const ServerUIState& s) {
+    return snapshot_async_ui_request(s.local_action_request).working;
+}
+
+static bool local_server_action_is_working(const ServerUIState& s,
+                                           LocalServerAction action) {
+    const auto snapshot = snapshot_async_ui_request(s.local_action_request);
+    return snapshot.working && snapshot.action == local_server_action_key(action);
+}
+
+static const char* local_server_command_key(LocalServerCommandOrigin origin) {
+    switch (origin) {
+        case LocalServerCommandOrigin::PopupConsole:   return "local-server-command-popup-console";
+        case LocalServerCommandOrigin::DetailConsole:  return "local-server-command-detail-console";
+        case LocalServerCommandOrigin::Kick:           return "local-server-command-kick";
+        case LocalServerCommandOrigin::Ban:            return "local-server-command-ban";
+        case LocalServerCommandOrigin::WhitelistAdd:   return "local-server-command-whitelist-add";
+        case LocalServerCommandOrigin::WhitelistRemove:return "local-server-command-whitelist-remove";
+        case LocalServerCommandOrigin::OpAdd:          return "local-server-command-op-add";
+        case LocalServerCommandOrigin::OpRemove:       return "local-server-command-op-remove";
+        case LocalServerCommandOrigin::SaveAll:        return "local-server-command-save-all";
+    }
+    return "local-server-command";
+}
+
+static const char* local_server_command_label(LocalServerCommandOrigin origin) {
+    switch (origin) {
+        case LocalServerCommandOrigin::PopupConsole:
+        case LocalServerCommandOrigin::DetailConsole:  return "Console command";
+        case LocalServerCommandOrigin::Kick:           return "Kick";
+        case LocalServerCommandOrigin::Ban:            return "Ban";
+        case LocalServerCommandOrigin::WhitelistAdd:   return "Add to Whitelist";
+        case LocalServerCommandOrigin::WhitelistRemove:return "Remove from Whitelist";
+        case LocalServerCommandOrigin::OpAdd:          return "Make OP";
+        case LocalServerCommandOrigin::OpRemove:       return "De-op";
+        case LocalServerCommandOrigin::SaveAll:        return "Save-All";
+    }
+    return "Server command";
+}
+
+static bool local_server_command_origin_from_result(int64_t value,
+                                                    LocalServerCommandOrigin& origin) {
+    if (value < static_cast<int64_t>(LocalServerCommandOrigin::PopupConsole) ||
+        value > static_cast<int64_t>(LocalServerCommandOrigin::SaveAll)) {
+        return false;
+    }
+    origin = static_cast<LocalServerCommandOrigin>(value);
+    return true;
+}
+
+static bool local_server_command_lane_busy(const ServerUIState& s) {
+    return async_ui_request_is_reserved(s.local_command_request);
+}
+
+static bool local_server_command_is_working(const ServerUIState& s,
+                                            LocalServerCommandOrigin origin) {
+    const auto snapshot = snapshot_async_ui_request(s.local_command_request);
+    return snapshot.working && snapshot.action == local_server_command_key(origin);
+}
+
+static AsyncUiRequestResult run_local_server_command(
+    const LocalServerActionTarget& target, LocalServerCommandOrigin origin,
+    const std::string& command) {
+    AsyncUiRequestResult result;
+    set_local_server_action_result_target(result, target);
+    result.number_a = static_cast<int64_t>(origin);
+    result.title = local_server_command_label(origin);
+
+    auto* service = aml::services::local_server_manager();
+    if (!service) {
+        result.detail = "The local server service is unavailable. Please restart Amalgam and try again.";
+        return result;
+    }
+
+    std::string response;
+    std::string error;
+    result.success = service->send_command(target.name, command, &response, &error);
+    if (result.success) {
+        result.detail = response.empty() ? "Command sent to local server" : response;
+    } else {
+        result.detail = error.empty()
+            ? "The local server service did not report why the command could not be sent."
+            : error;
+    }
+    return result;
+}
+
+static bool start_local_server_command(UiState& st, const server::ServerConfig& server,
+                                       LocalServerCommandOrigin origin,
+                                       const std::string& command) {
+    auto& s = state();
+    // Fixtures are an inert visual boundary even if a future presentation
+    // route accidentally exposes a command control.
+    if (st.fixture_mode || command.empty()) return false;
+    if (local_server_action_lane_busy(s) || local_server_command_lane_busy(s)) return false;
+
+    const LocalServerActionTarget target = make_local_server_action_target(server);
+    if (!find_unique_local_server_action_target(st, target)) {
+        report_server_failure(s, st, local_server_command_label(origin), target.name,
+                              "This saved server changed or is ambiguous. Refresh the server list before trying again.");
+        return false;
+    }
+
+    const std::string request_action = local_server_command_key(origin);
+    uint64_t request_generation = 0;
+    if (!begin_async_ui_request(s.local_command_request, request_action, &request_generation)) {
+        return false;
+    }
+
+    clear_server_failure(s);
+    clear_server_action_result(s);
+    s.local_command_target_active = true;
+    s.local_command_target = target;
+    spawn_worker(st, std::thread([&st, request_action, request_generation, origin, target, command]() {
+        AsyncUiRequestResult result;
+        try {
+            result = run_local_server_command(target, origin, command);
+        } catch (const std::exception&) {
+            set_local_server_action_result_target(result, target);
+            result.number_a = static_cast<int64_t>(origin);
+            result.title = local_server_command_label(origin);
+            result.detail = "The local server command ended unexpectedly. Please try again.";
+        } catch (...) {
+            set_local_server_action_result_target(result, target);
+            result.number_a = static_cast<int64_t>(origin);
+            result.title = local_server_command_label(origin);
+            result.detail = "The local server command ended unexpectedly. Please try again.";
+        }
+        if (!st.shutting_down.load()) {
+            complete_async_ui_request(state().local_command_request, request_action,
+                                      request_generation, std::move(result));
+        }
+    }));
+    return true;
+}
+
+static void append_local_server_command_console_result(ServerUIState& s,
+                                                       bool success,
+                                                       const std::string& detail) {
+    server::ServerConsoleEntry entry;
+    entry.timestamp = success ? "<" : "!";
+    entry.message = detail.empty()
+        ? (success ? "Command sent" : "Command could not be sent")
+        : detail;
+    s.console_log.push_back(std::move(entry));
+}
+
+static void consume_local_server_command_result(UiState& st) {
+    auto& s = state();
+    AsyncUiRequestSnapshot completed;
+    if (!take_async_ui_request_result(s.local_command_request, &completed)) return;
+
+    s.local_command_target_active = false;
+    LocalServerActionTarget target;
+    LocalServerCommandOrigin origin = LocalServerCommandOrigin::PopupConsole;
+    if (!read_local_server_action_result_target(completed.result, target) ||
+        !local_server_command_origin_from_result(completed.result.number_a, origin)) {
+        report_server_failure(s, st, "Server command", {},
+                              "The background command result was incomplete, so Amalgam did not apply it.");
+        return;
+    }
+
+    if (!find_unique_local_server_action_target(st, target)) {
+        report_server_failure(s, st, local_server_command_label(origin), target.name,
+                              "The saved server changed while this command was running. Amalgam left the newer entry unchanged; check the actual process state before retrying.");
+        return;
+    }
+
+    const char* label = local_server_command_label(origin);
+    const bool console_origin = origin == LocalServerCommandOrigin::PopupConsole ||
+                                origin == LocalServerCommandOrigin::DetailConsole;
+    if (console_origin) {
+        append_local_server_command_console_result(s, completed.result.success,
+                                                   completed.result.detail);
+    }
+
+    if (!completed.result.success) {
+        report_server_failure(s, st, label, target.name, completed.result.detail);
+        return;
+    }
+
+    switch (origin) {
+        case LocalServerCommandOrigin::WhitelistAdd:
+            s.player_whitelist_input.clear();
+            s.players_dirty = true;
+            break;
+        case LocalServerCommandOrigin::WhitelistRemove:
+        case LocalServerCommandOrigin::OpAdd:
+        case LocalServerCommandOrigin::OpRemove:
+        case LocalServerCommandOrigin::Kick:
+        case LocalServerCommandOrigin::Ban:
+            s.players_dirty = true;
+            if (origin == LocalServerCommandOrigin::OpAdd) s.player_op_input.clear();
+            break;
+        case LocalServerCommandOrigin::PopupConsole:
+        case LocalServerCommandOrigin::DetailConsole:
+        case LocalServerCommandOrigin::SaveAll:
+            break;
+    }
+
+    clear_server_failure(s);
+    s.action_result_action = label;
+    s.action_result_server = target.name;
+    s.action_result_detail = completed.result.detail;
+    push_notice(st, ui_model::NoticeLevel::Success, std::string(label) + " complete",
+                target.name + ": " + completed.result.detail);
+}
+
+static bool start_local_server_action(UiState& st, int server_index,
+                                      LocalServerAction action) {
+    auto& s = state();
+    // Keep the fixture isolation hard at the action boundary rather than
+    // relying solely on the fixture renderer's disabled controls.
+    if (st.fixture_mode) return false;
+    if (server_index < 0 || server_index >= static_cast<int>(st.servers.size())) {
+        report_server_failure(s, st, local_server_action_label(action), {},
+                              "The selected server is no longer available. Refresh the page and try again.");
+        return false;
+    }
+    if (local_server_action_lane_busy(s) || local_server_command_lane_busy(s)) return false;
+
+    const LocalServerActionTarget target =
+        make_local_server_action_target(st.servers[static_cast<size_t>(server_index)]);
+    if (!find_unique_local_server_action_target(st, target)) {
+        report_server_failure(s, st, local_server_action_label(action), target.name,
+                              "This saved server changed or is ambiguous. Refresh the server list before trying again.");
+        return false;
+    }
+
+    const std::string request_action = local_server_action_key(action);
+    uint64_t request_generation = 0;
+    if (!begin_async_ui_request(s.local_action_request, request_action, &request_generation)) {
+        return false;
+    }
+
+    clear_server_failure(s);
+    clear_server_action_result(s);
+    s.local_action_target_active = true;
+    s.local_action_target = target;
+    spawn_worker(st, std::thread([&st, request_action, request_generation, action, target]() {
+        AsyncUiRequestResult result;
+        try {
+            result = run_local_server_action(action, target);
+        } catch (const std::exception&) {
+            set_local_server_action_result_target(result, target);
+            result.number_a = -1;
+            result.title = std::string(local_server_action_label(action)) + " failed";
+            result.detail = "The local server action ended unexpectedly. Please try again.";
+        } catch (...) {
+            set_local_server_action_result_target(result, target);
+            result.number_a = -1;
+            result.title = std::string(local_server_action_label(action)) + " failed";
+            result.detail = "The local server action ended unexpectedly. Please try again.";
+        }
+        if (!st.shutting_down.load()) {
+            complete_async_ui_request(state().local_action_request, request_action,
+                                      request_generation, std::move(result));
+        }
+    }));
+    return true;
+}
+
+static void consume_local_server_action_result(UiState& st) {
+    auto& s = state();
+    AsyncUiRequestSnapshot completed;
+    if (!take_async_ui_request_result(s.local_action_request, &completed)) return;
+
+    s.local_action_target_active = false;
+    LocalServerActionTarget target;
+    const char* label = local_server_action_label_from_key(completed.action);
+    if (!read_local_server_action_result_target(completed.result, target)) {
+        report_server_failure(s, st, label, {},
+                              "The background result was incomplete, so Amalgam did not update any saved server state.");
+        return;
+    }
+
+    server::ServerConfig* current = find_unique_local_server_action_target(st, target);
+    if (!current) {
+        report_server_failure(s, st, label, target.name,
+                              "The saved server changed while this action was running. Amalgam left the newer entry unchanged; check the actual process state before retrying.");
+        return;
+    }
+
+    const int64_t saved_stage = completed.result.number_a;
+    if (saved_stage >= static_cast<int64_t>(server::ServerStage::NotInstalled) &&
+        saved_stage <= static_cast<int64_t>(server::ServerStage::Crashed)) {
+        current->stage = static_cast<server::ServerStage>(saved_stage);
+        std::string save_error;
+        if (!save_local_servers(st.servers, &save_error)) {
+            report_server_failure(s, st, label, target.name,
+                                  "The process action completed, but Amalgam could not save its new status: " +
+                                  (save_error.empty() ? std::string("unknown save error") : save_error));
+            return;
+        }
+    }
+
+    if (!completed.result.success) {
+        report_server_failure(s, st, label, target.name, completed.result.detail);
+        return;
+    }
+
+    clear_server_failure(s);
+    s.action_result_action = label;
+    s.action_result_server = target.name;
+    s.action_result_detail = completed.result.detail;
+    push_notice(st, ui_model::NoticeLevel::Success, std::string(label) + " complete",
+                completed.result.detail);
+}
+
+// This confirmation is reachable both from a server card and the local-server
+// detail view.  Keep it outside either layout so the detail view cannot set an
+// action_pending flag and then return before a user ever sees the confirmation.
+static void draw_remove_server_dialog(UiState& st) {
+    auto& s = state();
+    if (s.action_pending >= 0 && s.action_pending < static_cast<int>(st.servers.size())) {
+        ImGui::OpenPopup("Confirm Remove Server");
+    }
+    if (!ImGui::BeginPopupModal("Confirm Remove Server", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Remove saved server entry?");
+    ImGui::PopFont();
+    ImGui::Text("Remove \"%s\" from Amalgam?",
+                s.action_pending >= 0 && s.action_pending < static_cast<int>(st.servers.size())
+                    ? st.servers[static_cast<size_t>(s.action_pending)].name.c_str() : "");
+    ImGui::TextColored(k.muted,
+                       "This removes only Amalgam's saved server entry. The server folder and all server files stay on this PC.");
+    if (!s.remove_server_error.empty()) {
+        ImGui::Spacing();
+        ImGui::PushFont(f_bold);
+        ImGui::TextColored(k.red, "Remove failed");
+        ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, k.red);
+        ImGui::TextWrapped("%s", s.remove_server_error.c_str());
+        ImGui::PopStyleColor();
+    }
+    const bool fixture_preview = st.fixture_mode;
+    const bool local_action_busy = local_server_action_lane_busy(s) ||
+                                   local_server_command_lane_busy(s);
+    if (fixture_preview) {
+        ImGui::Spacing();
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture — removing this saved entry is disabled; no server list is changed.");
+    }
+    if (local_action_busy && !fixture_preview) {
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted,
+                           "A local server action is still finishing. This saved entry cannot be removed yet.");
+    }
+    ImGui::Spacing();
+    const auto attempt_remove_entry = [&] {
+        // Do not rely on a disabled fixture button alone. This is the action
+        // boundary that protects the persisted server list from any fixture
+        // invocation path.
+        if (st.fixture_mode || local_server_action_lane_busy(s)) return;
+        if (s.action_pending < 0 || s.action_pending >= static_cast<int>(st.servers.size())) return;
+        const int pending_index = s.action_pending;
+        std::vector<server::ServerConfig> revised_servers = st.servers;
+        revised_servers.erase(revised_servers.begin() + pending_index);
+        std::string save_error;
+        if (save_local_servers(revised_servers, &save_error)) {
+            st.servers = std::move(revised_servers);
+            s.action_pending = -1;
+            s.detail_server_idx = -1;
+            s.selected = -1;
+            s.remove_server_error.clear();
+            clear_server_failure(s);
+            push_notice(st, ui_model::NoticeLevel::Success, "Server entry removed",
+                        "The saved entry was removed from Amalgam. Its server folder and files were left unchanged.");
+            ImGui::CloseCurrentPopup();
+        } else {
+            s.remove_server_error = save_error.empty()
+                ? "The launcher could not save this change. The server remains in Amalgam."
+                : "The launcher could not save this change. The server remains in Amalgam: " + save_error;
+            report_server_failure(s, st, "Remove server entry",
+                                  st.servers[static_cast<size_t>(pending_index)].name,
+                                  s.remove_server_error);
+        }
+    };
+    if (danger_button("Remove entry", ImVec2(ui_px(120.0f), ui_px(32.0f)),
+                      fixture_preview || local_action_busy)) {
+        attempt_remove_entry();
+    }
+    ImGui::SameLine();
+    if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                     ImVec2(fixture_preview ? ui_px(116.0f) : ui_px(80.0f), ui_px(32.0f)))) {
+        s.action_pending = -1;
+        s.remove_server_error.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 // Rendered inside the page content, above everything else the Servers page
 // draws, so the reason is readable without leaving the page or opening Alerts.
-static void draw_server_action_failure(UiState& st) {
+static void draw_server_action_failure(UiState&) {
     auto& s = state();
-    if (s.action_failure_action.empty()) return;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(k.red.x, k.red.y, k.red.z, 0.08f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(k.red.x, k.red.y, k.red.z, 0.30f));
+    const auto request = snapshot_async_ui_request(s.local_action_request);
+    if (request.working) {
+        const char* action = local_server_action_working_label_from_key(request.action);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              ImVec4(k.brand.x, k.brand.y, k.brand.z, 0.09f));
+        ImGui::PushStyleColor(ImGuiCol_Border,
+                              ImVec4(k.brand.x, k.brand.y, k.brand.z, 0.36f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_px(8.0f));
+        if (ImGui::BeginChild("##server_action_working", ImVec2(-1, 0),
+                              ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY)) {
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.brand_hov, "%s local server", action);
+            ImGui::PopFont();
+            if (s.local_action_target_active && !s.local_action_target.name.empty()) {
+                ImGui::SameLine(0, ui_px(6.0f));
+                ImGui::TextColored(k.muted, "%s", s.local_action_target.name.c_str());
+            }
+            ImGui::PushFont(f_small);
+            ImGui::TextColored(k.muted,
+                               "Amalgam is keeping the interface responsive while the local process operation finishes.");
+            ImGui::PopFont();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+        ImGui::Spacing();
+    }
+
+    const auto command_request = snapshot_async_ui_request(s.local_command_request);
+    if (command_request.working) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              ImVec4(k.brand.x, k.brand.y, k.brand.z, 0.09f));
+        ImGui::PushStyleColor(ImGuiCol_Border,
+                              ImVec4(k.brand.x, k.brand.y, k.brand.z, 0.36f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_px(8.0f));
+        if (ImGui::BeginChild("##server_command_working", ImVec2(-1, 0),
+                              ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY)) {
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.brand_hov, "Sending local server command");
+            ImGui::PopFont();
+            if (s.local_command_target_active && !s.local_command_target.name.empty()) {
+                ImGui::SameLine(0, ui_px(6.0f));
+                ImGui::TextColored(k.muted, "%s", s.local_command_target.name.c_str());
+            }
+            ImGui::PushFont(f_small);
+            ImGui::TextColored(k.muted,
+                               "Amalgam is keeping the interface responsive while the command is delivered.");
+            ImGui::PopFont();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+        ImGui::Spacing();
+    }
+
+    if (s.action_failure_action.empty() && s.action_result_action.empty()) return;
+
+    const bool failed = !s.action_failure_action.empty();
+    const ImVec4 accent = failed ? k.red : k.green;
+    const std::string& action = failed ? s.action_failure_action : s.action_result_action;
+    const std::string& server = failed ? s.action_failure_server : s.action_result_server;
+    const std::string& detail = failed ? s.action_failure_cause : s.action_result_detail;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(accent.x, accent.y, accent.z, 0.08f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(accent.x, accent.y, accent.z, 0.30f));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui_px(8.0f));
-    if (ImGui::BeginChild("##server_action_failure", ImVec2(-1, 0),
+    if (ImGui::BeginChild("##server_action_feedback", ImVec2(-1, 0),
                           ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY)) {
         ImGui::PushFont(f_bold);
-        ImGui::TextColored(k.red, "%s failed", s.action_failure_action.c_str());
+        ImGui::TextColored(accent, "%s %s", action.c_str(), failed ? "failed" : "complete");
         ImGui::PopFont();
-        if (!s.action_failure_server.empty()) {
+        if (!server.empty()) {
             ImGui::SameLine(0, ui_px(6.0f));
-            ImGui::TextColored(k.muted, "%s", s.action_failure_server.c_str());
+            ImGui::TextColored(k.muted, "%s", server.c_str());
         }
         ImGui::PushFont(f_small);
-        ImGui::TextWrapped("%s", s.action_failure_cause.c_str());
+        ImGui::TextWrapped("%s", detail.c_str());
         ImGui::PopFont();
         ImGui::Spacing();
         if (ghost_button("Dismiss", ImVec2(ui_px(86.0f), ui_px(24.0f)))) {
-            clear_server_failure(s);
+            if (failed) clear_server_failure(s);
+            else clear_server_action_result(s);
         }
     }
     ImGui::EndChild();
@@ -253,19 +1046,19 @@ static void draw_server_action_failure(UiState& st) {
 // Software constants
 // ---------------------------------------------------------------------------
 
-static const char* kSoftwareNames[] = {
-    "Vanilla (manual)", "Paper", "Purpur", "Spigot (manual)", "Fabric", "Quilt", "Folia"
-};
-static const server::ServerSoftware kSoftwareValues[] = {
-    server::ServerSoftware::Vanilla,
-    server::ServerSoftware::Paper,
-    server::ServerSoftware::Purpur,
-    server::ServerSoftware::Spigot,
-    server::ServerSoftware::Fabric,
-    server::ServerSoftware::Quilt,
-    server::ServerSoftware::Folia
-};
-static const int kSoftwareCount = 7;
+static int software_index(server::ServerSoftware software) {
+    const auto& catalog = server::software_catalog();
+    for (size_t i = 0; i < catalog.size(); ++i) {
+        if (catalog[i].software == software) return static_cast<int>(i);
+    }
+    return 0;
+}
+
+static server::ServerSoftware software_at(int index) {
+    const auto& catalog = server::software_catalog();
+    if (index < 0 || index >= static_cast<int>(catalog.size())) return catalog.front().software;
+    return catalog[static_cast<size_t>(index)].software;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -303,18 +1096,61 @@ static ImVec4 stage_bg_color(server::ServerStage stage) {
     return c;
 }
 
-static const char* software_filter_name(int idx) {
-    switch (idx) {
-        case 0: return "All Software";
-        case 1: return "Vanilla";
-        case 2: return "Paper";
-        case 3: return "Purpur";
-        case 4: return "Spigot";
-        case 5: return "Fabric";
-        case 6: return "Quilt";
-        case 7: return "Folia";
+// Keep every server-memory reading in the same human scale. The persisted
+// value is MB, but a player scanning a running server benefits more from
+// "3.2 GB" than from a four-digit implementation detail.
+static std::string format_server_ram_mb(int megabytes) {
+    const uint64_t safe_megabytes = static_cast<uint64_t>(std::max(0, megabytes));
+    return format_bytes(safe_megabytes * 1024ull * 1024ull);
+}
+
+// Snapshot fixtures and a few providers report runtime duration as
+// "HH:MM:SS uptime". Render that compact machine-oriented form as natural
+// language, while leaving every other provider/status message untouched.
+static std::string humanize_server_status_message(const std::string& message) {
+    static const std::string suffix = " uptime";
+    if (message.size() <= suffix.size() ||
+        message.compare(message.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return message;
     }
-    return "All";
+
+    const std::string clock = message.substr(0, message.size() - suffix.size());
+    int hours = 0;
+    int minutes = 0;
+    int seconds = 0;
+    char trailing = '\0';
+    if (std::sscanf(clock.c_str(), "%d:%d:%d%c", &hours, &minutes, &seconds, &trailing) != 3 ||
+        hours < 0 || minutes < 0 || minutes >= 60 || seconds < 0 || seconds >= 60) {
+        return message;
+    }
+
+    const int days = hours / 24;
+    hours %= 24;
+    std::string result = "Online for ";
+    bool has_part = false;
+    auto append_part = [&](int value, const char* singular, const char* plural) {
+        if (value <= 0) return;
+        if (has_part) result += " ";
+        result += std::to_string(value);
+        result += " ";
+        result += value == 1 ? singular : plural;
+        has_part = true;
+    };
+    append_part(days, "day", "days");
+    append_part(hours, "hour", "hours");
+    append_part(minutes, "minute", "minutes");
+    // Seconds add useful detail for a just-started server, but are visual
+    // noise once the player already has an hours/minutes answer to scan.
+    if (!has_part) {
+        result += std::to_string(seconds);
+        result += seconds == 1 ? " second" : " seconds";
+    }
+    return result;
+}
+
+static const char* software_filter_name(int idx) {
+    if (idx <= 0) return "All Software";
+    return server::server_software_name(software_at(idx - 1));
 }
 
 static const char* status_filter_name(int idx) {
@@ -343,9 +1179,7 @@ static bool matches_filters(const UiState& st, const server::ServerConfig& sv,
         if (stage != target) return false;
     }
     if (filter_software > 0) {
-        int sw_idx = filter_software - 1;
-        if (sw_idx < kSoftwareCount && sv.software != kSoftwareValues[sw_idx])
-            return false;
+        if (sv.software != software_at(filter_software - 1)) return false;
     }
     return true;
 }
@@ -399,107 +1233,231 @@ static void save_server_properties(const std::string& dir,
 }
 
 // ---------------------------------------------------------------------------
-// Runtime provisioning
+// Downloading a server's files (the page's own job)
 // ---------------------------------------------------------------------------
 
-// Software whose server runtime Amalgam can download and verify automatically.
-// Vanilla is resolved from Mojang's live version manifest. Spigot is still
-// manual because it is built with BuildTools rather than published as a
-// direct jar. Everything else is auto-provisioned from provider meta APIs.
-static bool is_auto_provisioned(server::ServerSoftware software) {
-    switch (software) {
-        case server::ServerSoftware::Vanilla:
-        case server::ServerSoftware::Paper:
-        case server::ServerSoftware::Purpur:
-        case server::ServerSoftware::Folia:
-        case server::ServerSoftware::Fabric:
-        case server::ServerSoftware::Quilt:
+// One runtime download at a time. The launcher installs the runtime the page
+// asks for, and the outcome is written onto the server's own record so the
+// badge, the buttons and the next Start all read the same truth.
+static void start_provision(UiState& st, int server_index) {
+    auto& s = state();
+    auto& job = runtime_download();
+    if (job.active.load()) return;
+    if (server_index < 0 || server_index >= static_cast<int>(st.servers.size())) return;
+
+    const server::ServerConfig cfg = st.servers[server_index];
+
+    // A manual runtime has nothing to download, so the page states what to add
+    // instead of starting a job that can only fail.
+    if (server::server_software_kind(cfg.software) == server::RuntimeKind::Manual) {
+        aml::server_providers::RuntimeArtifact artifact;
+        std::string hint;
+        aml::server_providers::resolve_runtime(cfg.software, cfg.minecraft_version, artifact,
+                                               &hint);
+        st.servers[server_index].stage = server::ServerStage::NotInstalled;
+        st.servers[server_index].status_message =
+            artifact.manual_hint.empty() ? hint : artifact.manual_hint;
+        save_local_servers(st.servers);
+        clear_server_failure(s);
+        return;
+    }
+
+    job.cancel.store(false);
+    job.cancellable.store(false);
+    job.cancellation_observed.store(false);
+    job.progress.store(-1.0f);  // unknown until the transfer reports a size
+    {
+        std::lock_guard<std::mutex> lock(job.mu);
+        job.server = cfg.name;
+        job.phase = "Preparing";
+    }
+    job.active.store(true);
+    st.servers[server_index].stage = server::ServerStage::Installing;
+    st.servers[server_index].status_message.clear();
+    save_local_servers(st.servers);
+    clear_server_failure(s);
+
+    spawn_worker(st, std::thread([&job, cfg]() {
+        // Existing/imported Java servers can only be prepared if their local
+        // eula.txt already records the acknowledgement. New servers receive
+        // that file from the explicit create-dialog confirmation before this
+        // worker starts. Check before even resolving an installer Java runtime;
+        // the provisioning API validates the same fact again before providers.
+        const bool eula_accepted = aml::server_provision::has_accepted_eula(cfg);
+        // A loader installer has to run with the same Java the server itself
+        // will start with, so the version is resolved through the supervisor's
+        // single Java root rather than a second path policy.
+        std::wstring java_path;
+        std::string java_error;
+        if (eula_accepted &&
+            server::server_software_kind(cfg.software) == server::RuntimeKind::Installer) {
+            java_path = aml::services::local_server_manager()->resolve_local_server_java(
+                cfg.minecraft_version, &java_error);
+        }
+
+        auto phase_sink = [&job](const std::string& text) {
+            // The provisioning contract emits "Downloading ..." only around
+            // net::download, the one phase whose progress callback can honour
+            // a cancel request. All other phases are truthfully non-cancellable.
+            job.cancellable.store(text.rfind("Downloading ", 0) == 0);
+            std::lock_guard<std::mutex> lock(job.mu);
+            job.phase = text;
+        };
+        auto progress_sink = [&job](uint64_t done, uint64_t total) {
+            if (job.cancel.load() && job.cancellable.load()) {
+                job.cancellation_observed.store(true);
+                return false;
+            }
+            if (total > 0)
+                job.progress.store(static_cast<float>(static_cast<double>(done) /
+                                                       static_cast<double>(total)));
             return true;
-        default:
-            return false;
+        };
+
+        std::string error;
+        bool ok = aml::server_provision::provision_runtime(cfg, java_path, eula_accepted,
+                                                           progress_sink, phase_sink, &error);
+        job.cancellable.store(false);
+
+        if (ok) {
+            // eula.txt and server.properties belong to a prepared server, so
+            // they are written (or rewritten) once the runtime is in place.
+            std::string config_error;
+            if (!aml::server_provision::write_server_config_files(cfg, eula_accepted,
+                                                                    &config_error)) {
+                error = config_error;
+                ok = false;
+            }
+        }
+        if (ok && !aml::server_provision::verify_runnable_runtime(cfg, &error)) {
+            // Runtime delivery and config writes may succeed while an installer
+            // still leaves no startable target. Do not let that become Ready.
+            ok = false;
+        }
+        const bool cancelled = !ok && job.cancellation_observed.load();
+
+        {
+            std::lock_guard<std::mutex> lock(job.mu);
+            job.success = ok && error.empty();
+            job.cancelled = cancelled;
+            job.outcome = job.success ? std::string()
+                                      : (cancelled ? std::string() : error);
+        }
+        job.finished.store(true);
+        job.active.store(false);
+    }));
+}
+
+// Applies a finished download to the server the page owns. Runs on the UI
+// thread, so the server list is only ever written from one place.
+static void apply_finished_download(UiState& st) {
+    auto& s = state();
+    auto& job = runtime_download();
+    if (job.active.load() || !job.finished.exchange(false)) return;
+
+    std::string server_name;
+    std::string outcome;
+    bool success = false;
+    bool cancelled = false;
+    {
+        std::lock_guard<std::mutex> lock(job.mu);
+        server_name = job.server;
+        outcome = job.outcome;
+        success = job.success;
+        cancelled = job.cancelled;
+        job.phase.clear();
+    }
+
+    for (auto& sv : st.servers) {
+        if (sv.name != server_name) continue;
+        if (success) {
+            // Final UI-thread guard for a runtime deleted or left incomplete
+            // after the worker's verification but before the Ready badge.
+            std::string runtime_error;
+            if (!aml::server_provision::verify_runnable_runtime(sv, &runtime_error)) {
+                success = false;
+                outcome = runtime_error;
+            }
+        }
+        if (success) {
+            sv.stage = server::ServerStage::Ready;
+            sv.status_message.clear();
+        } else if (cancelled) {
+            sv.stage = server::ServerStage::NotInstalled;
+            sv.status_message = "Download cancelled before the server files were complete.";
+        } else {
+            sv.stage = server::ServerStage::Error;
+            sv.status_message = outcome.empty() ? "The server files could not be installed."
+                                                : outcome;
+        }
+        break;
+    }
+    save_local_servers(st.servers);
+
+    if (!success && !cancelled) {
+        report_server_failure(s, st, "Prepare server files", server_name,
+                              outcome.empty() ? "download failed" : outcome);
     }
 }
 
-// Downloads and verifies the server runtime jar into <dir>/server.jar.
-// Returns false (with err set) when the runtime cannot be provisioned.
-static bool provision_server_runtime(const server::ServerConfig& cfg, std::string* err) {
-    namespace sp = aml::server_providers;
-    const std::string& version = cfg.minecraft_version;
-    const std::wstring jar_path =
-        aml::net::to_wide(cfg.server_directory) + L"\\server.jar";
+static std::string download_phase() {
+    auto& job = runtime_download();
+    std::lock_guard<std::mutex> lock(job.mu);
+    return job.phase;
+}
 
-    std::string url;
-    std::string sha256;
+static bool download_can_cancel() {
+    return runtime_download().cancellable.load();
+}
 
-    switch (cfg.software) {
-        case server::ServerSoftware::Vanilla: {
-            std::string sha1;
-            int64_t size = -1;
-            if (!sp::vanilla_server_runtime(version, url, sha1, size, err)) return false;
-            // Mojang publishes SHA-1 for the vanilla server artifact, while
-            // third-party providers generally publish SHA-256.
-            return net::download(net::to_wide(url), jar_path, nullptr, err, sha1, size);
-        }
-        case server::ServerSoftware::Paper: {
-            sp::BuildInfo build;
-            if (!sp::paper_latest_stable(version, build, err)) return false;
-            url = build.download_url;
-            sha256 = build.sha256;
-            break;
-        }
-        case server::ServerSoftware::Folia: {
-            sp::BuildInfo build;
-            if (!sp::folia_latest_stable(version, build, err)) return false;
-            url = build.download_url;
-            sha256 = build.sha256;
-            break;
-        }
-        case server::ServerSoftware::Purpur: {
-            std::vector<sp::BuildInfo> builds;
-            if (!sp::purpur_builds(version, builds, err)) return false;
-            if (builds.empty()) {
-                if (err) *err = "No Purpur builds for " + version;
-                return false;
-            }
-            url = builds.back().download_url;  // newest-first
-            break;
-        }
-        case server::ServerSoftware::Fabric: {
-            std::vector<std::string> loaders;
-            std::vector<sp::GameVersion> installers;
-            if (!sp::fabric_loader_versions(loaders, err)) return false;
-            if (!sp::fabric_installer_versions(installers, err)) return false;
-            if (loaders.empty() || installers.empty()) {
-                if (err) *err = "No Fabric loader/installer for " + version;
-                return false;
-            }
-            url = sp::fabric_server_jar_url(version, loaders.front(),
-                                            installers.front().version);
-            break;
-        }
-        case server::ServerSoftware::Quilt: {
-            // Quilt's loader endpoint returns loader+installer pairs in one
-            // response, so a single fetch provides both parts of the URL.
-            std::vector<sp::QuiltLoaderPair> pairs;
-            if (!sp::quilt_loader_installer_pairs(pairs, err)) return false;
-            if (pairs.empty()) {
-                if (err) *err = "No Quilt loader/installer for " + version;
-                return false;
-            }
-            url = sp::quilt_server_jar_url(version, pairs.front().loader,
-                                           pairs.front().installer);
-            break;
-        }
-        default:
-            if (err) *err = "This software requires manual installation.";
-            return false;
+// Whether the job in flight is this server's, so the progress card and the
+// Cancel button only appear on the server the user started.
+static bool downloading_runtime_for(const std::string& server_name) {
+    auto& job = runtime_download();
+    if (!job.active.load()) return false;
+    std::lock_guard<std::mutex> lock(job.mu);
+    return job.server == server_name;
+}
+
+// ---------------------------------------------------------------------------
+// Live version lists
+// ---------------------------------------------------------------------------
+
+// Fetches this software's real version list in the background and keeps the
+// reply only if it still describes what the dialog is showing. A provider that
+// cannot be reached is reported, not silently replaced with a made-up list.
+static void request_software_versions(UiState& st, int software_index) {
+    auto& s = state();
+    const server::ServerSoftware software = software_at(software_index);
+    {
+        std::lock_guard<std::mutex> lock(s.version_mu);
+        if (s.version_software == software_index &&
+            (s.version_loading || s.version_live || !s.version_error.empty()))
+            return;
+        s.version_software = software_index;
+        s.version_list.clear();
+        s.version_live = false;
+        s.version_loading = true;
+        s.version_error.clear();
     }
 
-    if (url.empty()) {
-        if (err) *err = "No download available for this software.";
-        return false;
-    }
-    return sp::download_runtime(url, sha256, jar_path, err);
+    spawn_worker(st, std::thread([&s, software, software_index]() {
+        std::vector<std::string> versions;
+        std::string error;
+        const bool ok = aml::server_providers::software_versions(software, versions, &error);
+        std::lock_guard<std::mutex> lock(s.version_mu);
+        if (s.version_software != software_index) return;
+        s.version_loading = false;
+        if (ok && !versions.empty()) {
+            s.version_list = std::move(versions);
+            s.version_live = true;
+        } else {
+            s.version_error = error.empty()
+                ? std::string(server::server_software_name(software)) +
+                      " did not report any versions."
+                : error;
+        }
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +1484,7 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     bool is_ready = (stage == server::ServerStage::Ready ||
                      stage == server::ServerStage::Stopped ||
                      stage == server::ServerStage::NotInstalled);
+    refresh_local_server_metrics(st, sv);
 
     // ── Card with left status strip ──────────────────────────────────
     card_begin(("##srv_" + std::to_string(index)).c_str(), ImVec2(-1, 0));
@@ -659,9 +1618,13 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
             float ram_pct = std::clamp(metrics.ram_percent / 100.0f, 0.0f, 1.0f);
             ImVec4 ram_col = ram_pct > 0.9f ? k.red : ram_pct > 0.7f ? k.orange : k.blue;
             metrics_dl->AddRectFilled(ImVec2(bar_pos.x, bar_y), ImVec2(bar_pos.x + bar_w, bar_y + bar_h), c32(k.surface2), bar_h * 0.5f);
-            metrics_dl->AddRectFilled(ImVec2(bar_pos.x, bar_y), ImVec2(bar_pos.x + bar_w * ram_pct, bar_y + bar_h), c32(ram_col), bar_h * 0.5f);
+            if (metrics.ram_valid)
+                metrics_dl->AddRectFilled(ImVec2(bar_pos.x, bar_y), ImVec2(bar_pos.x + bar_w * ram_pct, bar_y + bar_h), c32(ram_col), bar_h * 0.5f);
             ImGui::PushFont(f_small);
-            metrics_dl->AddText(ImVec2(bar_pos.x, bar_y + bar_h + ui_px(2.0f)), c32(k.muted), ("RAM " + std::to_string((int)metrics.ram_percent) + "%").c_str());
+            const std::string ram_label = metrics.ram_valid
+                ? "RAM " + std::to_string(static_cast<int>(metrics.ram_percent)) + "%"
+                : "RAM unavailable";
+            metrics_dl->AddText(ImVec2(bar_pos.x, bar_y + bar_h + ui_px(2.0f)), c32(k.muted), ram_label.c_str());
             ImGui::PopFont();
 
             // CPU bar
@@ -669,17 +1632,25 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
             ImVec4 cpu_col = cpu_pct > 0.9f ? k.red : cpu_pct > 0.7f ? k.orange : k.green;
             float cpu_y = bar_y + bar_h + ui_px(16.0f);
             metrics_dl->AddRectFilled(ImVec2(bar_pos.x, cpu_y), ImVec2(bar_pos.x + bar_w, cpu_y + bar_h), c32(k.surface2), bar_h * 0.5f);
-            metrics_dl->AddRectFilled(ImVec2(bar_pos.x, cpu_y), ImVec2(bar_pos.x + bar_w * cpu_pct, cpu_y + bar_h), c32(cpu_col), bar_h * 0.5f);
+            if (metrics.cpu_valid)
+                metrics_dl->AddRectFilled(ImVec2(bar_pos.x, cpu_y), ImVec2(bar_pos.x + bar_w * cpu_pct, cpu_y + bar_h), c32(cpu_col), bar_h * 0.5f);
             ImGui::PushFont(f_small);
-            metrics_dl->AddText(ImVec2(bar_pos.x, cpu_y + bar_h + ui_px(2.0f)), c32(k.muted), ("CPU " + std::to_string((int)metrics.cpu_percent) + "%").c_str());
+            const std::string cpu_label = metrics.cpu_valid
+                ? "CPU " + std::to_string(static_cast<int>(metrics.cpu_percent)) + "%"
+                : "CPU unavailable";
+            metrics_dl->AddText(ImVec2(bar_pos.x, cpu_y + bar_h + ui_px(2.0f)), c32(k.muted), cpu_label.c_str());
             ImGui::PopFont();
 
             // TPS + Players row
-            ImVec4 tps_color = metrics.tps >= 19.0f ? k.green : metrics.tps >= 15.0f ? k.yellow : k.red;
             float row3_y = cpu_y + bar_h + ui_px(16.0f);
             ImGui::PushFont(f_small);
-            metrics_dl->AddText(ImVec2(bar_pos.x, row3_y), c32(tps_color), ("TPS " + std::to_string(metrics.tps)).c_str());
-            metrics_dl->AddText(ImVec2(bar_pos.x + bar_w * 0.5f, row3_y), c32(k.muted), (std::to_string(metrics.players_online) + "/" + std::to_string(sv.max_players) + " online").c_str());
+            const std::string tps_label = metrics.tps_valid
+                ? "TPS " + std::to_string(metrics.tps) : "TPS unavailable";
+            const std::string players_label = metrics.players_valid
+                ? std::to_string(metrics.players_online) + "/" + std::to_string(sv.max_players) + " online"
+                : "Players unavailable";
+            metrics_dl->AddText(ImVec2(bar_pos.x, row3_y), c32(metrics.tps_valid ? k.green : k.muted), tps_label.c_str());
+            metrics_dl->AddText(ImVec2(bar_pos.x + bar_w * 0.5f, row3_y), c32(k.muted), players_label.c_str());
             ImGui::PopFont();
             ImGui::Dummy(ImVec2(0, row3_y - bar_pos.y + ui_px(20.0f)));
         }
@@ -696,41 +1667,39 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     float bw = ui_px(80.0f);
     float bh = ui_px(28.0f);
 
-    auto* svc = aml::services::local_server_manager();
+    const bool local_action_busy = local_server_action_lane_busy(s) ||
+                                   local_server_command_lane_busy(s);
+    const bool start_working = local_server_action_is_working(s, LocalServerAction::Start);
+    const bool stop_working = local_server_action_is_working(s, LocalServerAction::Stop);
+    const bool restart_working = local_server_action_is_working(s, LocalServerAction::Restart);
     if (is_running) {
-        if (ghost_button("Stop", ImVec2(bw, bh))) {
-            std::string error;
-            if (svc->stop_local_server(sv.name, &error)) {
-                sv.stage = server::ServerStage::Stopped;
-                save_local_servers(st.servers);
-                clear_server_failure(s);
-            } else {
-                report_server_failure(s, st, "Stop", sv.name, error);
-            }
+        if (ghost_button(stop_working ? "Stopping..." : "Stop", ImVec2(bw, bh),
+                         local_action_busy)) {
+            start_local_server_action(st, index, LocalServerAction::Stop);
         }
         ImGui::SameLine(0, ui_px(4.0f));
-        if (ghost_button("Restart", ImVec2(bw + ui_px(10.0f), bh))) {
-            std::string error;
-            const bool started = svc->stop_local_server(sv.name, &error) &&
-                                 svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
-            if (started) {
-                sv.stage = server::ServerStage::Running;
-                save_local_servers(st.servers);
-                clear_server_failure(s);
-            } else {
-                report_server_failure(s, st, "Restart", sv.name, error);
-            }
+        if (ghost_button(restart_working ? "Restarting..." : "Restart",
+                         ImVec2(bw + ui_px(10.0f), bh), local_action_busy)) {
+            start_local_server_action(st, index, LocalServerAction::Restart);
         }
+    } else if (downloading_runtime_for(sv.name)) {
+        if (download_can_cancel()) {
+            if (ghost_button("Cancel download", ImVec2(bw + ui_px(20.0f), bh)))
+                runtime_download().cancel.store(true);
+        } else {
+            ImGui::BeginDisabled();
+            ghost_button("Working", ImVec2(bw + ui_px(20.0f), bh));
+            ImGui::EndDisabled();
+        }
+    } else if (!runtime_files_present(sv) &&
+               server::server_software_kind(sv.software) != server::RuntimeKind::Manual) {
+        // Nothing to start yet: this is the download the server needs, offered
+        // where the Start button would be.
+        if (primary_button("Prepare", ImVec2(bw + ui_px(10.0f), bh))) start_provision(st, index);
     } else if (is_ready) {
-        if (primary_button("Start", ImVec2(bw, bh))) {
-            std::string error;
-            if (svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error)) {
-                sv.stage = server::ServerStage::Running;
-                save_local_servers(st.servers);
-                clear_server_failure(s);
-            } else {
-                report_server_failure(s, st, "Start", sv.name, error);
-            }
+        if (primary_button(start_working ? "Starting..." : "Start", ImVec2(bw, bh),
+                           start_working, local_action_busy)) {
+            start_local_server_action(st, index, LocalServerAction::Start);
         }
     }
 
@@ -754,8 +1723,10 @@ static void draw_server_card(server::ServerConfig& sv, int index, UiState& st) {
     }
 
     ImGui::SameLine(0, ui_px(4.0f));
-    if (ghost_button("Delete", ImVec2(bw, bh)))
+    if (ghost_button("Remove", ImVec2(bw, bh), local_action_busy)) {
         s.action_pending = index;
+        s.remove_server_error.clear();
+    }
 
     card_end();
     ImGui::PopID();
@@ -773,6 +1744,55 @@ static void draw_console_panel(UiState& st) {
     }
 
     auto& sv = st.servers[s.console_server_idx];
+
+    // This legacy floating console is not the normal snapshot route, but keep
+    // the same hard boundary if a fixture ever reaches it through retained UI
+    // state.  In particular, do not let a fixture fall through to send_command.
+    if (st.fixture_mode) {
+        ImGui::SetNextWindowSize(ImVec2(ui_px(600), ui_px(400)), ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("Server Console", &s.console_open,
+                         ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::PushFont(f_h2);
+            ImGui::TextColored(k.text, "Console: %s", sv.name.c_str());
+            ImGui::PopFont();
+            ImGui::SameLine(0, ui_px(12.0f));
+            draw_status_badge(sv.stage);
+            ImGui::TextColored(k.brand_hov,
+                               "Visual fixture — static local sample; console reading and commands are disabled.");
+            ImGui::Spacing();
+            ImGui::BeginDisabled();
+            std::string fixture_filter;
+            ImGui::SetNextItemWidth(ui_px(200.0f));
+            input_text_hint("##fixture_console_filter", "Filter logs...", &fixture_filter);
+            ImGui::SameLine(0, ui_px(8.0f));
+            ghost_button("Copy", ImVec2(ui_px(60.0f), ui_px(24.0f)));
+            ImGui::SameLine(0, ui_px(4.0f));
+            ghost_button("Clear", ImVec2(ui_px(60.0f), ui_px(24.0f)));
+            ImGui::EndDisabled();
+            ImGui::Spacing();
+            if (ImGui::BeginChild("##fixture_console_log", ImVec2(-1, -ui_px(48.0f)),
+                                  ImGuiChildFlags_Borders)) {
+                ImGui::TextColored(k.muted, "[10:14:08]");
+                ImGui::SameLine();
+                ImGui::TextColored(k.green, "INFO  Representative fixture console ready");
+                ImGui::TextColored(k.muted, "[10:16:28]");
+                ImGui::SameLine();
+                ImGui::TextColored(k.green, "INFO  Saved the representative game state");
+            }
+            ImGui::EndChild();
+            std::string fixture_command = "say Welcome";
+            ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(-ui_px(80.0f) - ui_px(4.0f));
+            ImGui::InputText("##fixture_console_cmd", &fixture_command);
+            ImGui::SameLine();
+            primary_button("Send", ImVec2(ui_px(76.0f), ImGui::GetFrameHeight()));
+            ImGui::EndDisabled();
+        }
+        ImGui::End();
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(ui_px(600), ui_px(400)), ImGuiCond_Appearing);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
@@ -846,71 +1866,39 @@ static void draw_console_panel(UiState& st) {
 
         ImGui::Spacing();
 
+        const auto submit_console_command = [&] {
+            if (s.console_input.empty()) return;
+            const std::string command = s.console_input;
+            if (!start_local_server_command(st, sv, LocalServerCommandOrigin::PopupConsole,
+                                            command)) {
+                return;
+            }
+            server::ServerConsoleEntry cmd_entry;
+            cmd_entry.timestamp = ">";
+            cmd_entry.message = command;
+            s.console_log.push_back(std::move(cmd_entry));
+            s.console_input.clear();
+        };
+        const bool command_busy = local_server_action_lane_busy(s) ||
+                                  local_server_command_lane_busy(s);
+
         // Command input
+        if (command_busy) ImGui::BeginDisabled();
         ImGui::SetNextItemWidth(-ui_px(80.0f) - ui_px(4.0f));
         if (ImGui::InputText("##console_cmd", &s.console_input,
                              ImGuiInputTextFlags_EnterReturnsTrue)) {
-            if (!s.console_input.empty()) {
-                // Echo the command
-                server::ServerConsoleEntry cmd_entry;
-                cmd_entry.timestamp = ">";
-                cmd_entry.message = s.console_input;
-                s.console_log.push_back(cmd_entry);
-
-                // Send to server
-                std::string response;
-                std::string send_error;
-                if (aml::services::local_server_manager()->send_command(
-                        sv.name, s.console_input, &response, &send_error)) {
-                    if (!response.empty()) {
-                        server::ServerConsoleEntry resp_entry;
-                        resp_entry.timestamp = "<";
-                        resp_entry.message = response;
-                        s.console_log.push_back(resp_entry);
-                    }
-                } else {
-                    // A refused command belongs in the console it was typed in.
-                    server::ServerConsoleEntry err_entry;
-                    err_entry.timestamp = "!";
-                    err_entry.message = send_error.empty()
-                        ? "Command could not be sent"
-                        : send_error;
-                    s.console_log.push_back(err_entry);
-                }
-                s.console_input.clear();
-            }
+            submit_console_command();
             ImGui::SetKeyboardFocusHere(-1);
         }
         ImGui::SameLine();
-        if (primary_button("Send", ImVec2(ui_px(76.0f), ImGui::GetFrameHeight()))) {
-            if (!s.console_input.empty()) {
-                server::ServerConsoleEntry cmd_entry;
-                cmd_entry.timestamp = ">";
-                cmd_entry.message = s.console_input;
-                s.console_log.push_back(cmd_entry);
-
-                std::string response;
-                std::string send_error;
-                if (aml::services::local_server_manager()->send_command(
-                        sv.name, s.console_input, &response, &send_error)) {
-                    if (!response.empty()) {
-                        server::ServerConsoleEntry resp_entry;
-                        resp_entry.timestamp = "<";
-                        resp_entry.message = response;
-                        s.console_log.push_back(resp_entry);
-                    }
-                } else {
-                    // A refused command belongs in the console it was typed in.
-                    server::ServerConsoleEntry err_entry;
-                    err_entry.timestamp = "!";
-                    err_entry.message = send_error.empty()
-                        ? "Command could not be sent"
-                        : send_error;
-                    s.console_log.push_back(err_entry);
-                }
-                s.console_input.clear();
-            }
+        const bool sending = local_server_command_is_working(
+            s, LocalServerCommandOrigin::PopupConsole);
+        if (primary_button(sending ? "Sending..." : "Send",
+                           ImVec2(ui_px(76.0f), ImGui::GetFrameHeight()),
+                           false, command_busy)) {
+            submit_console_command();
         }
+        if (command_busy) ImGui::EndDisabled();
     }
     ImGui::End();
 }
@@ -1077,11 +2065,291 @@ static std::string file_size_label(uint64_t bytes) {
            std::to_string((bytes % (1024ULL * 1024 * 1024)) / (1024ULL * 1024 * 102)) + " GB";
 }
 
+static const char* fixture_server_properties_preview_text() {
+    return R"(# Amalgam visual fixture — static sample; no server file was read.
+# This representative text exists only for layout and scroll review.
+accepts-transfers=false
+allow-flight=false
+allow-nether=true
+broadcast-console-to-ops=true
+broadcast-rcon-to-ops=true
+bug-report-link=
+difficulty=normal
+enable-command-block=false
+enable-jmx-monitoring=false
+enable-query=false
+enable-rcon=false
+enable-status=true
+enforce-secure-profile=true
+enforce-whitelist=false
+entity-broadcast-range-percentage=100
+force-gamemode=false
+function-permission-level=2
+gamemode=survival
+generate-structures=true
+generator-settings={}
+hardcore=false
+hide-online-players=false
+level-name=world
+level-seed=
+level-type=minecraft:normal
+log-ips=true
+max-chained-neighbor-updates=1000000
+max-players=12
+max-tick-time=60000
+max-world-size=29999984
+motd=Forsaken World SMP
+network-compression-threshold=256
+online-mode=true
+op-permission-level=4
+player-idle-timeout=0
+prevent-proxy-connections=false
+pvp=true
+query.port=25565
+rate-limit=0
+rcon.password=
+rcon.port=25575
+region-file-compression=deflate
+require-resource-pack=false
+resource-pack=
+resource-pack-prompt=
+server-ip=
+server-port=25565
+simulation-distance=10
+spawn-animals=true
+spawn-monsters=true
+spawn-npcs=true
+spawn-protection=16
+sync-chunk-writes=true
+text-filtering-config=
+use-native-transport=true
+view-distance=10
+white-list=false
+)";
+}
+
+// The regular preview window is fed by a real file and can offer Explorer.
+// Fixture preview deliberately uses neither path: its content is a local
+// literal and every externally meaningful action stays disabled.
+static void draw_fixture_server_file_preview(ServerUIState& s, UiState& st) {
+    if (!s.file_preview_open) return;
+
+    const std::string display_name = s.file_preview_name.empty()
+        ? "server.properties" : s.file_preview_name;
+    const std::string window_name =
+        "File: " + display_name + "###fixture_server_file_preview";
+    ImGui::SetNextWindowSize(ImVec2(
+        std::min(ui_px(620.0f), ImGui::GetMainViewport()->WorkSize.x - ui_px(40.0f)),
+        std::min(ui_px(470.0f), ImGui::GetMainViewport()->WorkSize.y - ui_px(40.0f))),
+        ImGuiCond_Appearing);
+    if (ImGui::Begin(window_name.c_str(), &s.file_preview_open,
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::PushFont(f_h2);
+        ImGui::TextColored(k.text, "%s", display_name.c_str());
+        ImGui::PopFont();
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture — static server.properties text; no file or Explorer action is used.");
+        ImGui::Spacing();
+
+        // Use a fixed, component-owned viewport rather than a remaining-space
+        // height: fixtures need a reliable range for @middle and @bottom even
+        // while their containing page has a separate scroll host.
+        const float preview_body_height = std::min(
+            ui_px(286.0f), std::max(ui_px(170.0f),
+                                    ImGui::GetContentRegionAvail().y - ui_px(66.0f)));
+        ImGui::PushFont(f_mono);
+        if (ImGui::BeginChild("##fixture_server_file_preview_body",
+                              ImVec2(-1, preview_body_height), ImGuiChildFlags_Borders)) {
+            ImGui::TextUnformatted(fixture_server_properties_preview_text());
+            // Repeat after this child has laid out its static text. That keeps
+            // capture scrolling deterministic without synthesizing input.
+            if (st.fixture_scroll_position > 0) {
+                const float max_scroll = ImGui::GetScrollMaxY();
+                if (max_scroll > 0.0f) {
+                    const float requested_scroll = st.fixture_scroll_position == 1
+                        ? max_scroll * 0.5f : max_scroll;
+                    ImGui::SetScrollY(requested_scroll);
+                }
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopFont();
+
+        ImGui::Spacing();
+        ghost_button("Open in Explorer", ImVec2(ui_px(130.0f), ui_px(28.0f)), true);
+        ImGui::SameLine(0, ui_px(8.0f));
+        if (ghost_button("Close preview", ImVec2(ui_px(116.0f), ui_px(28.0f)))) {
+            s.file_preview_open = false;
+        }
+    }
+    ImGui::End();
+}
+
+// Render the file-row context menu as a fully inert, deterministic fixture.
+// It deliberately does not share the live file-list popup below: that popup
+// resolves real paths for preview and Explorer actions.  Keeping this branch
+// self-contained makes the visual evidence truthful even when a review runs
+// on a machine that has a same-named local server.
+static void draw_fixture_server_file_context_menu(ServerUIState& s) {
+    if (!s.fixture_file_context_menu_open) return;
+
+    const std::string display_name = s.fixture_file_context_menu_name.empty()
+        ? "server.properties" : s.fixture_file_context_menu_name;
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::OpenPopup("##fixture_server_file_context_menu");
+    if (ImGui::BeginPopup("##fixture_server_file_context_menu",
+                          ImGuiWindowFlags_AlwaysAutoResize |
+                          ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted(display_name.c_str());
+        ImGui::PopFont();
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture — static local sample; no file was read, opened, or changed.");
+        ImGui::Separator();
+        ImGui::BeginDisabled();
+        ImGui::MenuItem("Preview");
+        ImGui::MenuItem("Open in Explorer");
+        ImGui::Separator();
+        ImGui::MenuItem("Delete");
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+}
+
+static void draw_fixture_server_files_tab(ServerUIState& s,
+                                          const server::ServerConfig& sv,
+                                          UiState& st) {
+    ImGui::PushFont(f_small);
+    ImGui::TextColored(k.muted, "Directory:");
+    ImGui::SameLine();
+    ImGui::TextColored(k.text, "C:\\Amalgam\\Servers\\%s", sv.name.c_str());
+    ImGui::PopFont();
+    ImGui::TextColored(k.brand_hov,
+                       "Visual fixture: representative files only; browsing, refresh, preview, and file actions are disabled.");
+    ImGui::Spacing();
+    ghost_button("< Back", ImVec2(ui_px(80.0f), ui_px(26.0f)), true);
+    ImGui::SameLine(0, ui_px(8.0f));
+    ghost_button("Refresh", ImVec2(ui_px(80.0f), ui_px(26.0f)), true);
+    ImGui::Spacing();
+
+    struct FixtureFile {
+        const char* name;
+        const char* detail;
+        bool directory;
+    };
+    const FixtureFile files[] = {
+        {"world", "Folder", true},
+        {"logs", "Folder", true},
+        {"plugins", "Folder", true},
+        {"eula.txt", "1 KB", false},
+        {"server.properties", "2 KB", false},
+        {"server.jar", "45 MB", false},
+    };
+    if (ImGui::BeginChild("##fixture_server_files_list", ImVec2(-1, ui_px(184.0f)),
+                          ImGuiChildFlags_Borders)) {
+        for (const auto& file : files) {
+            ImGui::TextColored(file.directory ? k.brand : k.text, "%s", file.name);
+            ImGui::SameLine(ui_px(250.0f));
+            ImGui::TextColored(k.muted, "%s", file.detail);
+        }
+    }
+    ImGui::EndChild();
+    ImGui::TextColored(k.muted, "%d representative items", static_cast<int>(sizeof(files) / sizeof(files[0])));
+
+    draw_fixture_server_file_context_menu(s);
+    draw_fixture_server_file_preview(s, st);
+}
+
+// Kept separate from the live directory listing so fixture routes can show the
+// same confirmation and recovery composition without ever enumerating files.
+static void draw_server_file_delete_dialog(ServerUIState& s,
+                                           const server::ServerConfig& sv,
+                                           UiState& st) {
+    if (s.file_delete_confirm) {
+        ImGui::OpenPopup("##confirm_file_delete");
+        s.file_delete_confirm = false;  // open once
+    }
+    if (ImGui::BeginPopupModal("##confirm_file_delete", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Delete \"%s\"?", s.file_delete_target.c_str());
+        ImGui::TextColored(k.muted, "This cannot be undone.");
+        if (!s.file_delete_error.empty()) {
+            ImGui::Spacing();
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.red, "Delete failed");
+            ImGui::PopFont();
+            ImGui::PushStyleColor(ImGuiCol_Text, k.red);
+            ImGui::TextWrapped("%s", s.file_delete_error.c_str());
+            ImGui::PopStyleColor();
+        }
+        const bool fixture_preview = st.fixture_mode;
+        if (fixture_preview) {
+            ImGui::Spacing();
+            ImGui::TextColored(k.brand_hov,
+                               "Visual fixture — deletion is disabled; no fixture file is inspected or changed.");
+        }
+        ImGui::Spacing();
+        const char* delete_label = s.file_delete_error.empty() ? "Delete" : "Retry delete";
+        const auto attempt_file_delete = [&] {
+            // The fixture button is disabled, but retain this guard at the
+            // operation entry so no path or filesystem call can occur if this
+            // renderer is invoked through another UI path.
+            if (st.fixture_mode) return;
+            namespace fs = std::filesystem;
+            std::string path = file_full_path(s, sv.server_directory, s.file_delete_target);
+            const std::wstring native_path = aml::net::to_wide(path);
+            std::error_code ec;
+            const bool directory = fs::is_directory(native_path, ec);
+            bool removed = false;
+            if (!ec) {
+                if (directory) removed = fs::remove_all(native_path, ec) > 0;
+                else removed = fs::remove(native_path, ec);
+            }
+            if (ec) {
+                s.file_list_dirty = true;
+                s.file_delete_error = directory
+                    ? "The folder could not be fully deleted. Some contents may already be removed; refresh before trying again."
+                    : "The file could not be deleted. Check that it is not in use, then try again.";
+                report_server_failure(s, st, "Delete file", sv.name,
+                                      s.file_delete_error + " (" + ec.message() + ")");
+            } else if (!removed) {
+                s.file_list_dirty = true;
+                s.file_delete_error = "This item no longer exists. Refresh the file list before trying again.";
+                report_server_failure(s, st, "Delete file", sv.name, s.file_delete_error);
+            } else {
+                s.file_list_dirty = true;
+                s.file_delete_target.clear();
+                s.file_delete_error.clear();
+                clear_server_failure(s);
+                ImGui::CloseCurrentPopup();
+            }
+        };
+        if (danger_button(delete_label, ImVec2(ui_px(104.0f), ui_px(28.0f)), fixture_preview)) {
+            attempt_file_delete();
+        }
+        ImGui::SameLine();
+        if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                         ImVec2(fixture_preview ? ui_px(116.0f) : ui_px(70.0f), ui_px(28.0f)))) {
+            s.file_delete_target.clear();
+            s.file_delete_error.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server detail – file browser tab
 // ---------------------------------------------------------------------------
 
-static void draw_server_files_tab(ServerUIState& s, const server::ServerConfig& sv) {
+static void draw_server_files_tab(ServerUIState& s, const server::ServerConfig& sv,
+                                  UiState& st) {
+    if (st.fixture_mode) {
+        draw_fixture_server_files_tab(s, sv, st);
+        draw_server_file_delete_dialog(s, sv, st);
+        return;
+    }
     if (s.file_list_dirty) {
         scan_server_directory(s, sv.server_directory);
         s.file_list_dirty = false;
@@ -1092,7 +2360,12 @@ static void draw_server_files_tab(ServerUIState& s, const server::ServerConfig& 
         ImGui::PushFont(f_small);
         ImGui::TextColored(k.muted, "Directory:");
         ImGui::SameLine();
-        std::string display_path = sv.server_directory;
+        // A fixture directory is intentionally a disposable artifact path.
+        // Never place that machine-specific path in visual evidence; use the
+        // representative launcher location users recognize instead.
+        std::string display_path = st.fixture_mode
+            ? "C:\\Amalgam\\Servers\\" + sv.name
+            : sv.server_directory;
         if (!s.file_browse_path.empty()) display_path += "\\" + s.file_browse_path;
         ImGui::TextColored(k.text, "%s", display_path.c_str());
         ImGui::PopFont();
@@ -1203,6 +2476,7 @@ static void draw_server_files_tab(ServerUIState& s, const server::ServerConfig& 
                     ImGui::Separator();
                     if (ImGui::MenuItem("Delete")) {
                         s.file_delete_target = name;
+                        s.file_delete_error.clear();
                         s.file_delete_confirm = true;
                     }
                     ImGui::EndPopup();
@@ -1217,33 +2491,7 @@ static void draw_server_files_tab(ServerUIState& s, const server::ServerConfig& 
     ImGui::Spacing();
     ImGui::TextColored(k.muted, "%d items", (int)s.file_entries.size());
 
-    // Delete confirmation
-    if (s.file_delete_confirm) {
-        ImGui::OpenPopup("##confirm_file_delete");
-        s.file_delete_confirm = false;  // open once
-    }
-    if (ImGui::BeginPopupModal("##confirm_file_delete", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Delete \"%s\"?", s.file_delete_target.c_str());
-        ImGui::TextColored(k.muted, "This cannot be undone.");
-        ImGui::Spacing();
-        if (primary_button("Delete", ImVec2(ui_px(80.0f), ui_px(28.0f)))) {
-            namespace fs = std::filesystem;
-            std::string path = file_full_path(s, sv.server_directory, s.file_delete_target);
-            std::error_code ec;
-            if (fs::is_directory(aml::net::to_wide(path), ec))
-                fs::remove_all(aml::net::to_wide(path), ec);
-            else
-                fs::remove(aml::net::to_wide(path), ec);
-            s.file_list_dirty = true;
-            s.file_delete_target.clear();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ghost_button("Cancel", ImVec2(ui_px(70.0f), ui_px(28.0f))))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
+    draw_server_file_delete_dialog(s, sv, st);
 
     // File preview window
     if (s.file_preview_open) {
@@ -1279,6 +2527,70 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
     ImGui::TextColored(k.text, "Online Players");
     ImGui::PopFont();
     ImGui::Spacing();
+
+    // A visual-review fixture must never query a same-named local server or
+    // offer controls which can issue vanilla server commands.  The four rows
+    // deliberately match the overview metric seeded in ui.cpp.
+    if (st.fixture_mode) {
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: representative local player data; management is disabled.");
+        ImGui::Spacing();
+        struct FixturePlayer { const char* name; const char* ping; ImVec4 color; };
+        const FixturePlayer players[] = {
+            {"Alex", "42 ms", k.green},
+            {"MiraBuilds", "57 ms", k.green},
+            {"AveryStone", "86 ms", k.green},
+            {"NovaCraft", "118 ms", k.yellow},
+        };
+        card_begin("##fixture_players_list", ImVec2(-1, 0));
+        for (size_t i = 0; i < sizeof(players) / sizeof(players[0]); ++i) {
+            const auto& player = players[i];
+            ImGui::PushID(static_cast<int>(i));
+            const float row_h = ui_px(48.0f);
+            const ImVec2 row_min = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(row_min, row_min + ImVec2(ImGui::GetContentRegionAvail().x, row_h),
+                              c32(k.surface), ui_px(8.0f));
+            dl->AddCircleFilled(row_min + ImVec2(ui_px(18.0f), row_h * 0.5f), ui_px(10.0f),
+                                c32(k.brand_dk));
+            char initial[2] = {player.name[0], '\0'};
+            const ImVec2 initial_size = ImGui::CalcTextSize(initial);
+            dl->AddText(row_min + ImVec2(ui_px(18.0f) - initial_size.x * 0.5f,
+                                         row_h * 0.5f - initial_size.y * 0.5f),
+                        c32(k.text), initial);
+            ImGui::PushFont(f_bold);
+            dl->AddText(row_min + ImVec2(ui_px(38.0f),
+                                         (row_h - ImGui::GetTextLineHeight()) * 0.5f),
+                        c32(k.text), player.name);
+            ImGui::PopFont();
+            const ImVec2 ping_pos = row_min + ImVec2(ui_px(210.0f),
+                                                      (row_h - ui_px(20.0f)) * 0.5f);
+            const ImVec2 ping_size = ImGui::CalcTextSize(player.ping) +
+                                    ImVec2(ui_px(12.0f), ui_px(4.0f));
+            ImVec4 ping_bg = player.color;
+            ping_bg.w = 0.12f;
+            dl->AddRectFilled(ping_pos, ping_pos + ping_size, c32(ping_bg), ui_px(5.0f));
+            dl->AddText(ping_pos + ImVec2(ui_px(6.0f), ui_px(2.0f)), c32(player.color),
+                        player.ping);
+            // Advance through normal layout instead of moving the cursor past
+            // the card boundary, which Dear ImGui correctly flags as an
+            // invalid parent-window extension in a capture.
+            ImGui::Dummy(ImVec2(0, row_h));
+            ImGui::PopID();
+        }
+        card_end();
+        ImGui::TextColored(k.muted, "4 / %d connected", sv.max_players);
+        ImGui::Spacing();
+        ImGui::PushFont(f_h2);
+        ImGui::TextColored(k.text, "Access controls");
+        ImGui::PopFont();
+        ImGui::TextColored(k.muted,
+                           "Whitelist and operator management are unavailable in visual fixtures.");
+        return;
+    }
+
+    const bool command_busy = local_server_action_lane_busy(s) ||
+                              local_server_command_lane_busy(s);
 
     if (effective_stage(st, sv) != server::ServerStage::Running) {
         empty_state("Server not running", "Start the server to see online players.");
@@ -1322,18 +2634,14 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
             ImGui::SameLine(ImGui::GetCursorPosX() +
                             std::max(0.0f, ImGui::GetContentRegionAvail().x - ui_px(140.0f)));
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ui_px(26.0f)) * 0.5f);
-            if (ghost_button("Kick", ImVec2(ui_px(62.0f), ui_px(26.0f)))) {
-                std::string error;
-                if (!aml::services::local_server_manager()->send_command(
-                        sv.name, "kick " + p.name, nullptr, &error))
-                    report_server_failure(s, st, "Kick", sv.name, error);
+            if (ghost_button("Kick", ImVec2(ui_px(62.0f), ui_px(26.0f)), command_busy)) {
+                start_local_server_command(st, sv, LocalServerCommandOrigin::Kick,
+                                           "kick " + p.name);
             }
             ImGui::SameLine(0, ui_px(4.0f));
-            if (ghost_button("Ban", ImVec2(ui_px(62.0f), ui_px(26.0f)))) {
-                std::string error;
-                if (!aml::services::local_server_manager()->send_command(
-                        sv.name, "ban " + p.name, nullptr, &error))
-                    report_server_failure(s, st, "Ban", sv.name, error);
+            if (ghost_button("Ban", ImVec2(ui_px(62.0f), ui_px(26.0f)), command_busy)) {
+                start_local_server_command(st, sv, LocalServerCommandOrigin::Ban,
+                                           "ban " + p.name);
             }
             ImGui::Dummy(ImVec2(0, row_h));
             ImGui::PopID();
@@ -1350,18 +2658,14 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
     ImGui::PopFont();
     ImGui::Spacing();
 
+    if (command_busy) ImGui::BeginDisabled();
     ImGui::SetNextItemWidth(ui_px(220.0f));
     ImGui::InputText("##wl_input", &s.player_whitelist_input);
     ImGui::SameLine();
     if (primary_button("Add to Whitelist", ImVec2(ui_px(130.0f), ui_px(26.0f))) &&
         !s.player_whitelist_input.empty()) {
-        std::string error;
-        if (aml::services::local_server_manager()->send_command(
-                sv.name, "whitelist add " + s.player_whitelist_input, nullptr, &error)) {
-            s.player_whitelist_input.clear();
-        } else {
-            report_server_failure(s, st, "Add to Whitelist", sv.name, error);
-        }
+        start_local_server_command(st, sv, LocalServerCommandOrigin::WhitelistAdd,
+                                   "whitelist add " + s.player_whitelist_input);
     }
     ImGui::Spacing();
 
@@ -1372,10 +2676,8 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
             ImGui::TextColored(k.text, "%s", s.whitelist_entries[i].c_str());
             ImGui::SameLine(0, ui_px(12.0f));
             if (ghost_button("Remove", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
-                std::string error;
-                if (!aml::services::local_server_manager()->send_command(
-                        sv.name, "whitelist remove " + s.whitelist_entries[i], nullptr, &error))
-                    report_server_failure(s, st, "Remove from Whitelist", sv.name, error);
+                start_local_server_command(st, sv, LocalServerCommandOrigin::WhitelistRemove,
+                                           "whitelist remove " + s.whitelist_entries[i]);
             }
             ImGui::PopID();
         }
@@ -1396,13 +2698,8 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
     ImGui::SameLine();
     if (primary_button("Make OP", ImVec2(ui_px(100.0f), ui_px(26.0f))) &&
         !s.player_op_input.empty()) {
-        std::string error;
-        if (aml::services::local_server_manager()->send_command(
-                sv.name, "op " + s.player_op_input, nullptr, &error)) {
-            s.player_op_input.clear();
-        } else {
-            report_server_failure(s, st, "Make OP", sv.name, error);
-        }
+        start_local_server_command(st, sv, LocalServerCommandOrigin::OpAdd,
+                                   "op " + s.player_op_input);
     }
     ImGui::Spacing();
 
@@ -1413,26 +2710,136 @@ static void draw_server_players_tab(ServerUIState& s, const server::ServerConfig
             ImGui::TextColored(k.brand, "%s", s.ops_entries[i].c_str());
             ImGui::SameLine(0, ui_px(12.0f));
             if (ghost_button("De-op", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
-                std::string error;
-                if (!aml::services::local_server_manager()->send_command(
-                        sv.name, "deop " + s.ops_entries[i], nullptr, &error))
-                    report_server_failure(s, st, "De-op", sv.name, error);
+                start_local_server_command(st, sv, LocalServerCommandOrigin::OpRemove,
+                                           "deop " + s.ops_entries[i]);
             }
             ImGui::PopID();
         }
         card_end();
     }
+    if (command_busy) ImGui::EndDisabled();
 }
 
 // ---------------------------------------------------------------------------
 // Server detail – world tab
 // ---------------------------------------------------------------------------
 
+// Shared by the live World tab and its inert fixture equivalent.  Keeping the
+// confirmation outside the live-backup list is important: the fixture must
+// show the exact same decision boundary without enumerating any reviewer
+// files or letting the fixture issue a restore request.
+static void draw_server_backup_restore_dialog(ServerUIState& s,
+                                              const server::ServerConfig& sv,
+                                              UiState& st) {
+    if (s.restore_backup_confirm) ImGui::OpenPopup("Confirm Backup Restore##server_backup");
+    if (!ImGui::BeginPopupModal("Confirm Backup Restore##server_backup", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::PushFont(f_h2);
+    ImGui::TextColored(k.text, "Restore backup?");
+    ImGui::PopFont();
+    ImGui::TextWrapped("Restore \"%s\" into server \"%s\"?",
+                       s.restore_backup_name.c_str(), sv.name.c_str());
+    ImGui::Spacing();
+    ImGui::TextColored(k.yellow,
+                       "The server must be stopped. When current files exist, Amalgam first creates and retains a pre-restore backup.");
+    ImGui::TextColored(k.muted,
+                       "The selected backup replaces the current server files only after it has been staged successfully.");
+    if (!s.restore_backup_error.empty()) {
+        ImGui::Spacing();
+        ImGui::PushFont(f_bold);
+        ImGui::TextColored(k.red, "Restore failed");
+        ImGui::PopFont();
+        ImGui::PushStyleColor(ImGuiCol_Text, k.red);
+        ImGui::TextWrapped("%s", s.restore_backup_error.c_str());
+        ImGui::PopStyleColor();
+    }
+    const bool fixture_preview = st.fixture_mode;
+    if (fixture_preview) {
+        ImGui::Spacing();
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture — restoration is disabled; no server files are staged or changed.");
+    }
+    ImGui::Spacing();
+    const auto attempt_backup_restore = [&] {
+        // Keep the hard fixture boundary at the action entry rather than
+        // relying solely on disabled visual controls.
+        if (st.fixture_mode) return;
+        if (local_server_supervised(sv)) {
+            s.restore_backup_error = "Stop this local server before restoring a backup.";
+        } else {
+            std::string restore_error;
+            if (aml::services::local_server_manager()->restore_backup(
+                    sv.name, s.restore_backup_id, &restore_error)) {
+                s.world_dirty = true;
+                s.restore_backup_confirm = false;
+                s.restore_backup_id.clear();
+                s.restore_backup_name.clear();
+                s.restore_backup_error.clear();
+                clear_server_failure(s);
+                push_notice(st, ui_model::NoticeLevel::Success, "Backup Restored",
+                            "The previous server files were preserved as a pre-restore backup.");
+                ImGui::CloseCurrentPopup();
+            } else {
+                s.restore_backup_error = restore_error.empty()
+                    ? "The backup could not be restored; current server files were not changed."
+                    : restore_error;
+                report_server_failure(s, st, "Restore Backup", sv.name, s.restore_backup_error);
+            }
+        }
+    };
+    if (danger_button("Restore backup", ImVec2(ui_px(140.0f), ui_px(32.0f)), fixture_preview)) {
+        attempt_backup_restore();
+    }
+    ImGui::SameLine();
+    if (ghost_button(fixture_preview ? "Close preview" : "Cancel",
+                     ImVec2(fixture_preview ? ui_px(116.0f) : ui_px(80.0f), ui_px(32.0f)))) {
+        s.restore_backup_confirm = false;
+        s.restore_backup_id.clear();
+        s.restore_backup_name.clear();
+        s.restore_backup_error.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
     ImGui::PushFont(f_h2);
     ImGui::TextColored(k.text, "World");
     ImGui::PopFont();
     ImGui::Spacing();
+
+    // Do not enumerate a reviewer-owned world directory from a fixture.  This
+    // keeps the visual evidence representative, deterministic, and inert.
+    if (st.fixture_mode) {
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: representative local world data; file actions are disabled.");
+        ImGui::Spacing();
+        card_begin("##fixture_world_info", ImVec2(-1, 0));
+        ImGui::TextColored(k.text, "Forsaken World SMP");
+        ImGui::TextColored(k.muted, "world  •  42 MB  •  Survival");
+        ImGui::Spacing();
+        ghost_button("Save-All", ImVec2(ui_px(100.0f), ui_px(28.0f)), true);
+        ImGui::SameLine(0, ui_px(4.0f));
+        ghost_button("Open Folder", ImVec2(ui_px(120.0f), ui_px(28.0f)), true);
+        card_end();
+        ImGui::Spacing();
+        ImGui::PushFont(f_h2);
+        ImGui::TextColored(k.text, "Backups");
+        ImGui::PopFont();
+        ImGui::Spacing();
+        card_begin("##fixture_world_backup", ImVec2(-1, 0));
+        ImGui::TextColored(k.text, "Pre-release checkpoint");
+        ImGui::SameLine(0, ui_px(10.0f));
+        ImGui::TextColored(k.muted, "42 MB  •  Local fixture");
+        ImGui::SameLine(0, ui_px(12.0f));
+        ghost_button("Restore", ImVec2(ui_px(70.0f), ui_px(22.0f)), true);
+        card_end();
+        draw_server_backup_restore_dialog(s, sv, st);
+        return;
+    }
 
     if (sv.server_directory.empty()) {
         empty_state("No server directory", "Set a server directory to manage the world.");
@@ -1499,11 +2906,14 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
             float bh = ui_px(28.0f);
 
             if (effective_stage(st, sv) == server::ServerStage::Running) {
-                if (ghost_button("Save-All", ImVec2(bw, bh))) {
-                    std::string error;
-                    if (!aml::services::local_server_manager()->send_command(
-                            sv.name, "save-all", nullptr, &error))
-                        report_server_failure(s, st, "Save-All", sv.name, error);
+                const bool command_busy = local_server_action_lane_busy(s) ||
+                                          local_server_command_lane_busy(s);
+                const bool saving = local_server_command_is_working(
+                    s, LocalServerCommandOrigin::SaveAll);
+                if (ghost_button(saving ? "Saving..." : "Save-All", ImVec2(bw, bh),
+                                 command_busy)) {
+                    start_local_server_command(st, sv, LocalServerCommandOrigin::SaveAll,
+                                               "save-all");
                 }
                 ImGui::SameLine(0, ui_px(4.0f));
             }
@@ -1526,7 +2936,7 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
     ImGui::PopFont();
     ImGui::Spacing();
 
-    if (ghost_button("Create Backup", ImVec2(ui_px(120.0f), ui_px(30.0f)))) {
+    if (!st.fixture_mode && ghost_button("Create Backup", ImVec2(ui_px(120.0f), ui_px(30.0f)))) {
         std::string backup_id;
         std::string backup_err;
         if (aml::services::local_server_manager()->create_backup(
@@ -1539,8 +2949,20 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
 
     ImGui::Spacing();
 
-    // List backups from the services layer
-    {
+    // A fixture must not enumerate the reviewer's global local-backup root.
+    // Provide a static representative record for layout evidence instead.
+    if (st.fixture_mode) {
+        card_begin("##fixture_backups_list", ImVec2(-1, 0));
+        ImGui::TextColored(k.text, "Forsaken World SMP - pre-release checkpoint");
+        ImGui::SameLine(0, ui_px(10.0f));
+        ImGui::TextColored(k.muted, "(Local fixture - 42 MB)");
+        ImGui::SameLine(0, ui_px(12.0f));
+        ImGui::BeginDisabled();
+        ghost_button("Restore", ImVec2(ui_px(70.0f), ui_px(22.0f)));
+        ImGui::EndDisabled();
+        card_end();
+    } else {
+        // List backups from the services layer
         auto backups = aml::services::local_server_manager()->list_backups(sv.name);
         if (backups.empty()) {
             empty_state("No backups yet", "Create a backup above to protect your world.");
@@ -1563,26 +2985,173 @@ static void draw_server_world_tab(ServerUIState& s, const server::ServerConfig& 
                 }
                 ImGui::SameLine(0, ui_px(12.0f));
                 if (ghost_button("Restore", ImVec2(ui_px(70.0f), ui_px(22.0f)))) {
-                    std::string restore_error;
-                    if (aml::services::local_server_manager()->restore_backup(
-                            sv.name, bid, &restore_error))
-                        clear_server_failure(s);
-                    else
-                        report_server_failure(s, st, "Restore Backup", sv.name, restore_error);
+                    if (!bid.empty()) {
+                        s.restore_backup_id = bid;
+                        s.restore_backup_name = bname;
+                        s.restore_backup_error.clear();
+                        s.restore_backup_confirm = true;
+                    }
                 }
                 ImGui::PopID();
             }
             card_end();
         }
     }
+
+    draw_server_backup_restore_dialog(s, sv, st);
 }
 
 // ---------------------------------------------------------------------------
 // Server detail – console tab (embedded)
 // ---------------------------------------------------------------------------
 
+// Keep the console visual-review route entirely self-contained.  The live
+// console below reads a supervised server and can send commands; even a
+// disabled-looking live widget would not be an acceptable fixture boundary.
+static void draw_fixture_server_detail_console(const server::ServerConfig& sv) {
+    ImGui::PushFont(f_h2);
+    ImGui::TextColored(k.text, "Console: %s", sv.name.c_str());
+    ImGui::PopFont();
+    ImGui::SameLine(0, ui_px(12.0f));
+    draw_status_badge(sv.stage);
+    ImGui::Spacing();
+    ImGui::TextColored(k.brand_hov,
+                       "Visual fixture — representative local log only. Reading, copying, clearing, and sending commands are disabled.");
+    ImGui::Spacing();
+
+    std::string fixture_filter;
+    ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(ui_px(200.0f));
+    input_text_hint("##fixture_dconsole_filter", "Filter logs...", &fixture_filter);
+    ImGui::SameLine(0, ui_px(8.0f));
+    ghost_button("Copy", ImVec2(ui_px(60.0f), ui_px(24.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Clear", ImVec2(ui_px(60.0f), ui_px(24.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Auto-scroll ON", ImVec2(ui_px(110.0f), ui_px(24.0f)));
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // The real console intentionally owns a bounded, auto-scrolling log
+    // viewer.  A review fixture must instead participate in the launcher's
+    // page-level scroll host: the generic @top/@middle/@bottom capture cases
+    // target that host, not an arbitrary nested child.  This content-sized
+    // card makes each capture position a truthful portion of one stable,
+    // explicitly local representative transcript while the live console below
+    // remains completely unchanged.
+    struct FixtureConsoleEntry {
+        int section;
+        const char* timestamp;
+        const char* message;
+        ImVec4 color;
+    };
+    const char* section_titles[] = {
+        "STARTUP",
+        "PLAYER ACTIVITY",
+        "WORLD SAVES",
+        "SERVER MAINTENANCE",
+        "SESSION TAIL",
+    };
+    const FixtureConsoleEntry entries[] = {
+        {0, "10:14:02", "INFO  Starting Minecraft server version 1.21.1", k.green},
+        {0, "10:14:03", "INFO  Loading server properties", k.green},
+        {0, "10:14:04", "INFO  Loading 3 representative mods", k.green},
+        {0, "10:14:05", "INFO  Preparing spawn area: 0%", k.muted},
+        {0, "10:14:06", "INFO  Preparing spawn area: 54%", k.muted},
+        {0, "10:14:07", "INFO  Preparing spawn area: 100%", k.muted},
+        {0, "10:14:08", "INFO  Done (6.214s)! For help, type \"help\"", k.green},
+        {0, "10:14:10", "INFO  Listening on 0.0.0.0:25565", k.green},
+
+        {1, "10:15:17", "INFO  Alex joined the game", k.green},
+        {1, "10:15:18", "INFO  Alex joined the lobby", k.muted},
+        {1, "10:15:31", "INFO  Sam joined the game", k.green},
+        {1, "10:15:44", "INFO  Sent welcome message to Sam", k.muted},
+        {1, "10:16:02", "INFO  Alex completed advancement [Stone Age]", k.muted},
+        {1, "10:16:11", "WARN  Can't keep up! Is the server overloaded?", k.yellow},
+        {1, "10:16:15", "INFO  Recovered 38 ms behind the expected tick rate", k.green},
+        {1, "10:16:22", "INFO  Sam moved to world_nether", k.muted},
+
+        {2, "10:16:28", "INFO  Saved the game", k.green},
+        {2, "10:16:29", "INFO  Saved chunks for level 'world'/minecraft:overworld", k.muted},
+        {2, "10:16:29", "INFO  Saved chunks for level 'world_nether'/minecraft:the_nether", k.muted},
+        {2, "10:18:04", "INFO  Autosave checkpoint started", k.muted},
+        {2, "10:18:05", "INFO  Flushed 12 modified chunks", k.green},
+        {2, "10:18:05", "INFO  Autosave checkpoint complete", k.green},
+        {2, "10:20:09", "INFO  Saved the game", k.green},
+        {2, "10:20:10", "INFO  World save completed in 41 ms", k.muted},
+
+        {3, "10:22:00", "INFO  Scheduled maintenance check started", k.muted},
+        {3, "10:22:01", "INFO  Runtime health check passed", k.green},
+        {3, "10:22:02", "INFO  Storage space is available", k.green},
+        {3, "10:23:18", "INFO  Player list synchronized", k.muted},
+        {3, "10:24:40", "WARN  Slow tick observed; continuing to monitor", k.yellow},
+        {3, "10:24:41", "INFO  Tick time returned to normal", k.green},
+        {3, "10:26:00", "INFO  Scheduled maintenance check complete", k.green},
+        {3, "10:27:34", "INFO  Saved the game", k.green},
+
+        {4, "10:29:12", "INFO  Alex left the game", k.muted},
+        {4, "10:29:13", "INFO  Sam returned to the overworld", k.muted},
+        {4, "10:30:00", "INFO  Autosave checkpoint started", k.muted},
+        {4, "10:30:01", "INFO  Autosave checkpoint complete", k.green},
+        {4, "10:31:25", "INFO  Player list synchronized", k.muted},
+        {4, "10:32:44", "INFO  Saved the game", k.green},
+        {4, "10:33:00", "INFO  Representative fixture capture is ready", k.green},
+        {4, "10:33:01", "INFO  Commands remain disabled in this review route", k.muted},
+    };
+    constexpr int fixture_entry_count =
+        static_cast<int>(sizeof(entries) / sizeof(entries[0]));
+
+    card_begin("##fixture_dconsole_log_document", ImVec2(-1, 0));
+    ImGui::TextColored(k.muted,
+                       "Representative local transcript — %d static records",
+                       fixture_entry_count);
+    ImGui::Spacing();
+    int previous_section = -1;
+    for (const auto& entry : entries) {
+        if (entry.section != previous_section) {
+            if (previous_section >= 0) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+            }
+            ImGui::TextColored(k.brand_hov, "%s", section_titles[entry.section]);
+            previous_section = entry.section;
+        }
+        ImGui::TextColored(k.muted, "[%s]", entry.timestamp);
+        ImGui::SameLine(ui_px(78.0f));
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(entry.color, "%s", entry.message);
+        ImGui::PopTextWrapPos();
+    }
+    card_end();
+
+    ImGui::Spacing();
+    std::string fixture_command = "say Welcome to Forsaken World SMP";
+    const float send_width = ui_px(76.0f);
+    const float send_gap = ImGui::GetStyle().ItemSpacing.x;
+    const float command_width = std::max(ui_px(120.0f),
+        ImGui::GetContentRegionAvail().x - send_width - send_gap);
+    ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(command_width);
+    ImGui::InputText("##fixture_dconsole_cmd", &fixture_command);
+    ImGui::SameLine(0, send_gap);
+    primary_button("Send", ImVec2(send_width, ImGui::GetFrameHeight()));
+    ImGui::EndDisabled();
+}
+
 static void draw_server_detail_console(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
-    if (ImGui::GetTime() - s.detail_console_last_refresh >= 1.0) {
+    if (st.fixture_mode) {
+        draw_fixture_server_detail_console(sv);
+        return;
+    }
+
+    // The visual fixture seeds `s.console_log` from UiState.  Do not ask the
+    // service layer for a same-named real server's logs: that lookup reads the
+    // reviewer's local server registry and can expose a real latest.log.
+    if (!st.fixture_mode && ImGui::GetTime() - s.detail_console_last_refresh >= 1.0) {
         s.detail_console_last_refresh = ImGui::GetTime();
         const auto live_entries =
             aml::services::local_server_manager()->get_console_logs(sv.name, 500, nullptr);
@@ -1671,23 +3240,19 @@ static void draw_server_detail_console(ServerUIState& s, const server::ServerCon
     auto submit_command = [&]() {
         if (s.detail_console_input.empty()) return;
         const std::string command = s.detail_console_input;
+        if (!start_local_server_command(st, sv, LocalServerCommandOrigin::DetailConsole,
+                                        command)) {
+            return;
+        }
         server::ServerConsoleEntry cmd_entry;
         cmd_entry.timestamp = ">";
         cmd_entry.message = command;
         s.console_log.push_back(std::move(cmd_entry));
-
-        std::string response;
-        std::string command_error;
-        const bool sent = aml::services::local_server_manager()->send_command(
-            sv.name, command, &response, &command_error);
-        server::ServerConsoleEntry result_entry;
-        result_entry.timestamp = sent ? "<" : "!";
-        result_entry.message = sent
-            ? (response.empty() ? "Command sent" : response)
-            : (command_error.empty() ? "Command could not be sent" : command_error);
-        s.console_log.push_back(std::move(result_entry));
         s.detail_console_input.clear();
     };
+
+    const bool command_busy = local_server_action_lane_busy(s) ||
+                              local_server_command_lane_busy(s);
 
     // Command input. Reserve the exact button width and current style gap so
     // the Send action remains inside the content region at every DPI scale.
@@ -1695,6 +3260,7 @@ static void draw_server_detail_console(ServerUIState& s, const server::ServerCon
     const float send_gap = ImGui::GetStyle().ItemSpacing.x;
     const float command_width = std::max(ui_px(120.0f),
         ImGui::GetContentRegionAvail().x - send_width - send_gap);
+    if (command_busy) ImGui::BeginDisabled();
     ImGui::SetNextItemWidth(command_width);
     if (ImGui::InputText("##dconsole_cmd", &s.detail_console_input,
                          ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -1702,16 +3268,149 @@ static void draw_server_detail_console(ServerUIState& s, const server::ServerCon
         ImGui::SetKeyboardFocusHere(-1);
     }
     ImGui::SameLine(0, send_gap);
-    if (primary_button("Send", ImVec2(send_width, ImGui::GetFrameHeight()))) {
+    const bool sending = local_server_command_is_working(
+        s, LocalServerCommandOrigin::DetailConsole);
+    if (primary_button(sending ? "Sending..." : "Send",
+                       ImVec2(send_width, ImGui::GetFrameHeight()),
+                       false, command_busy)) {
         submit_command();
     }
+    if (command_busy) ImGui::EndDisabled();
 }
 
 // ---------------------------------------------------------------------------
 // Server detail – overview tab
 // ---------------------------------------------------------------------------
 
+// This presentation reads only the fixture-seeded configuration and snapshot
+// metrics. The normal overview reaches the local supervisor, runtime
+// downloader, filesystem and persisted server list through its action row; a
+// visual fixture must not inherit any of those paths merely to show the same
+// composition.
+static void draw_fixture_server_overview_tab(const server::ServerConfig& sv, const UiState& st) {
+    const server::ServerStage stage = sv.stage;
+
+    card_begin("##fixture_detail_hero", ImVec2(-1, 0));
+    {
+        const ImVec2 hero_origin = ImGui::GetCursorScreenPos();
+        const float hero_height = ui_px(126.0f);
+        const ImVec2 hero_size(ImGui::GetContentRegionAvail().x, hero_height);
+        ImDrawList* hero_draw = ImGui::GetWindowDrawList();
+        hero_draw->AddRectFilled(hero_origin, hero_origin + hero_size, c32(k.surface2),
+                                 ui_px(10.0f));
+        hero_draw->AddRect(hero_origin, hero_origin + hero_size, c32(k.border),
+                           ui_px(10.0f));
+        hero_draw->AddRectFilled(hero_origin,
+                                 hero_origin + ImVec2(ui_px(5.0f), hero_height),
+                                 c32(stage_color(stage)), ui_px(2.0f));
+        hero_draw->AddCircleFilled(hero_origin + ImVec2(ui_px(34.0f), ui_px(34.0f)),
+                                   ui_px(22.0f), c32(k.brand_dk));
+        draw_icon(IconId::Server, hero_origin + ImVec2(ui_px(34.0f), ui_px(34.0f)),
+                  ui_px(12.0f), c32(k.brand_hov));
+
+        ImGui::SetCursorScreenPos(hero_origin + ImVec2(ui_px(68.0f), ui_px(14.0f)));
+        ImGui::PushFont(f_title);
+        ImGui::TextUnformatted(sv.name.c_str());
+        ImGui::PopFont();
+        ImGui::SameLine(0, ui_px(10.0f));
+        draw_status_badge(stage);
+        ImGui::TextColored(k.muted, "%s  •  Minecraft %s",
+                           server::server_software_name(sv.software),
+                           sv.minecraft_version.c_str());
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, k.brand_hov);
+        ImGui::TextWrapped(
+            "Visual fixture — representative local server state; no server, file, process, or launcher configuration is read or changed.");
+        ImGui::PopStyleColor();
+
+        ImGui::SetCursorScreenPos(ImVec2(hero_origin.x, hero_origin.y + hero_height));
+        ImGui::Dummy(ImVec2(0, 0));
+    }
+    card_end();
+
+    ImGui::Spacing();
+    card_begin("##fixture_detail_metrics", ImVec2(-1, 0));
+    ImGui::PushFont(f_bold);
+    ImGui::TextColored(k.text, "Representative activity");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "Snapshot-only values for visual layout review.");
+    ImGui::Spacing();
+    const float column_width = std::max(ui_px(112.0f),
+        (ImGui::GetContentRegionAvail().x - ui_px(30.0f)) / 4.0f);
+    const auto& fixture_metrics = st.server_metrics;
+    const bool metrics_available = fixture_metrics.valid;
+    const ImVec4 unavailable_color = k.muted;
+    const float cpu_pct = std::clamp(fixture_metrics.cpu_percent / 100.0f, 0.0f, 1.0f);
+    const float ram_pct = std::clamp(fixture_metrics.ram_percent / 100.0f, 0.0f, 1.0f);
+    const ImVec4 cpu_color = cpu_pct > 0.9f ? k.red : cpu_pct > 0.7f ? k.orange : k.green;
+    const ImVec4 ram_color = ram_pct > 0.9f ? k.red : ram_pct > 0.7f ? k.orange : k.blue;
+    const ImVec4 tps_color = fixture_metrics.tps >= 19.0f ? k.green
+        : fixture_metrics.tps >= 15.0f ? k.yellow : k.red;
+    char tps_text[32]{};
+    if (metrics_available)
+        std::snprintf(tps_text, sizeof(tps_text), "%.1f", fixture_metrics.tps);
+
+    const struct {
+        const char* label;
+        std::string value;
+        ImVec4 color;
+    } metrics[] = {
+        {"CPU", metrics_available
+            ? std::to_string(static_cast<int>(fixture_metrics.cpu_percent)) + "%"
+            : "Unavailable", metrics_available ? cpu_color : unavailable_color},
+        {"RAM", metrics_available
+            ? format_server_ram_mb(fixture_metrics.ram_mb) + " / " +
+                format_server_ram_mb(sv.allocated_ram_mb)
+            : "Unavailable", metrics_available ? ram_color : unavailable_color},
+        {"TPS", metrics_available ? tps_text : "Unavailable",
+            metrics_available ? tps_color : unavailable_color},
+        {"PLAYERS", metrics_available
+            ? std::to_string(fixture_metrics.players_online) + " / " +
+                std::to_string(sv.max_players)
+            : "Unavailable", metrics_available ? k.brand : unavailable_color},
+    };
+    for (size_t i = 0; i < sizeof(metrics) / sizeof(metrics[0]); ++i) {
+        if (i) ImGui::SameLine(0, ui_px(10.0f));
+        const ImVec2 metric_min = ImGui::GetCursorScreenPos();
+        const ImVec2 metric_size(column_width, ui_px(52.0f));
+        ImDrawList* metric_draw = ImGui::GetWindowDrawList();
+        ImVec4 metric_bg = metrics[i].color;
+        metric_bg.w = 0.10f;
+        metric_draw->AddRectFilled(metric_min, metric_min + metric_size, c32(metric_bg),
+                                   ui_px(7.0f));
+        metric_draw->AddRect(metric_min, metric_min + metric_size,
+                             c32(ImVec4(metrics[i].color.x, metrics[i].color.y,
+                                         metrics[i].color.z, 0.45f)),
+                             ui_px(7.0f));
+        metric_draw->AddText(metric_min + ImVec2(ui_px(10.0f), ui_px(7.0f)),
+                             c32(k.muted), metrics[i].label);
+        metric_draw->AddText(f_bold, f_bold->LegacySize,
+                             metric_min + ImVec2(ui_px(10.0f), ui_px(25.0f)),
+                             c32(metrics[i].color), metrics[i].value.c_str());
+        ImGui::Dummy(metric_size);
+    }
+    card_end();
+
+    ImGui::Spacing();
+    ImGui::TextColored(k.muted,
+                       "Operational controls are shown for layout only and cannot act in this visual fixture.");
+    ImGui::BeginDisabled();
+    ghost_button("Stop", ImVec2(ui_px(108.0f), ui_px(32.0f)));
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Restart", ImVec2(ui_px(108.0f), ui_px(32.0f)));
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Open Folder", ImVec2(ui_px(132.0f), ui_px(32.0f)));
+    ImGui::SameLine(0, ui_px(16.0f));
+    danger_button("Remove from Amalgam", ImVec2(ui_px(178.0f), ui_px(32.0f)));
+    ImGui::EndDisabled();
+}
+
 static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv, UiState& st) {
+    if (st.fixture_mode) {
+        draw_fixture_server_overview_tab(sv, st);
+        return;
+    }
+
     const server::ServerStage stage = effective_stage(st, sv);
     bool is_running = (stage == server::ServerStage::Running);
     bool is_ready = (stage == server::ServerStage::Ready ||
@@ -1735,16 +3434,54 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         ImGui::GetWindowDrawList()->AddRect(hero_art_pos, hero_art_pos + hero_art_size,
                                             c32(k.border), ui_px(10.0f));
 
+        // Wide screens otherwise leave a large, visually unanchored patch of
+        // artwork beside the server identity. A compact, read-only limits
+        // panel balances that space without hiding the scene or duplicating a
+        // primary control. It deliberately disappears before it could crowd
+        // the identity and status badges on compact widths.
+        if (hero_art_size.x >= ui_px(860.0f)) {
+            const float limits_w = std::min(ui_px(224.0f), hero_art_size.x * 0.26f);
+            const float limits_h = ui_px(88.0f);
+            const ImVec2 limits_min(hero_art_pos.x + hero_art_size.x - limits_w - ui_px(18.0f),
+                                    hero_art_pos.y + (hero_art_height - limits_h) * 0.5f);
+            const ImVec2 limits_max = limits_min + ImVec2(limits_w, limits_h);
+            ImDrawList* hero_dl = ImGui::GetWindowDrawList();
+            hero_dl->AddRectFilled(limits_min, limits_max,
+                                   c32(ImVec4(k.bg.x, k.bg.y, k.bg.z, 0.80f)), ui_px(8.0f));
+            hero_dl->AddRect(limits_min, limits_max,
+                             c32(ImVec4(k.border.x, k.border.y, k.border.z, 0.92f)),
+                             ui_px(8.0f));
+
+            const ImVec2 text_pos = limits_min + ImVec2(ui_px(12.0f), ui_px(10.0f));
+            const std::string memory_limit = format_server_ram_mb(sv.allocated_ram_mb);
+            const std::string player_capacity = std::to_string(sv.max_players) +
+                (sv.max_players == 1 ? " player slot" : " player slots");
+            hero_dl->AddText(f_small, f_small->LegacySize, text_pos, c32(k.muted),
+                             "MEMORY LIMIT");
+            hero_dl->AddText(f_bold, f_bold->LegacySize,
+                             text_pos + ImVec2(0, ui_px(16.0f)), c32(k.blue),
+                             memory_limit.c_str());
+            hero_dl->AddText(f_small, f_small->LegacySize,
+                             text_pos + ImVec2(0, ui_px(47.0f)), c32(k.muted),
+                             "PLAYER CAPACITY");
+            hero_dl->AddText(f_bold, f_bold->LegacySize,
+                             text_pos + ImVec2(0, ui_px(63.0f)), c32(k.green),
+                             player_capacity.c_str());
+        }
+
         // Left status strip
         ImVec2 card_min = ImGui::GetCursorScreenPos();
         ImVec4 strip_color = stage_color(stage);
+        const float strip_inset = ui_px(8.0f);
         ImGui::GetWindowDrawList()->AddRectFilled(
-            card_min,
-            ImVec2(card_min.x + ui_px(5.0f), card_min.y + ui_px(90.0f)),
+            card_min + ImVec2(0, strip_inset),
+            ImVec2(card_min.x + ui_px(5.0f), card_min.y + hero_art_height - strip_inset),
             c32(strip_color), ui_px(2.0f));
 
-        ImGui::Dummy(ImVec2(ui_px(10.0f), 0));
-        ImGui::SameLine();
+        // Indent the full text column, not just the first line. The previous
+        // one-line spacer reset after a newline, letting status copy collide
+        // with the green status rail.
+        ImGui::Indent(ui_px(14.0f));
 
         // Name + badges
         ImGui::PushFont(f_title);
@@ -1790,7 +3527,7 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         std::string port_chip = "Port " + std::to_string(sv.port);
         meta_chip(port_chip.c_str(), k.muted);
         ImGui::SameLine(0, ui_px(6.0f));
-        std::string ram_chip = "RAM " + std::to_string(sv.allocated_ram_mb) + " MB";
+        std::string ram_chip = "RAM " + format_server_ram_mb(sv.allocated_ram_mb);
         meta_chip(ram_chip.c_str(), k.blue);
         ImGui::SameLine(0, ui_px(6.0f));
         std::string max_chip = "Max " + std::to_string(sv.max_players) + " players";
@@ -1799,10 +3536,14 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         if (!sv.status_message.empty()) {
             ImGui::Spacing();
             const ImVec4 sc = (stage == server::ServerStage::Error) ? k.red : k.muted;
-            ImGui::TextColored(sc, "%s", sv.status_message.c_str());
+            const std::string readable_status = humanize_server_status_message(sv.status_message);
+            ImGui::PushFont(f_small);
+            ImGui::TextColored(sc, "%s", readable_status.c_str());
+            ImGui::PopFont();
         }
 
         const float content_bottom = ImGui::GetCursorScreenPos().y;
+        ImGui::Unindent(ui_px(14.0f));
         if (content_bottom < hero_art_pos.y + hero_art_height) {
             ImGui::SetCursorScreenPos(ImVec2(hero_art_pos.x,
                                              hero_art_pos.y + hero_art_height));
@@ -1813,46 +3554,89 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
 
     ImGui::Spacing();
 
+    // ── Runtime download progress ───────────────────────────────────
+    if (downloading_runtime_for(sv.name)) {
+        const float transfer = runtime_download().progress.load();
+        card_begin("##detail_download", ImVec2(-1, 0));
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted(download_phase().c_str());
+        ImGui::PopFont();
+        ImGui::Spacing();
+        char overlay[64]{};
+        if (transfer >= 0.0f)
+            std::snprintf(overlay, sizeof(overlay), "%d%%", static_cast<int>(transfer * 100.0f));
+        progress_bar(transfer, ImVec2(-1, ui_px(8.0f)), overlay);
+        ImGui::PushFont(f_small);
+        if (download_can_cancel()) {
+            ImGui::TextColored(k.muted,
+                               "You can cancel while this file downloads; this page updates as it goes.");
+        } else {
+            ImGui::TextColored(k.muted,
+                               "This step cannot be cancelled safely. It will finish or report an error.");
+        }
+        ImGui::PopFont();
+        card_end();
+        ImGui::Spacing();
+    }
+
     // ── Quick actions row ───────────────────────────────────────────
     {
         float bw = ui_px(100.0f);
         float bh = ui_px(32.0f);
 
-        auto* svc = aml::services::local_server_manager();
+        const bool local_action_busy = local_server_action_lane_busy(s) ||
+                                       local_server_command_lane_busy(s);
+        const bool start_working = local_server_action_is_working(s, LocalServerAction::Start);
+        const bool stop_working = local_server_action_is_working(s, LocalServerAction::Stop);
+        const bool restart_working = local_server_action_is_working(s, LocalServerAction::Restart);
         if (is_running) {
-            if (primary_button("Stop", ImVec2(bw + ui_px(10.0f), bh))) {
-                std::string error;
-                if (svc->stop_local_server(sv.name, &error)) {
-                    sv.stage = server::ServerStage::Stopped;
-                    save_local_servers(st.servers);
-                    clear_server_failure(s);
+            if (ghost_button(stop_working ? "Stopping..." : "Stop",
+                             ImVec2(bw + ui_px(10.0f), bh), local_action_busy)) {
+                start_local_server_action(st, s.detail_server_idx, LocalServerAction::Stop);
+            }
+            ImGui::SameLine(0, ui_px(6.0f));
+            if (ghost_button(restart_working ? "Restarting..." : "Restart",
+                             ImVec2(bw + ui_px(10.0f), bh), local_action_busy)) {
+                start_local_server_action(st, s.detail_server_idx, LocalServerAction::Restart);
+            }
+        } else if (downloading_runtime_for(sv.name)) {
+            if (download_can_cancel()) {
+                if (ghost_button("Cancel download", ImVec2(bw + ui_px(30.0f), bh))) {
+                    runtime_download().cancel.store(true);
+                }
+            } else {
+                ImGui::BeginDisabled();
+                ghost_button("Working", ImVec2(bw + ui_px(30.0f), bh));
+                ImGui::EndDisabled();
+            }
+        } else if (!runtime_files_present(sv)) {
+            // The files the server starts from are not on disk. Offer the
+            // download here instead of a Start that can only fail. A manual
+            // runtime has nothing to fetch, so that case opens the folder the
+            // jar has to be placed in.
+            const bool manual =
+                server::server_software_kind(sv.software) == server::RuntimeKind::Manual;
+            if (primary_button(manual ? "Add server file" : "Prepare server files",
+                               ImVec2(bw + ui_px(50.0f), bh))) {
+                if (manual) {
+                    ShellExecuteW(nullptr, L"open",
+                        aml::net::to_wide(sv.server_directory).c_str(),
+                        nullptr, nullptr, SW_SHOWNORMAL);
                 } else {
-                    report_server_failure(s, st, "Stop", sv.name, error);
+                    start_provision(st, s.detail_server_idx);
                 }
             }
             ImGui::SameLine(0, ui_px(6.0f));
-            if (ghost_button("Restart", ImVec2(bw + ui_px(10.0f), bh))) {
-                std::string error;
-                const bool started = svc->stop_local_server(sv.name, &error) &&
-                                     svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error);
-                if (started) {
-                    sv.stage = server::ServerStage::Running;
-                    save_local_servers(st.servers);
-                    clear_server_failure(s);
-                } else {
-                    report_server_failure(s, st, "Restart", sv.name, error);
-                }
+            if (ghost_button("Open Folder", ImVec2(bw + ui_px(20.0f), bh))) {
+                ShellExecuteW(nullptr, L"open",
+                    aml::net::to_wide(sv.server_directory).c_str(),
+                    nullptr, nullptr, SW_SHOWNORMAL);
             }
         } else if (is_ready) {
-            if (primary_button("Start", ImVec2(bw + ui_px(10.0f), bh))) {
-                std::string error;
-                if (svc->start_local_server(sv.name, "", sv.allocated_ram_mb, &error)) {
-                    sv.stage = server::ServerStage::Running;
-                    save_local_servers(st.servers);
-                    clear_server_failure(s);
-                } else {
-                    report_server_failure(s, st, "Start", sv.name, error);
-                }
+            if (primary_button(start_working ? "Starting..." : "Start",
+                               ImVec2(bw + ui_px(10.0f), bh), start_working,
+                               local_action_busy)) {
+                start_local_server_action(st, s.detail_server_idx, LocalServerAction::Start);
             }
             ImGui::SameLine(0, ui_px(6.0f));
             if (ghost_button("Open Folder", ImVec2(bw + ui_px(20.0f), bh))) {
@@ -1862,9 +3646,27 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
             }
         }
 
-        ImGui::SameLine(0, ui_px(6.0f));
-        if (ghost_button("Delete Server", ImVec2(bw + ui_px(10.0f), bh)))
+        // Split irreversible removal away from the operating controls. Stop
+        // and Restart stay neutral; a red outline gives Delete Server its own
+        // unmistakable risk tier before the confirmation step appears.
+        ImGui::SameLine(0, ui_px(16.0f));
+        const ImVec2 divider_min = ImGui::GetCursorScreenPos();
+        ImVec4 divider_color = k.border;
+        divider_color.w = 0.9f;
+        ImGui::GetWindowDrawList()->AddLine(
+            divider_min + ImVec2(0, ui_px(5.0f)),
+            divider_min + ImVec2(0, bh - ui_px(5.0f)),
+            c32(divider_color), ui_px(1.0f));
+        ImGui::Dummy(ImVec2(ui_px(1.0f), bh));
+        ImGui::SameLine(0, ui_px(16.0f));
+        if (danger_button("Remove from Amalgam", ImVec2(bw + ui_px(52.0f), bh),
+                          local_action_busy)) {
             s.action_pending = s.detail_server_idx;
+            s.remove_server_error.clear();
+        }
+        if (ImGui::IsItemHovered()) {
+            draw_tooltip("Removes this server only from Amalgam. Its server folder and files stay where they are.");
+        }
     }
 
     ImGui::Spacing();
@@ -1879,8 +3681,23 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
 
         auto& metrics = st.server_metrics;
         if (!metrics.valid) {
-            empty_state("Live metrics unavailable",
-                        "Metrics will appear when this server reports an authoritative health snapshot.");
+            // A missing telemetry provider is a normal, honest state for a
+            // local server. Keep it compact and actionable instead of turning
+            // the overview into a large empty panel.
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            draw_icon(IconId::Info, origin + ImVec2(ui_px(12.0f), ui_px(15.0f)),
+                      ui_px(9.0f), c32(k.muted));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(34.0f));
+            ImGui::PushFont(f_bold);
+            ImGui::TextUnformatted("Telemetry not reported yet");
+            ImGui::PopFont();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(34.0f));
+            ImGui::TextColored(k.muted,
+                               "Lifecycle state is authoritative; CPU, RAM, TPS, and player counts will appear when the server exposes a health snapshot.");
+            ImGui::Spacing();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ui_px(34.0f));
+            if (ghost_button("Open Console", ImVec2(ui_px(122.0f), ui_px(28.0f))))
+                s.detail_tab = 1;
         } else {
 
         // Stat cards row
@@ -1889,23 +3706,47 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
         float max_h = 0;
         float cpu_pct = metrics.cpu_percent / 100.0f;
         ImVec4 cpu_color = cpu_pct > 0.9f ? k.red : cpu_pct > 0.7f ? k.orange : k.green;
-        max_h = std::max(max_h, draw_stat_card("CPU", (std::to_string((int)metrics.cpu_percent) + "%").c_str(), cpu_pct, cpu_color, card_w));
+        const std::string cpu_value = metrics.cpu_valid
+            ? std::to_string(static_cast<int>(metrics.cpu_percent)) + "%"
+            : "Unavailable";
+        max_h = std::max(max_h, draw_stat_card(
+            "CPU", cpu_value.c_str(), metrics.cpu_valid ? cpu_pct : -1.0f,
+            metrics.cpu_valid ? cpu_color : k.muted, card_w));
         ImGui::SameLine(0, ui_px(12.0f));
 
         float ram_pct = metrics.ram_percent / 100.0f;
         ImVec4 ram_color = ram_pct > 0.9f ? k.red : ram_pct > 0.7f ? k.orange : k.blue;
-        max_h = std::max(max_h, draw_stat_card("RAM", (std::to_string(metrics.ram_mb) + " MB").c_str(), ram_pct, ram_color, card_w));
+        const std::string ram_value = metrics.ram_valid
+            ? format_server_ram_mb(metrics.ram_mb) : "Unavailable";
+        max_h = std::max(max_h, draw_stat_card(
+            "RAM", ram_value.c_str(), metrics.ram_valid ? ram_pct : -1.0f,
+            metrics.ram_valid ? ram_color : k.muted, card_w));
         ImGui::SameLine(0, ui_px(12.0f));
 
         ImVec4 tps_col = metrics.tps >= 19.0f ? k.green : metrics.tps >= 15.0f ? k.yellow : k.red;
         float tps_pct = metrics.tps / 20.0f;
         char tps_value[32]{};
-        std::snprintf(tps_value, sizeof(tps_value), "%.1f", metrics.tps);
-        max_h = std::max(max_h, draw_stat_card("TPS", tps_value, tps_pct, tps_col, card_w));
+        if (metrics.tps_valid)
+            std::snprintf(tps_value, sizeof(tps_value), "%.1f", metrics.tps);
+        else
+            std::snprintf(tps_value, sizeof(tps_value), "Unavailable");
+        // TPS is a health metric, not capacity: 19.8/20 is explicitly green.
+        // Its semantic status color also drives the bar so the card cannot
+        // contradict its own healthy reading through generic high-is-danger
+        // capacity thresholds.
+        max_h = std::max(max_h, draw_stat_card(
+            "TPS", tps_value, metrics.tps_valid ? tps_pct : -1.0f,
+            metrics.tps_valid ? tps_col : k.muted, card_w,
+            ui_model::StatCardProgressPolarity::HigherIsBetter, &tps_col));
         ImGui::SameLine(0, ui_px(12.0f));
 
         float pl_pct = (float)metrics.players_online / (float)std::max(1, sv.max_players);
-        max_h = std::max(max_h, draw_stat_card("Players", (std::to_string(metrics.players_online) + " / " + std::to_string(sv.max_players)).c_str(), pl_pct, k.brand, card_w));
+        const std::string players_value = metrics.players_valid
+            ? std::to_string(metrics.players_online) + " / " + std::to_string(sv.max_players)
+            : "Unavailable";
+        max_h = std::max(max_h, draw_stat_card(
+            "Players", players_value.c_str(), metrics.players_valid ? pl_pct : -1.0f,
+            metrics.players_valid ? k.brand : k.muted, card_w));
         }
 
         card_end();
@@ -1916,11 +3757,38 @@ static void draw_server_overview_tab(ServerUIState& s, server::ServerConfig& sv,
 // Server detail – plugins tab
 // ---------------------------------------------------------------------------
 
-static void draw_server_plugins_tab(ServerUIState&, const server::ServerConfig& sv) {
+static void draw_server_plugins_tab(ServerUIState&, const server::ServerConfig& sv, UiState& st) {
     ImGui::PushFont(f_h2);
     ImGui::TextColored(k.text, "Plugins & Mods");
     ImGui::PopFont();
     ImGui::Spacing();
+
+    // Directory enumeration is intentionally replaced with a static fixture
+    // list so a screenshot cannot disclose local jar names or paths.
+    if (st.fixture_mode) {
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: representative local mod inventory; file actions are disabled.");
+        ImGui::Spacing();
+        ImGui::PushFont(f_h2);
+        ImGui::TextColored(k.text, "Mods");
+        ImGui::PopFont();
+        ImGui::Spacing();
+        const char* mods[] = {"Fabric API 0.92.2", "Lithium 0.12.7", "Sodium 0.5.11"};
+        card_begin("##fixture_mods_list", ImVec2(-1, 0));
+        for (size_t i = 0; i < sizeof(mods) / sizeof(mods[0]); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            draw_icon(IconId::Cube, ImGui::GetCursorScreenPos() +
+                      ImVec2(ui_px(8.0f), ui_px(8.0f)), ui_px(6.0f), c32(k.brand));
+            ImGui::Dummy(ImVec2(ui_px(16.0f), ui_px(16.0f)));
+            ImGui::SameLine(0, ui_px(4.0f));
+            ImGui::TextColored(k.text, "%s", mods[i]);
+            ImGui::PopID();
+        }
+        card_end();
+        ImGui::TextColored(k.muted, "%d mods in this representative server",
+                           (int)(sizeof(mods) / sizeof(mods[0])));
+        return;
+    }
 
     namespace fs = std::filesystem;
     bool has_plugins = false;
@@ -2028,11 +3896,35 @@ static void draw_server_plugins_tab(ServerUIState&, const server::ServerConfig& 
 // Server detail – properties tab (embedded)
 // ---------------------------------------------------------------------------
 
-static void draw_server_properties_tab(ServerUIState& s, const server::ServerConfig& sv) {
+static void draw_server_properties_tab(ServerUIState& s, const server::ServerConfig& sv, UiState& st) {
     ImGui::PushFont(f_h2);
     ImGui::TextColored(k.text, "server.properties");
     ImGui::PopFont();
     ImGui::Spacing();
+
+    // Render an explicit static sample before any local server file is read.
+    if (st.fixture_mode) {
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture: representative settings; editing and disk access are disabled.");
+        ImGui::Spacing();
+        struct FixtureProperty { const char* key; const char* value; };
+        const FixtureProperty properties[] = {
+            {"motd", "Forsaken World SMP"},
+            {"gamemode", "survival"},
+            {"difficulty", "normal"},
+            {"max-players", "12"},
+            {"online-mode", "true"},
+            {"pvp", "true"},
+        };
+        card_begin("##fixture_server_properties", ImVec2(-1, 0));
+        for (const auto& property : properties) {
+            ImGui::TextColored(k.brand, "%s", property.key);
+            ImGui::SameLine(ui_px(220.0f));
+            ImGui::TextColored(k.text, "%s", property.value);
+        }
+        card_end();
+        return;
+    }
 
     // Load properties if needed
     if (s.properties.empty() || s.properties_server_idx != s.detail_server_idx) {
@@ -2207,14 +4099,25 @@ static void draw_server_detail(UiState& st) {
 
     // Seed the console log from the UiState-level log so both the fixture and
     // any live console feed share one source of truth.
-    if (s.console_log.empty() && !st.server_console_log.empty()) {
+    if (st.fixture_mode) {
+        s.console_log = st.server_console_log;
+    } else if (s.console_log.empty() && !st.server_console_log.empty()) {
         s.console_log = st.server_console_log;
     }
 
-    // Breadcrumb
-    if (ghost_button("< Servers", ImVec2(ui_px(120.0f), ui_px(28.0f)))) {
+    // Breadcrumb. A seeded visual fixture is intentionally a static route:
+    // tab and back navigation would otherwise expose arbitrary operational
+    // detail views during a capture.
+    if (!st.fixture_mode &&
+        ghost_button("< Servers", ImVec2(ui_px(120.0f), ui_px(28.0f)))) {
         s.detail_server_idx = -1;
         return;
+    }
+    if (st.fixture_mode) {
+        ghost_button("< Servers", ImVec2(ui_px(120.0f), ui_px(28.0f)), true);
+        ImGui::SameLine(0, ui_px(8.0f));
+        ImGui::TextColored(k.brand_hov,
+                           "Visual fixture — navigation and server actions are disabled.");
     }
     ImGui::Spacing();
 
@@ -2253,17 +4156,20 @@ static void draw_server_detail(UiState& st) {
         if (active)
             dl->AddRect(tab_min, tab_min + tab_size, c32(k.brand), ui_px(8.0f),
                         0, ui_px(1.5f));
+        if (st.fixture_mode) ImGui::BeginDisabled();
         ImGui::InvisibleButton((std::string("##srv_tab_") + std::to_string(i)).c_str(),
                                tab_size);
+        if (st.fixture_mode) ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !active)
             dl->AddRect(tab_min, tab_min + tab_size, c32(k.border), ui_px(8.0f),
                         0, ui_px(1.0f));
-        if (ImGui::IsItemClicked()) s.detail_tab = i;
+        if (!st.fixture_mode && ImGui::IsItemClicked()) s.detail_tab = i;
         ImGui::PushFont(active ? f_bold : f_body);
         dl->AddText(tab_min + ImVec2(pad_x, (tab_h - ImGui::GetTextLineHeight()) * 0.5f),
                     c32(active ? k.text : k.muted), label);
         ImGui::PopFont();
-        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (!st.fixture_mode && ImGui::IsItemHovered())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     }
     ImGui::Spacing();
 
@@ -2271,10 +4177,10 @@ static void draw_server_detail(UiState& st) {
     switch (s.detail_tab) {
         case 0: draw_server_overview_tab(s, sv, st); break;
         case 1: draw_server_detail_console(s, sv, st); break;
-        case 2: draw_server_files_tab(s, sv); break;
+        case 2: draw_server_files_tab(s, sv, st); break;
         case 3: draw_server_players_tab(s, sv, st); break;
-        case 4: draw_server_plugins_tab(s, sv); break;
-        case 5: draw_server_properties_tab(s, sv); break;
+        case 4: draw_server_plugins_tab(s, sv, st); break;
+        case 5: draw_server_properties_tab(s, sv, st); break;
         case 6: draw_server_world_tab(s, sv, st); break;
     }
 }
@@ -2283,28 +4189,46 @@ static void draw_server_detail(UiState& st) {
 // Create dialog
 // ---------------------------------------------------------------------------
 
+// The versions the selected software actually publishes, plus why they are
+// missing when a provider cannot be reached. The bundled catalogue is the
+// first paint so the dialog is never empty, and it is labelled as such.
+static std::vector<std::string> create_versions(ServerUIState& s, bool* live,
+                                                std::string* error) {
+    std::lock_guard<std::mutex> lock(s.version_mu);
+    *live = s.version_live;
+    *error = s.version_error;
+    if (s.version_live && !s.version_list.empty()) return s.version_list;
+    return version_catalog::server_versions();
+}
+
 static void draw_create_dialog(UiState& st) {
     auto& s = state();
     if (!s.create_open) return;
 
-    std::vector<std::string> supported_versions = version_catalog::server_versions();
-    // The static list gives the dialog a useful first paint. Once the Mojang
-    // manifest is available, merge every released version into the same
-    // selector so a newly published vanilla server does not wait for a
-    // launcher update.
+    // A visual fixture must never make the dialog's eager provider request.
+    // The bundled catalog is intentionally sufficient to render the complete
+    // selector and is identified as such below.
+    if (st.fixture_mode) {
+        std::lock_guard<std::mutex> lock(s.version_mu);
+        s.version_software = s.create_software_idx;
+        s.version_list.clear();
+        s.version_live = false;
+        s.version_loading = false;
+        s.version_error.clear();
+    } else {
+        request_software_versions(st, s.create_software_idx);
+    }
+    bool versions_live = false;
+    std::string versions_error;
+    const std::vector<std::string> supported_versions =
+        create_versions(s, &versions_live, &versions_error);
+    bool versions_loading = false;
     {
-        std::lock_guard<std::mutex> lock(st.version_mu);
-        for (const auto& manifest_entry : st.versions) {
-            if (manifest_entry.type != "release" ||
-                !version_catalog::supports_server(manifest_entry.id)) continue;
-            if (std::find(supported_versions.begin(), supported_versions.end(), manifest_entry.id) ==
-                supported_versions.end())
-                supported_versions.push_back(manifest_entry.id);
-        }
+        std::lock_guard<std::mutex> lock(s.version_mu);
+        versions_loading = s.version_loading;
     }
-    if (!version_catalog::supports_server(s.create_version)) {
-        s.create_version = version_catalog::default_server_version();
-    }
+    if (s.create_version.empty() && !supported_versions.empty())
+        s.create_version = supported_versions.front();
 
     ImGui::OpenPopup("Create Server");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
@@ -2317,6 +4241,20 @@ static void draw_create_dialog(UiState& st) {
     if (ImGui::BeginPopupModal("Create Server", &s.create_open,
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
 
+        // Keep the decision and recovery copy reachable at compact heights.
+        // The body owns its own scroll range while this footer never moves
+        // below the viewport, so Create/Cancel remain usable after the
+        // validation text grows or the desktop window is short. A file-write
+        // failure also reserves room for its exact recovery detail here, so a
+        // compact viewport never makes the user rely on scroll position.
+        const float create_footer_height = s.create_error.empty()
+            ? ui_px(78.0f) : ui_px(128.0f);
+        bool valid = false;
+        std::string footer_status;
+        ImVec4 footer_status_color = k.muted;
+        if (ImGui::BeginChild("##create_server_body",
+                              ImVec2(0.0f, -create_footer_height),
+                              ImGuiChildFlags_None)) {
         card_begin("##create_server_hero", ImVec2(-1, ui_px(88.0f)));
         const ImVec2 hero_origin = ImGui::GetCursorScreenPos();
         ImDrawList* hero_draw = ImGui::GetWindowDrawList();
@@ -2332,30 +4270,18 @@ static void draw_create_dialog(UiState& st) {
         card_end();
         ImGui::Spacing();
 
+        // Fixture state is a staged visual sample, not an editable draft.
+        // Disable the operational fields as well as the Create footer so no
+        // review interaction can alter even transient creation choices.
+        if (st.fixture_mode) ImGui::BeginDisabled();
         card_begin("##create_server_settings", ImVec2(-1, 0));
         ImGui::TextColored(k.muted, "SERVER BASICS");
         ImGui::PushFont(f_bold);
         ImGui::TextUnformatted("Server name");
         ImGui::PopFont();
         ImGui::SetNextItemWidth(-1);
-        input_text_hint("##cs_name", "For example: Survival Realm", &s.create_name);
-
-        ImGui::Spacing();
-        ImGui::PushFont(f_bold);
-        ImGui::TextUnformatted("Minecraft version");
-        ImGui::PopFont();
-        ImGui::TextColored(k.muted,
-                           "Choose a tested server target. Amalgam verifies the provider build before downloading.");
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##cs_ver", s.create_version.c_str())) {
-            for (const std::string& version : supported_versions) {
-                const bool selected = s.create_version == version;
-                if (ImGui::Selectable(version.c_str(), selected)) {
-                    s.create_version = version;
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        if (input_text_hint("##cs_name", "For example: Survival Realm", &s.create_name)) {
+            s.create_error.clear();
         }
 
         ImGui::Spacing();
@@ -2363,10 +4289,54 @@ static void draw_create_dialog(UiState& st) {
         ImGui::TextUnformatted("Server software");
         ImGui::PopFont();
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##cs_sw", kSoftwareNames[s.create_software_idx])) {
-            for (int i = 0; i < kSoftwareCount; ++i) {
-                if (ImGui::Selectable(kSoftwareNames[i], s.create_software_idx == i))
-                    s.create_software_idx = i;
+        const auto& catalog = server::software_catalog();
+        if (ImGui::BeginCombo("##cs_sw", catalog[s.create_software_idx].label)) {
+            for (size_t i = 0; i < catalog.size(); ++i) {
+                const bool selected = s.create_software_idx == static_cast<int>(i);
+                if (ImGui::Selectable(catalog[i].label, selected) && !selected) {
+                    s.create_software_idx = static_cast<int>(i);
+                    // A version from the previous software means nothing to
+                    // this one, so the selector waits for the new list.
+                    s.create_version.clear();
+                    if (server::is_native_software(catalog[i].software)) s.create_port = 19132;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextColored(k.muted, "%s", catalog[s.create_software_idx].note);
+
+        ImGui::Spacing();
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted("Minecraft version");
+        ImGui::PopFont();
+        if (server::is_native_software(software_at(s.create_software_idx)))
+            ImGui::TextColored(k.muted,
+                               "Bedrock publishes one current build; the launcher installs that one.");
+        else if (versions_loading)
+            ImGui::TextColored(k.muted, "Loading versions from the provider…");
+        else if (!versions_error.empty())
+            ImGui::TextColored(k.yellow,
+                               "Provider version list unavailable (%s). Showing bundled targets.",
+                               versions_error.c_str());
+        else
+            ImGui::TextColored(k.muted, "Every version this software publishes; %s.",
+                                versions_live ? "fetched from the provider just now"
+                                              : "bundled with this launcher");
+        if (st.fixture_mode)
+            ImGui::TextColored(k.brand_hov,
+                                "Visual fixture: bundled targets only; no provider was contacted.");
+        ImGui::SetNextItemWidth(-1);
+        const char* version_label = s.create_version.empty()
+            ? (versions_loading ? "Loading versions…" : "No versions available")
+            : s.create_version.c_str();
+        if (ImGui::BeginCombo("##cs_ver", version_label)) {
+            for (const std::string& version : supported_versions) {
+                const bool selected = s.create_version == version;
+                if (ImGui::Selectable(version.c_str(), selected)) {
+                    s.create_version = version;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
         }
@@ -2395,17 +4365,22 @@ static void draw_create_dialog(UiState& st) {
         s.create_port = std::clamp(s.create_port, 1, 65535);
         ImGui::Columns(1);
         card_end();
+        if (st.fixture_mode) ImGui::EndDisabled();
 
         ImGui::Spacing();
         card_begin("##create_server_eula", ImVec2(-1, 0));
         ImGui::TextColored(k.muted, "MINECRAFT EULA");
+        if (st.fixture_mode) ImGui::BeginDisabled();
         ImGui::Checkbox("I have read and agree to the Minecraft EULA",
                         &s.create_eula_accepted);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Read EULA")) {
+        if (st.fixture_mode) {
+            ImGui::SmallButton("Read EULA");
+        } else if (ImGui::SmallButton("Read EULA")) {
             ShellExecuteW(nullptr, L"open", L"https://aka.ms/MinecraftEULA",
                           nullptr, nullptr, SW_SHOWNORMAL);
         }
+        if (st.fixture_mode) ImGui::EndDisabled();
         ImGui::TextColored(k.muted,
             "Amalgam writes eula=true only after this explicit confirmation.");
         card_end();
@@ -2413,9 +4388,8 @@ static void draw_create_dialog(UiState& st) {
         ImGui::Separator();
         ImGui::Spacing();
 
-        const bool safe_name = !s.create_name.empty() && s.create_name != "." &&
-            s.create_name != ".." &&
-            s.create_name.find_first_of("\\/:*?\"<>|") == std::string::npos;
+        std::string name_error;
+        const bool safe_name = server::validate_server_name(s.create_name, &name_error);
         bool duplicate_name = false;
         for (const auto& existing : st.servers) {
             std::string left = existing.name;
@@ -2427,75 +4401,114 @@ static void draw_create_dialog(UiState& st) {
             if (!right.empty() && left == right) { duplicate_name = true; break; }
         }
         if (!safe_name)
-            ImGui::TextColored(k.red, "Use a simple server name without path characters.");
+            ImGui::TextColored(k.red, "%s", name_error.c_str());
         else if (duplicate_name)
             ImGui::TextColored(k.red, "A server with this name already exists.");
         else if (!s.create_eula_accepted)
             ImGui::TextColored(k.yellow, "EULA acceptance is required before creation.");
-        const bool valid = safe_name && !duplicate_name && s.create_eula_accepted &&
-            version_catalog::supports_server(s.create_version);
+        else if (s.create_version.empty() && !versions_loading)
+            ImGui::TextColored(k.red,
+                               "No version is available for this software right now. Pick another "
+                               "software, or try again when the provider responds.");
+        if (!s.create_error.empty()) {
+            ImGui::TextColored(k.red, "SERVER FILES WERE NOT SAVED");
+            ImGui::TextWrapped("%s", s.create_error.c_str());
+        }
+        if (st.fixture_mode)
+            ImGui::TextColored(k.muted,
+                                "Visual fixture: server creation is disabled for this capture.");
+        valid = !st.fixture_mode && safe_name && !duplicate_name && s.create_eula_accepted &&
+            !s.create_version.empty();
+        if (!s.create_error.empty()) {
+            footer_status = "Server files were not saved. Review the detail below, then retry.";
+            footer_status_color = k.red;
+        } else if (!safe_name) {
+            footer_status = name_error;
+            footer_status_color = k.red;
+        } else if (duplicate_name) {
+            footer_status = "Choose a different server name.";
+            footer_status_color = k.red;
+        } else if (!s.create_eula_accepted) {
+            footer_status = "Accept the Minecraft EULA to enable creation.";
+            footer_status_color = k.yellow;
+        } else if (s.create_version.empty() && !versions_loading) {
+            footer_status = "Choose a compatible Minecraft version.";
+            footer_status_color = k.red;
+        } else if (st.fixture_mode) {
+            footer_status = "Visual fixture: creation is disabled.";
+            footer_status_color = k.brand_hov;
+        }
+        // The fixture harness scrolls page-level hosts by default. This modal
+        // body owns a separate range, so apply its requested @middle/@bottom
+        // position after layout without changing normal player interaction.
+        if (st.fixture_mode && st.fixture_scroll_position > 0) {
+            const float max_scroll = ImGui::GetScrollMaxY();
+            if (max_scroll > 0.0f) {
+                const float requested_scroll = st.fixture_scroll_position == 1
+                    ? max_scroll * 0.5f : max_scroll;
+                ImGui::SetScrollY(requested_scroll);
+            }
+        }
+        }
+        ImGui::EndChild();
+
+        if (!footer_status.empty()) {
+            ImGui::TextColored(footer_status_color, "%s", footer_status.c_str());
+            if (!s.create_error.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, footer_status_color);
+                ImGui::TextWrapped("%s", s.create_error.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::Separator();
+        ImGui::Spacing();
         if (!valid) ImGui::BeginDisabled();
         if (primary_button("Create", ImVec2(ui_px(100.0f), ui_px(32.0f)))) {
             server::ServerConfig cfg;
             cfg.name = s.create_name;
-            cfg.software = kSoftwareValues[s.create_software_idx];
+            cfg.software = software_at(s.create_software_idx);
             cfg.minecraft_version = s.create_version;
             cfg.allocated_ram_mb = s.create_ram;
             cfg.max_players = s.create_max_players;
             cfg.port = s.create_port;
-            cfg.stage = server::ServerStage::Installing;
 
-            std::wstring data = aml::net::get_local_app_data_path() + L"\\amalgam\\servers\\";
-            std::wstring dir = data + aml::net::to_wide(s.create_name);
-            std::filesystem::create_directories(dir);
-            cfg.server_directory = aml::net::to_utf8(dir);
+            const std::filesystem::path dir =
+                std::filesystem::path(aml::net::get_local_app_data_path()) / L"amalgam" /
+                L"servers" / aml::net::to_wide(s.create_name);
+            cfg.server_directory = aml::net::to_utf8(dir.wstring());
 
-            bool config_written = true;
-            {
-                std::ofstream eula(std::filesystem::path(dir) / "eula.txt",
-                                   std::ios::trunc);
-                eula << "eula=true\n";
-                config_written = static_cast<bool>(eula);
-            }
-            {
-                std::ofstream properties(std::filesystem::path(dir) / "server.properties",
-                                         std::ios::trunc);
-                properties << "server-name=" << cfg.name << "\n"
-                           << "motd=" << cfg.name << " - managed by Amalgam\n"
-                           << "server-port=" << cfg.port << "\n"
-                           << "max-players=" << cfg.max_players << "\n"
-                           << "online-mode=true\n"
-                           << "view-distance=10\n"
-                           << "simulation-distance=10\n";
-                config_written = config_written && static_cast<bool>(properties);
-            }
-
+            std::string config_error;
+            const bool config_written = aml::server_provision::write_server_config_files(
+                cfg, s.create_eula_accepted, &config_error);
             if (!config_written) {
-                cfg.stage = server::ServerStage::Error;
-                cfg.status_message = "Failed to write EULA or server.properties";
-            } else if (is_auto_provisioned(cfg.software)) {
-                std::string prov_err;
-                if (provision_server_runtime(cfg, &prov_err)) {
-                    cfg.stage = server::ServerStage::Ready;
-                } else {
-                    cfg.stage = server::ServerStage::Error;
-                    cfg.status_message = prov_err.empty() ? "Failed to install runtime" : prov_err;
-                }
+                s.create_error = config_error.empty()
+                    ? "Amalgam could not create this server's files."
+                    : config_error;
+                report_server_failure(s, st, "Create server", cfg.name, s.create_error);
             } else {
-                cfg.stage = server::ServerStage::Ready;
-                cfg.status_message = "Runtime must be installed manually";
+                cfg.stage = server::ServerStage::NotInstalled;
+                st.servers.push_back(cfg);
+                save_local_servers(st.servers);
+                clear_server_failure(s);
+
+                s.create_open = false;
+                s.create_name.clear();
+                s.create_ram = 4096;
+                s.create_max_players = 20;
+                s.create_port = 25565;
+                s.create_eula_accepted = false;
+                s.create_error.clear();
+                ImGui::CloseCurrentPopup();
+
+                // The download starts on a worker and the new server opens on its
+                // own page, so the user watches the files arrive instead of a
+                // frozen dialog. A manual runtime has nothing to fetch.
+                const int index = static_cast<int>(st.servers.size()) - 1;
+                s.detail_server_idx = index;
+                s.detail_connect_idx = -1;
+                s.detail_tab = 0;
+                start_provision(st, index);
             }
-
-            st.servers.push_back(cfg);
-            save_local_servers(st.servers);
-
-            s.create_open = false;
-            s.create_name.clear();
-            s.create_ram = 4096;
-            s.create_max_players = 20;
-            s.create_port = 25565;
-            s.create_eula_accepted = false;
-            ImGui::CloseCurrentPopup();
         }
         if (!valid) ImGui::EndDisabled();
 
@@ -2504,6 +4517,7 @@ static void draw_create_dialog(UiState& st) {
             s.create_open = false;
             s.create_name.clear();
             s.create_eula_accepted = false;
+            s.create_error.clear();
             ImGui::CloseCurrentPopup();
         }
 
@@ -2513,12 +4527,88 @@ static void draw_create_dialog(UiState& st) {
     if (!s.create_open) {
         s.create_name.clear();
         s.create_eula_accepted = false;
+        s.create_error.clear();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Fixture helper: lets the snapshot runner open the cloud tab directly.
 // ---------------------------------------------------------------------------
+
+void reset_fixture_server_state() {
+    auto& s = state();
+    // In an in-process review run, do not carry a prior live server page's
+    // state, console, property edit, form value, or action failure forward
+    // into a named deterministic fixture.
+    s.loaded = true;
+    s.create_open = false;
+    s.selected = -1;
+    s.action_pending = -1;
+    s.mode = 0;
+    s.create_name.clear();
+    s.create_version.clear();
+    s.create_software_idx = 0;
+    s.create_ram = 4096;
+    s.create_max_players = 20;
+    s.create_port = 25565;
+    s.create_eula_accepted = false;
+    s.create_error.clear();
+    {
+        std::lock_guard<std::mutex> lock(s.version_mu);
+        s.version_software = -1;
+        s.version_list.clear();
+        s.version_loading = false;
+        s.version_live = false;
+        s.version_error.clear();
+    }
+    s.filter_status = 0;
+    s.filter_software = 0;
+    s.sort_mode = 0;
+    s.console_open = false;
+    s.console_server_idx = -1;
+    s.console_filter.clear();
+    s.console_log.clear();
+    s.console_input.clear();
+    s.console_auto_scroll = true;
+    s.properties_open = false;
+    s.properties_server_idx = -1;
+    s.properties.clear();
+    s.properties_dirty = false;
+    s.detail_server_idx = -1;
+    s.detail_connect_idx = -1;
+    s.detail_tab = 0;
+    s.file_browse_path.clear();
+    s.file_entries.clear();
+    s.file_is_dir.clear();
+    s.file_list_dirty = true;
+    s.file_preview_name.clear();
+    s.file_preview_content.clear();
+    s.file_preview_open = false;
+    s.fixture_file_context_menu_open = false;
+    s.fixture_file_context_menu_name.clear();
+    s.file_delete_confirm = false;
+    s.file_delete_target.clear();
+    s.file_delete_error.clear();
+    s.detail_players.clear();
+    s.whitelist_entries.clear();
+    s.ops_entries.clear();
+    s.players_dirty = true;
+    s.player_op_input.clear();
+    s.player_whitelist_input.clear();
+    s.world_size_bytes = 0;
+    s.world_name.clear();
+    s.world_dirty = true;
+    s.restore_backup_confirm = false;
+    s.restore_backup_id.clear();
+    s.restore_backup_name.clear();
+    s.restore_backup_error.clear();
+    s.detail_console_filter.clear();
+    s.detail_console_input.clear();
+    s.detail_console_auto_scroll = true;
+    s.detail_console_last_refresh = 0.0;
+    s.remove_server_error.clear();
+    clear_server_failure(s);
+}
 
 void set_fixture_server_mode(int mode) {
     state().mode = mode;
@@ -2535,43 +4625,191 @@ void set_fixture_server_detail(int server_index, int tab) {
     s.world_dirty = true;
 }
 
+// Deliberately open production confirmations with synthetic, non-actionable
+// data.  The snapshot harness disables the underlying launcher actions, but
+// these states still exercise the real modal composition and destructive-copy
+// clarity that a reviewer needs to inspect.
+void set_fixture_server_destructive_overlay(const std::string& fixture_case) {
+    auto& s = state();
+    if (fixture_case == "server-file-context-menu") {
+        set_fixture_server_detail(0, 2);
+        s.fixture_file_context_menu_name = "server.properties";
+        s.fixture_file_context_menu_open = true;
+    } else if (fixture_case == "server-create-validation" ||
+               fixture_case == "server-create-error") {
+        // Stage the same create dialog used in production, but never make its
+        // action valid in fixture mode.  The dialog's fixture branch uses the
+        // bundled catalog and prevents both provider requests and file writes.
+        set_fixture_server_create_open(true);
+        s.create_name = fixture_case == "server-create-validation"
+            ? "Survival/Realm" : "Survival Realm";
+        s.create_eula_accepted = true;
+        s.create_error = fixture_case == "server-create-error"
+            ? "Amalgam could not prepare the server files. The staged configuration was not saved; check the destination and retry."
+            : "";
+    } else if (fixture_case == "server-file-delete-confirm" ||
+        fixture_case == "server-file-delete-error") {
+        set_fixture_server_detail(0, 2);
+        s.file_delete_target = "server.properties";
+        s.file_delete_error = fixture_case == "server-file-delete-error"
+            ? "The file could not be deleted. Check that it is not in use, then try again."
+            : "";
+        s.file_delete_confirm = true;
+    } else if (fixture_case == "server-file-preview") {
+        set_fixture_server_detail(0, 2);
+        s.file_preview_name = "server.properties";
+        s.file_preview_content = fixture_server_properties_preview_text();
+        s.file_preview_open = true;
+    } else if (fixture_case == "server-backup-restore-confirm" ||
+               fixture_case == "server-backup-restore-error") {
+        set_fixture_server_detail(0, 6);
+        s.restore_backup_id = "fixture-pre-release";
+        s.restore_backup_name = "Forsaken World SMP - pre-release checkpoint";
+        s.restore_backup_error = fixture_case == "server-backup-restore-error"
+            ? "The backup could not be restored. Current server files were not changed. You can retry safely."
+            : "";
+        s.restore_backup_confirm = true;
+    } else if (fixture_case == "server-remove-confirm" ||
+               fixture_case == "server-remove-error") {
+        set_fixture_server_detail(0, 0);
+        s.action_pending = 0;
+        s.remove_server_error = fixture_case == "server-remove-error"
+            ? "The launcher could not save this change. The server remains in Amalgam. You can retry safely."
+            : "";
+    }
+}
+
+void set_fixture_server_create_open(bool open) {
+    auto& s = state();
+    s.mode = 0;
+    s.detail_server_idx = -1;
+    s.detail_connect_idx = -1;
+    s.create_open = open;
+}
+
+// The production overview combines server controls, import browsing, saved
+// address mutation, and launch hand-off in one page.  Keep fixture captures
+// on this separately-owned facade so no seeded route can accidentally invoke
+// a local manager, browse a folder, save configuration, or begin a launch.
+static void draw_fixture_server_overview(UiState& st) {
+    const server::ServerConfig* fixture_server =
+        st.servers.empty() ? nullptr : &st.servers.front();
+    const std::string name = fixture_server ? fixture_server->name : "Fixture server unavailable";
+    const server::ServerStage stage = fixture_server
+        ? fixture_server->stage : server::ServerStage::NotInstalled;
+    std::string metadata = "No representative server configuration is available.";
+    std::string activity = "No representative server activity is available.";
+    if (fixture_server) {
+        metadata = std::string(server::server_software_name(fixture_server->software)) +
+            "  •  Minecraft " + fixture_server->minecraft_version +
+            "  •  Port " + std::to_string(fixture_server->port);
+        if (st.server_metrics.valid) {
+            char tps_text[32]{};
+            std::snprintf(tps_text, sizeof(tps_text), "%.1f", st.server_metrics.tps);
+            activity = std::to_string(st.server_metrics.players_online) + " / " +
+                std::to_string(fixture_server->max_players) + " players  •  " +
+                format_server_ram_mb(st.server_metrics.ram_mb) + " / " +
+                format_server_ram_mb(fixture_server->allocated_ram_mb) + "  •  " +
+                std::string(tps_text) + " TPS";
+        } else {
+            activity = std::string("Capacity ") +
+                std::to_string(fixture_server->max_players) +
+                " players  •  Runtime metrics unavailable";
+        }
+    }
+
+    page_title("Servers", "Run local servers here — hosted servers are managed on the website.");
+    draw_breadcrumbs({"Home", "Servers"});
+    ImGui::PushStyleColor(ImGuiCol_Text, k.brand_hov);
+    ImGui::TextWrapped(
+        "Visual fixture — static representative server inventory. No local service, folder, saved address, launch, or configuration is accessed.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    ImGui::PushFont(f_h2);
+    ImGui::TextColored(k.text, "LOCAL SERVERS");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "The controls below are intentionally inactive for this review capture.");
+    ImGui::Spacing();
+
+    ImGui::BeginDisabled();
+    primary_button("+ Create Local Server", ImVec2(ui_px(170.0f), ui_px(32.0f)));
+    ImGui::SameLine(0, ui_px(8.0f));
+    ghost_button("Import Server", ImVec2(ui_px(120.0f), ui_px(32.0f)));
+    ImGui::SameLine(0, ui_px(12.0f));
+    ghost_button("All statuses", ImVec2(ui_px(112.0f), ui_px(32.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("All software", ImVec2(ui_px(122.0f), ui_px(32.0f)));
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    card_begin("##fixture_server_overview_card", ImVec2(-1, 0));
+    const ImVec2 card_origin = ImGui::GetCursorScreenPos();
+    ImDrawList* card_draw = ImGui::GetWindowDrawList();
+    card_draw->AddRectFilled(card_origin,
+                             card_origin + ImVec2(ui_px(5.0f), ui_px(100.0f)),
+                             c32(stage_color(stage)), ui_px(2.0f));
+    card_draw->AddCircleFilled(card_origin + ImVec2(ui_px(34.0f), ui_px(35.0f)),
+                               ui_px(22.0f), c32(k.brand_dk));
+    draw_icon(IconId::Server, card_origin + ImVec2(ui_px(34.0f), ui_px(35.0f)),
+              ui_px(12.0f), c32(k.brand_hov));
+    ImGui::SetCursorScreenPos(card_origin + ImVec2(ui_px(70.0f), ui_px(12.0f)));
+    ImGui::PushFont(f_bold);
+    ImGui::TextUnformatted(name.c_str());
+    ImGui::PopFont();
+    ImGui::SameLine(0, ui_px(8.0f));
+    draw_status_badge(stage);
+    ImGui::TextColored(k.muted, "%s", metadata.c_str());
+    ImGui::TextColored(k.muted, "%s", activity.c_str());
+    ImGui::Spacing();
+    ImGui::BeginDisabled();
+    ghost_button("Stop", ImVec2(ui_px(80.0f), ui_px(28.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Restart", ImVec2(ui_px(92.0f), ui_px(28.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Manage", ImVec2(ui_px(92.0f), ui_px(28.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Folder", ImVec2(ui_px(80.0f), ui_px(28.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    danger_button("Remove", ImVec2(ui_px(84.0f), ui_px(28.0f)));
+    ImGui::EndDisabled();
+    card_end();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PushFont(f_h2);
+    ImGui::TextColored(k.text, "SAVED SERVERS");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "Representative quick-connect entry; it is neither read from nor written to your launcher settings.");
+    ImGui::Spacing();
+    card_begin("##fixture_saved_server", ImVec2(-1, 0));
+    ImGui::PushFont(f_bold);
+    ImGui::TextColored(k.text, "Amalgam Network");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "play.amalgam-network.com  •  Java");
+    ImGui::SameLine(0, ui_px(18.0f));
+    ImGui::BeginDisabled();
+    ghost_button("Connect", ImVec2(ui_px(76.0f), ui_px(26.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Copy", ImVec2(ui_px(60.0f), ui_px(26.0f)));
+    ImGui::SameLine(0, ui_px(4.0f));
+    ghost_button("Remove", ImVec2(ui_px(70.0f), ui_px(26.0f)));
+    ImGui::EndDisabled();
+    card_end();
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-void draw_server_manager(UiState& st) {
-    auto& s = state();
-    // This page is the only consumer of the server service layer. Keep the
-    // supervisor pointed at the Java directory the rest of the launcher uses —
-    // the settings page can change it while the launcher runs.
-    aml::services::local_server_manager()->set_local_java_root(
-        st.cfg ? st.cfg->java_cache_dir : std::wstring());
-    if (!s.loaded) {
-        // In fixture mode the visual seed already populated st.servers.
-        if (!st.fixture_mode || st.servers.empty()) {
-            load_local_servers(st.servers);
-            reconcile_local_server_stages(st.servers);
-        }
-        s.loaded = true;
-    }
-
-    // ── Detail view (local server) ──────────────────────────────────
-    if (s.detail_server_idx >= 0) {
-        page_title("Servers", nullptr);
-        draw_breadcrumbs({"Home", "Servers", "Local"});
-        draw_server_action_failure(st);
-        draw_server_detail(st);
-        // Overlays
-        draw_create_dialog(st);
-        draw_console_panel(st);
-        draw_properties_panel(st);
-        return;
-    }
-
+// Render the shared overview shell before touching any local-server state. In
+// particular, this lets the Cloud handoff route return before a local server
+// download, reconcile, or persistence check is even considered.
+static bool draw_server_overview_shell(UiState& st, ServerUIState& s) {
     draw_page_emblem(st, "server-emblem-ai.png");
     page_title("Servers", "Run local servers here — hosted servers are managed on the website.");
     draw_breadcrumbs({"Home", "Servers"});
-    draw_server_action_failure(st);
 
     // Branded scene keeps this operational page visually connected to the
     // launcher while the controls remain real and readable on top.
@@ -2597,45 +4835,116 @@ void draw_server_manager(UiState& st) {
 
     // ── Mode switch: LOCAL / AMALGAM CLOUD (premium pill tabs) ────
     const char* modes[] = {"LOCAL", "AMALGAM CLOUD"};
-    {
-        const float tab_gap = ui_px(6.0f);
-        const float tab_h = ui_px(34.0f);
-        for (int i = 0; i < 2; ++i) {
-            if (i) ImGui::SameLine(0, tab_gap);
-            const bool active = s.mode == i;
-            const char* label = modes[i];
-            const ImVec2 label_sz = ImGui::CalcTextSize(label);
-            const float pad_x = ui_px(16.0f);
-            const ImVec2 tab_size(label_sz.x + pad_x * 2.0f, tab_h);
-            const ImVec2 tab_min = ImGui::GetCursorScreenPos();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(tab_min, tab_min + tab_size,
-                              c32(active ? k.surface2 : ImVec4(0, 0, 0, 0)),
-                              ui_px(8.0f));
-            if (active)
-                dl->AddRect(tab_min, tab_min + tab_size, c32(k.brand), ui_px(8.0f),
-                            0, ui_px(1.5f));
-            ImGui::InvisibleButton((std::string("##mode_") + std::to_string(i)).c_str(),
-                                   tab_size);
-            if (ImGui::IsItemHovered() && !active)
-                dl->AddRect(tab_min, tab_min + tab_size, c32(k.border), ui_px(8.0f),
-                            0, ui_px(1.0f));
-            if (ImGui::IsItemClicked()) s.mode = i;
-            ImGui::PushFont(active ? f_bold : f_body);
-            dl->AddText(tab_min + ImVec2(pad_x, (tab_h - ImGui::GetTextLineHeight()) * 0.5f),
-                        c32(active ? k.text : k.muted), label);
-            ImGui::PopFont();
-            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        }
-        ImGui::Separator();
-        ImGui::Spacing();
+    const float tab_gap = ui_px(6.0f);
+    const float tab_h = ui_px(34.0f);
+    for (int i = 0; i < 2; ++i) {
+        if (i) ImGui::SameLine(0, tab_gap);
+        const bool active = s.mode == i;
+        const char* label = modes[i];
+        const ImVec2 label_sz = ImGui::CalcTextSize(label);
+        const float pad_x = ui_px(16.0f);
+        const ImVec2 tab_size(label_sz.x + pad_x * 2.0f, tab_h);
+        const ImVec2 tab_min = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(tab_min, tab_min + tab_size,
+                          c32(active ? k.surface2 : ImVec4(0, 0, 0, 0)),
+                          ui_px(8.0f));
+        if (active)
+            dl->AddRect(tab_min, tab_min + tab_size, c32(k.brand), ui_px(8.0f),
+                        0, ui_px(1.5f));
+        ImGui::InvisibleButton((std::string("##mode_") + std::to_string(i)).c_str(),
+                               tab_size);
+        if (ImGui::IsItemHovered() && !active)
+            dl->AddRect(tab_min, tab_min + tab_size, c32(k.border), ui_px(8.0f),
+                        0, ui_px(1.0f));
+        if (ImGui::IsItemClicked()) s.mode = i;
+        ImGui::PushFont(active ? f_bold : f_body);
+        dl->AddText(tab_min + ImVec2(pad_x, (tab_h - ImGui::GetTextLineHeight()) * 0.5f),
+                    c32(active ? k.text : k.muted), label);
+        ImGui::PopFont();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+    ImGui::Separator();
+    ImGui::Spacing();
+    return s.mode == 1;
+}
+
+void draw_server_manager(UiState& st) {
+    auto& s = state();
+
+    // Consume completed process-control work before route selection. A user
+    // can switch to the Cloud handoff or a detail view while a local command
+    // runs; its result still belongs to the launcher-owned local list and must
+    // not remain reserved until they navigate back.
+    if (!st.fixture_mode) {
+        consume_local_server_action_result(st);
+        consume_local_server_command_result(st);
     }
 
-    // ── Cloud tab → delegate to cloud_ui.cpp ──────────────────────
-    if (s.mode == 1) {
+    // A Cloud fixture has its own inert renderer. Route it before the local
+    // overview facade so the review captures the official-site handoff rather
+    // than a representative local-server inventory.
+    if (st.fixture_mode && s.detail_server_idx < 0 && s.mode == 1) {
         draw_cloud_page(st);
         return;
     }
+
+    // The non-detail local-server fixture needs its own renderer before any of
+    // the live overview's folder-picker, manager, persistence, or launch
+    // paths. Create-dialog fixtures still receive the genuine (but inert)
+    // modal overlay below, so their validation/recovery composition remains
+    // covered.
+    if (st.fixture_mode && s.detail_server_idx < 0) {
+        draw_fixture_server_overview(st);
+        draw_create_dialog(st);
+        return;
+    }
+
+    // The common shell contains the switcher required to return from Cloud to
+    // Local. When Cloud is selected it exits before local-server initialization
+    // or reconciliation, keeping the website handoff side-effect free.
+    if (s.detail_server_idx < 0 && draw_server_overview_shell(st, s)) {
+        draw_cloud_page(st);
+        return;
+    }
+
+    if (!st.fixture_mode) {
+        apply_finished_download(st);
+        // This page is the only consumer of the server service layer. Keep the
+        // supervisor pointed at the Java directory the rest of the launcher uses —
+        // the settings page can change it while the launcher runs.
+        aml::services::local_server_manager()->set_local_java_root(
+            st.cfg ? st.cfg->java_cache_dir : std::wstring());
+    }
+    if (!s.loaded) {
+        // Fixtures never fall back to the reviewer's saved server list.  A
+        // missing seed is rendered as the facade's representative empty data,
+        // rather than becoming permission to read local configuration.
+        if (!st.fixture_mode) {
+            load_local_servers(st.servers);
+            reconcile_local_server_stages(st.servers);
+        }
+        s.loaded = true;
+    }
+
+    // ── Detail view (local server) ──────────────────────────────────
+    if (s.detail_server_idx >= 0) {
+        page_title("Servers", nullptr);
+        draw_breadcrumbs({"Home", "Servers", "Local"});
+        draw_server_action_failure(st);
+        draw_server_detail(st);
+        draw_remove_server_dialog(st);
+        // Overlays
+        draw_create_dialog(st);
+        draw_console_panel(st);
+        draw_properties_panel(st);
+        return;
+    }
+
+    // The overview shell has already been rendered above. Local-only error
+    // feedback belongs below its switcher so a Cloud handoff never inherits a
+    // stale local-server operation message.
+    draw_server_action_failure(st);
 
     // ══════════════════════════════════════════════════════════════
     // LOCAL SERVERS
@@ -2763,7 +5072,7 @@ void draw_server_manager(UiState& st) {
         const char* sw_name = software_filter_name(s.filter_software);
         ImGui::SetNextItemWidth(ui_px(110.0f));
         if (ImGui::BeginCombo("##srv_sw_f", sw_name)) {
-            for (int i = 0; i <= kSoftwareCount; ++i) {
+            for (int i = 0; i <= static_cast<int>(server::software_catalog().size()); ++i) {
                 if (ImGui::Selectable(software_filter_name(i), s.filter_software == i))
                     s.filter_software = i;
             }
@@ -2843,31 +5152,7 @@ void draw_server_manager(UiState& st) {
         }
     }
 
-    // ── Delete confirmation ────────────────────────────────────────
-    if (s.action_pending >= 0 && s.action_pending < static_cast<int>(st.servers.size())) {
-        ImGui::OpenPopup("Confirm Delete");
-    }
-    if (ImGui::BeginPopupModal("Confirm Delete", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Delete server \"%s\"?",
-            s.action_pending >= 0 && s.action_pending < static_cast<int>(st.servers.size())
-                ? st.servers[s.action_pending].name.c_str() : "");
-        ImGui::TextColored(k.muted, "This cannot be undone.");
-        ImGui::Spacing();
-        if (primary_button("Delete", ImVec2(ui_px(90.0f), ui_px(32.0f))) &&
-            s.action_pending >= 0 && s.action_pending < static_cast<int>(st.servers.size())) {
-            st.servers.erase(st.servers.begin() + s.action_pending);
-            save_local_servers(st.servers);
-            s.action_pending = -1;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ghost_button("Cancel", ImVec2(ui_px(80.0f), ui_px(32.0f)))) {
-            s.action_pending = -1;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
+    draw_remove_server_dialog(st);
 
     // ── Saved external servers (moved from old Connect tab) ────────
     if (!st.cfg->servers.empty()) {

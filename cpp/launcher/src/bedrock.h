@@ -192,6 +192,11 @@ std::vector<BedrockDependencyInfo> resolve_dependencies(
 
 std::vector<BedrockWorldEntry> list_worlds(const BedrockProfile& profile,
                                            std::string* err = nullptr);
+// Removes exactly one validated world directory.  The implementation rejects
+// unsafe path components and re-checks the target immediately before deletion
+// so UI state that became stale cannot resolve outside the selected profile.
+bool delete_world(const BedrockProfile& profile, const std::string& world_folder,
+                  std::string* err = nullptr);
 bool backup_world(const BedrockProfile& profile, const std::string& world_folder,
                   std::wstring& out_path, std::string* err = nullptr);
 bool import_world_file(const std::wstring& source, const BedrockProfile& profile,

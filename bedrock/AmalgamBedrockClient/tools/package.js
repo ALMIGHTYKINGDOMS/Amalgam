@@ -11,22 +11,19 @@ const distRoot = path.join(root, "dist");
 const stagingRoot = path.join(buildRoot, "staging");
 const version = pkg.version;
 const archiveName = `AmalgamBedrockClient-${version}.mcaddon`;
-
-function tarPath(value) {
-  // Git for Windows' GNU tar treats a raw `C:\\...` archive path as a
-  // remote host specification. Normalize absolute Windows paths to the
-  // POSIX form understood by the same tar binary in every shell context.
-  if (typeof value !== "string") return value;
-  const match = value.match(/^([A-Za-z]):[\\/](.*)$/);
-  return match ? `/${match[1].toLowerCase()}/${match[2].replace(/[\\\\]+/g, "/")}` : value;
-}
+// Archive creation must be deterministic on Windows.  A Git/MSYS tar found
+// first on PATH rewrites C:\\ paths as remote-host syntax, which makes package
+// output depend on the shell that happened to invoke npm.  The launcher
+// release tooling already standardizes on the inbox Windows archive utility.
+const tarExecutable = process.platform === "win32"
+  ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe")
+  : "tar";
 
 function runTar(args, options = {}) {
-  const normalizedArgs = args.map(tarPath);
-  const result = spawnSync("tar.exe", normalizedArgs, { windowsHide: true, ...options });
+  const result = spawnSync(tarExecutable, args, { windowsHide: true, ...options });
   if (result.error || result.status !== 0) {
     const detail = result.stderr ? `: ${String(result.stderr).trim()}` : "";
-    throw result.error || new Error(`tar.exe exited with ${result.status}${detail}`);
+    throw result.error || new Error(`${tarExecutable} exited with ${result.status}${detail}`);
   }
   return result;
 }

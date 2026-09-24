@@ -1,88 +1,177 @@
 param(
-    [ValidateSet("all", "install", "uninstall-yes", "uninstall-no")]
-    [string]$Action = "all"
+    [ValidateSet("all", "install", "uninstall-yes", "uninstall-no", "audit")]
+    [string]$Action = "all",
+    [string]$SourceDir = (Join-Path $PSScriptRoot "..\dist\amalgam-1.0.0"),
+    [string]$QaRoot = (Join-Path ([IO.Path]::GetTempPath()) ("amalgam-uninstall-qa-" + [Guid]::NewGuid().ToString("N")))
 )
 
-# Destructive-uninstall integration test for the production Setup.exe.
+# Isolated destructive-uninstall integration test.
 #
-#   install       : seed disposable data, silent-install, verify files
-#   uninstall-yes : run the interactive uninstaller and answer YES to the
-#                   destructive prompt (Amalgam user data is removed too)
-#   uninstall-no  : same, answering NO (data-preserving path)
+# This test NEVER installs, seeds, backs up, restores, or removes a user's
+# real Amalgam installation or LocalAppData. It compiles a uniquely identified
+# QA installer with compile-time paths below a verified temporary sandbox, then
+# drives that isolated installer and uninstaller through the same UI a customer
+# sees. Production user-data roots are intentionally out of scope for this
+# test because a partial backup cannot make their deletion safe.
 #
-# The .iss destructive branch only runs when UninstallSilent() is false, so
-# the real interactive wizard is driven through UI Automation -- the same
-# clicks a user would make. Real user data is backed up first and restored
-# afterwards; the script aborts before deleting anything if backup
-# verification fails.
+#   audit          : validate sandbox/installer prerequisites only
+#   install        : compile and silent-install one isolated QA instance
+#   uninstall-yes : install an isolated instance, choose the destructive path,
+#                   and verify only its sandbox data is removed
+#   uninstall-no  : install an isolated instance, choose the preserving path,
+#                   and verify only its sandbox data remains
+#   all            : run both isolated uninstall scenarios
+
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
+$script:QaSentinelName = ".amalgam-uninstall-qa-sandbox"
+$script:QaSentinelText = "AMALGAM-UNINSTALL-QA-SANDBOX-v1"
+$script:QaTitle = "Amalgam Launcher QA"
 
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$setup = Join-Path $root "dist\installer\AmalgamLauncher-1.0.0-Setup.exe"
-$local = $env:LOCALAPPDATA
-$installDir = Join-Path $local "AmalgamLauncher"
-$amalgamDir = Join-Path $local "Amalgam"
-$stamp = Get-Date -Format yyyyMMddHHmmss
-$seedInstance = Join-Path $local "instances\launch-test-profile"
-$seedModpack = Join-Path $local "modpacks\launch-test-pack"
-$seedBackup = Join-Path $local "backups\launch-test-backup"
-$sessionFile = Join-Path $amalgamDir "account-sessions.json"
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$iss = Join-Path $root "installer\AmalgamLauncher.iss"
+$SourceDir = (Resolve-Path -LiteralPath $SourceDir).Path
 
-function Test-FileHas([string]$path, [string]$needle) {
-    (Get-Content $path -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($needle)
+function Get-NormalizedPath([string]$Path) {
+    return [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 }
 
-function Backup-RealData {
-    $backupRoot = Join-Path $env:TEMP "amalgam-qa-backup-$stamp"
-    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-    if (Test-Path $sessionFile) {
-        $copy = Join-Path $backupRoot "account-sessions.json"
-        Copy-Item $sessionFile $copy
-        # Verify byte-identical: this file's shape can legitimately be an
-        # empty session list, so content matching is not a validity check.
-        if ((Get-FileHash $sessionFile).Hash -ne (Get-FileHash $copy).Hash) {
-            throw "backup verification failed; aborting before any destructive step"
+function Assert-QARoot([string]$Path, [switch]$RequireSentinel) {
+    $full = Get-NormalizedPath $Path
+    $tempRoot = Get-NormalizedPath ([IO.Path]::GetTempPath())
+    $tempPrefix = $tempRoot + [IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "QA root must be below the system temporary directory: $full"
+    }
+    $leaf = Split-Path -Leaf $full
+    if (-not $leaf.StartsWith("amalgam-uninstall-qa-", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "QA root must use the guarded amalgam-uninstall-qa- prefix: $full"
+    }
+    if ($RequireSentinel) {
+        $sentinel = Join-Path $full $script:QaSentinelName
+        if (-not (Test-Path -LiteralPath $sentinel) -or
+            ((Get-Content -LiteralPath $sentinel -Raw).Trim() -ne $script:QaSentinelText)) {
+            throw "Refusing to alter a QA root without the expected sandbox sentinel: $full"
         }
     }
-    return $backupRoot
+    return $full
 }
 
-function Restore-RealData([string]$backupRoot) {
-    $saved = Join-Path $backupRoot "account-sessions.json"
-    if (Test-Path $saved) {
-        New-Item -ItemType Directory -Path $amalgamDir -Force | Out-Null
-        Copy-Item $saved $sessionFile -Force
-        if ((Get-FileHash $sessionFile).Hash -ne (Get-FileHash $saved).Hash) { throw "restore verification failed" }
-        Write-Output "real user data restored (account-sessions.json)"
+function Initialize-QARoot([string]$Path) {
+    $full = Assert-QARoot $Path
+    if (Test-Path -LiteralPath $full) {
+        throw "QA root already exists; choose a new empty sandbox path: $full"
+    }
+    New-Item -ItemType Directory -Path $full -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $full $script:QaSentinelName), $script:QaSentinelText,
+        [Text.UTF8Encoding]::new($false))
+    return (Assert-QARoot $full -RequireSentinel)
+}
+
+function Remove-QARoot([string]$Path) {
+    $full = Assert-QARoot $Path -RequireSentinel
+    Remove-Item -LiteralPath $full -Recurse -Force
+}
+
+function Get-ISCC {
+    foreach ($candidate in @(
+        (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 7\ISCC.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files (x86)\Inno Setup 7\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 7\ISCC.exe")) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
+    throw "ISCC.exe is required to compile the isolated QA installer."
+}
+
+function Assert-InstallerInputs {
+    if (-not (Test-Path -LiteralPath $iss)) { throw "Installer source missing: $iss" }
+    foreach ($relative in @("amalgam_launcher.exe", "amalgam.dll", "bridges", "LICENSE.txt", "INSTALL-INFO.txt")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $SourceDir $relative))) {
+            throw "QA installer input missing: $relative"
+        }
     }
 }
 
-function Invoke-DialogButton([string]$titlePattern, [string]$buttonName, [int]$timeoutSec = 30) {
-    # Find the top-level dialog and invoke its Yes/No button by name.
+function New-QAInstaller([string]$Sandbox) {
+    $Sandbox = Assert-QARoot $Sandbox -RequireSentinel
+    Assert-InstallerInputs
+    $iscc = Get-ISCC
+    $outputDir = Join-Path $Sandbox "installer"
+    $installDir = Join-Path $Sandbox "app"
+    $dataRoot = Join-Path $Sandbox "data"
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+    # The separate AppId ensures Inno Setup cannot treat a production install
+    # as an upgrade, replacement, or uninstall target. Double opening braces
+    # are intentional Inno syntax for a literal GUID opening brace.
+    $qaAppId = "{{" + [Guid]::NewGuid().ToString() + "}"
+    & $iscc "/DSourceDir=$SourceDir" "/DMyAppVersion=1.0.0-qa" "/DMyFileVersion=1.0.0.0" `
+        "/DMyAppName=$script:QaTitle" "/DInstallerAppId=$qaAppId" `
+        "/DDefaultInstallDir=$installDir" "/DUserDataRoot=$dataRoot" `
+        "/DOutputDir=$outputDir" "/DOutputBaseFilename=AmalgamLauncher-QA-Setup" $iss
+    if ($LASTEXITCODE -ne 0) { throw "Isolated installer compilation failed with exit code $LASTEXITCODE" }
+
+    $setup = Join-Path $outputDir "AmalgamLauncher-QA-Setup.exe"
+    if (-not (Test-Path -LiteralPath $setup)) { throw "Isolated setup executable missing: $setup" }
+    return [pscustomobject]@{
+        Sandbox = $Sandbox
+        Setup = $setup
+        InstallDir = $installDir
+        DataRoot = $dataRoot
+        AmalgamDir = (Join-Path $dataRoot "Amalgam")
+        InstancesDir = (Join-Path $dataRoot "instances")
+        ModpacksDir = (Join-Path $dataRoot "modpacks")
+        BackupsDir = (Join-Path $dataRoot "backups")
+    }
+}
+
+function Write-QAFile([string]$Path, [string]$Text) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
+    [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
+}
+
+function Seed-QAData($qa) {
+    Write-QAFile -Path (Join-Path $qa.InstancesDir "launch-test-profile\instance.json") -Text '{"format":1,"id":"launch-test-profile","name":"Launch Test Profile","minecraft_version":"1.20.1","loader":"fabric"}'
+    Write-QAFile -Path (Join-Path $qa.ModpacksDir "launch-test-pack\modpack.json") -Text '{"name":"launch-test-pack"}'
+    Write-QAFile -Path (Join-Path $qa.BackupsDir "launch-test-backup\seed-marker.txt") -Text "DESTRUCTIVE-TEST"
+    Write-QAFile -Path (Join-Path $qa.AmalgamDir "account-sessions.json") -Text '[]'
+}
+
+function Install-QAInstance($qa) {
+    $p = Start-Process -FilePath $qa.Setup -ArgumentList @("/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES", '/COMPONENTS="launcher"') -PassThru -Wait
+    if ($p.ExitCode -ne 0) { throw "isolated installer exit code $($p.ExitCode)" }
+    foreach ($file in @("amalgam_launcher.exe", "amalgam.dll", "unins000.exe")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $qa.InstallDir $file))) {
+            throw "isolated installed file missing: $file"
+        }
+    }
+    Write-QAFile (Join-Path $qa.InstallDir "launcher.json") '{"runtime":"qa"}'
+    Write-QAFile (Join-Path $qa.InstallDir "downloads.json") '{"active_downloads":{}}'
+}
+
+function Invoke-DialogButton([string]$buttonName, [int]$timeoutSec = 40) {
     $auto = [System.Windows.Automation.AutomationElement]
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
-        $cond = New-Object System.Windows.Automation.PropertyCondition(
+        $condition = New-Object System.Windows.Automation.PropertyCondition(
             [System.Windows.Automation.AutomationElement]::ClassNameProperty, "#32770")
-        $dialogs = $auto::RootElement.FindAll(
-            [System.Windows.Automation.TreeScope]::Children, $cond)
-        foreach ($d in $dialogs) {
-            $name = $d.Current.Name
-            if ($name -notmatch $titlePattern) { continue }
-            $btnCond = New-Object System.Windows.Automation.AndCondition(
+        $dialogs = $auto::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)
+        foreach ($dialog in $dialogs) {
+            if ($dialog.Current.Name -notmatch [regex]::Escape($script:QaTitle)) { continue }
+            $buttonCondition = New-Object System.Windows.Automation.AndCondition(
                 (New-Object System.Windows.Automation.PropertyCondition(
                     [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
                     [System.Windows.Automation.ControlType]::Button)),
                 (New-Object System.Windows.Automation.PropertyCondition(
                     [System.Windows.Automation.AutomationElement]::NameProperty, $buttonName)))
-            $btn = $d.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
-            if ($btn) {
-                $btnName = $btn.Current.Name
+            $button = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
+            if ($button) {
                 (New-Object System.Windows.Automation.InvokePattern(
-                    $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern))).Invoke()
-                Write-Output "clicked '$btnName' on dialog '$name'"
+                    $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern))).Invoke()
+                Write-Output "clicked '$buttonName' on isolated QA dialog"
                 return $true
             }
         }
@@ -91,87 +180,80 @@ function Invoke-DialogButton([string]$titlePattern, [string]$buttonName, [int]$t
     return $false
 }
 
-function Wait-UninstallDone {
-    # Inno's uninstaller re-execs itself, so waiting on the spawned process
-    # can return before the file removal finishes. Wait until no uninstaller
-    # process remains.
+function Wait-QAUninstall([string]$InstallDir) {
     $deadline = (Get-Date).AddSeconds(300)
     while ((Get-Date) -lt $deadline) {
-        $running = Get-Process -Name "unins000", "_iu14D2N" -ErrorAction SilentlyContinue
-        if (-not $running) { return $true }
+        if (-not (Test-Path -LiteralPath (Join-Path $InstallDir "unins000.exe")) -and
+            -not (Test-Path -LiteralPath (Join-Path $InstallDir "amalgam_launcher.exe"))) {
+            return $true
+        }
         Start-Sleep -Seconds 2
     }
     return $false
 }
 
-if ($Action -in @("install", "all")) {    if (-not (Test-Path $setup)) { throw "Setup.exe missing: $setup" }
-    New-Item -ItemType Directory -Path (Join-Path $seedInstance "mods") -Force | Out-Null
-    @{ format = 1; id = "launch-test-profile"; name = "Launch Test Profile";
-       minecraft_version = "1.20.1"; loader = "fabric" } |
-        ConvertTo-Json | Set-Content (Join-Path $seedInstance "instance.json")
-    New-Item -ItemType Directory -Path (Join-Path $seedModpack "overrides") -Force | Out-Null
-    Set-Content (Join-Path $seedModpack "modpack.json") '{"name":"launch-test-pack"}'
-    New-Item -ItemType Directory -Path $seedBackup -Force | Out-Null
-    Set-Content (Join-Path $seedBackup "seed-marker.txt") "DESTRUCTIVE-TEST-$stamp"
-    Write-Output "seeded instance/modpack/backup (marker $stamp)"
-
-    $p = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES" -PassThru -Wait
-    if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
-    foreach ($f in "amalgam_launcher.exe", "amalgam.dll", "unins000.exe") {
-        if (-not (Test-Path (Join-Path $installDir $f))) { throw "installed file missing: $f" }
+function Assert-QAUninstallResult($qa, [string]$Answer) {
+    foreach ($file in @("amalgam_launcher.exe", "amalgam.dll", "unins000.exe", "launcher.json", "downloads.json")) {
+        if (Test-Path -LiteralPath (Join-Path $qa.InstallDir $file)) {
+            throw "isolated app file survived uninstall: $file"
+        }
     }
-    # Seed runtime-written configs in the install dir so the .iss DeleteFile
-    # lines on the destructive path are genuinely exercised (the launcher
-    # writes these on first run; simulate that before uninstalling).
-    Set-Content (Join-Path $installDir "launcher.json") '{"runtime":"written-by-launcher"}'
-    Set-Content (Join-Path $installDir "downloads.json") '{"active_downloads":{}}'
-    Write-Output "installed (with uninstaller) to $installDir; seeded runtime configs"
+    $expectDataGone = $Answer -eq "Yes"
+    foreach ($dir in @($qa.AmalgamDir, $qa.InstancesDir, $qa.ModpacksDir, $qa.BackupsDir)) {
+        $gone = -not (Test-Path -LiteralPath $dir)
+        if ($expectDataGone -and -not $gone) { throw "isolated destructive uninstall left data: $dir" }
+        if (-not $expectDataGone -and $gone) { throw "isolated preserving uninstall deleted data: $dir" }
+    }
+}
+
+function Invoke-QAScenario([string]$Name, [string]$Answer = "") {
+    $sandbox = Initialize-QARoot $Name
+    try {
+        $qa = New-QAInstaller $sandbox
+        Seed-QAData $qa
+        Install-QAInstance $qa
+        if ([string]::IsNullOrEmpty($Answer)) {
+            Write-Output "isolated install verified: $($qa.InstallDir)"
+            return
+        }
+
+        Add-Type -AssemblyName UIAutomationClient
+        Add-Type -AssemblyName UIAutomationTypes
+        $uninstaller = Join-Path $qa.InstallDir "unins000.exe"
+        Start-Process -FilePath $uninstaller | Out-Null
+        if (-not (Invoke-DialogButton "Yes")) { throw "isolated uninstall confirmation dialog not found" }
+        if (-not (Invoke-DialogButton $Answer)) { throw "isolated destructive-prompt dialog not found" }
+        if (-not (Wait-QAUninstall $qa.InstallDir)) { throw "isolated uninstaller did not finish" }
+        Assert-QAUninstallResult $qa $Answer
+        Write-Output "isolated uninstall '$Answer' scenario verified"
+    }
+    finally {
+        if (Test-Path -LiteralPath $sandbox) { Remove-QARoot $sandbox }
+    }
+}
+
+Assert-InstallerInputs
+if ($Action -eq "audit") {
+    $checkedRoot = Assert-QARoot $QaRoot
+    Write-Output "QA uninstall audit passed: installer inputs and guarded temporary root are valid ($checkedRoot)"
     exit 0
 }
 
-if ($Action -in @("uninstall-yes", "uninstall-no", "all")) {
-    $answer = if ($Action -eq "uninstall-no") { "No" } else { "Yes" }
-    $backupRoot = Backup-RealData
-    Write-Output "backed up real user data to $backupRoot"
-
-    $unins = Join-Path $installDir "unins000.exe"
-    if (-not (Test-Path $unins)) { throw "uninstaller missing: $unins" }
-    Start-Process -FilePath $unins | Out-Null
-
-    # Dialog 1: Inno's "This will remove Amalgam Launcher... Continue?" -> Yes.
-    if (-not (Invoke-DialogButton "Amalgam" "Yes" 40)) { throw "uninstall confirmation dialog not found" }
-    # Dialog 2: the .iss destructive prompt -> the answer under test.
-    if (-not (Invoke-DialogButton "Amalgam" $answer 40)) { throw "destructive-prompt dialog not found" }
-    if (-not (Wait-UninstallDone)) { throw "uninstaller did not finish" }
-
-    foreach ($f in "amalgam_launcher.exe", "amalgam.dll", "unins000.exe", "launcher.json", "downloads.json") {
-        if (Test-Path (Join-Path $installDir $f)) { throw "APP FILE SURVIVED UNINSTALL: $f" }
-    }
-    Write-Output "app files removed (install dir: $(Test-Path $installDir))"
-
-    $expectDataGone = ($answer -eq "Yes")
-    foreach ($dir in $amalgamDir, (Split-Path $seedInstance -Parent), (Split-Path $seedModpack -Parent), (Split-Path $seedBackup -Parent)) {
-        $gone = -not (Test-Path $dir)
-        if ($expectDataGone -and -not $gone) { throw "DESTRUCTIVE UNINSTALL LEFT DATA: $dir" }
-        if (-not $expectDataGone -and $gone) { throw "NO-PATH DELETED DATA: $dir" }
-    }
-    if ($expectDataGone) {
-        Write-Output "destructive path verified: Amalgam data dirs removed (Amalgam, instances, modpacks, backups)"
-    } else {
-        Write-Output "data-preserving path verified: Amalgam data dirs intact"
-    }
-
-    Restore-RealData $backupRoot
-
-    if (-not $expectDataGone) {
-        # Leave the machine as found: remove the seeds the destructive path
-        # would have removed, and re-verify the app dir is gone.
-        Remove-Item -Recurse -Force $seedInstance, $seedModpack, $seedBackup -ErrorAction SilentlyContinue
-        Write-Output "seed data cleaned up"
-    }
-    if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
-    Write-Output "machine state restored"
+if ($Action -eq "install") {
+    Invoke-QAScenario $QaRoot
     exit 0
 }
 
-throw "unknown action: $Action"
+if ($Action -eq "uninstall-yes") {
+    Invoke-QAScenario $QaRoot "Yes"
+    exit 0
+}
+
+if ($Action -eq "uninstall-no") {
+    Invoke-QAScenario $QaRoot "No"
+    exit 0
+}
+
+Invoke-QAScenario ($QaRoot + "-yes") "Yes"
+Invoke-QAScenario ($QaRoot + "-no") "No"
+Write-Output "all isolated uninstall scenarios passed"

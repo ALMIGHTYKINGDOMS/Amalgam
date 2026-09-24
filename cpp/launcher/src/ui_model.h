@@ -143,6 +143,29 @@ inline bool contains_case_insensitive(std::string_view text, std::string_view qu
     return false;
 }
 
+// Profile content is populated asynchronously. A fresh cache has no rows
+// before the initial filesystem scan finishes, so an empty vector alone does
+// not mean the profile has no installed content. Keep the user-facing states
+// deterministic and independent from the renderer.
+enum class ProfileContentPresentation {
+    Loading,
+    Error,
+    EmptyInventory,
+    EmptyFiltered,
+    Ready,
+};
+
+inline ProfileContentPresentation profile_content_presentation(
+    bool initial_scan_complete, std::string_view scan_error,
+    size_t inventory_count, size_t visible_count) {
+    if (!initial_scan_complete) return ProfileContentPresentation::Loading;
+    if (!scan_error.empty() && inventory_count == 0)
+        return ProfileContentPresentation::Error;
+    if (inventory_count == 0) return ProfileContentPresentation::EmptyInventory;
+    if (visible_count == 0) return ProfileContentPresentation::EmptyFiltered;
+    return ProfileContentPresentation::Ready;
+}
+
 inline int clamp_selection(int selected, size_t item_count) {
     if (item_count == 0) return 0;
     return std::clamp(selected, 0, static_cast<int>(item_count - 1));
@@ -152,6 +175,39 @@ inline float normalize_progress(float progress) {
     if (!std::isfinite(progress)) return progress < 0.0f ? -1.0f : 0.0f;
     if (progress < 0.0f) return -1.0f; // negative means indeterminate
     return std::clamp(progress, 0.0f, 1.0f);
+}
+
+// Most stat-card progress measures are capacity (CPU/RAM/player slots), where
+// a fuller bar is increasingly risky. Health measures such as TPS are the
+// inverse: a fuller bar is good. Keep that meaning explicit rather than
+// letting a shared capacity threshold turn a healthy metric red.
+enum class StatCardProgressPolarity {
+    HigherIsWorse,
+    HigherIsBetter,
+    AccentOnly,
+};
+
+enum class StatCardProgressTone {
+    Accent,
+    Warning,
+    Critical,
+};
+
+inline StatCardProgressTone stat_card_progress_tone(
+    float progress,
+    StatCardProgressPolarity polarity = StatCardProgressPolarity::HigherIsWorse) {
+    const float normalized = normalize_progress(progress);
+    if (normalized < 0.0f || polarity == StatCardProgressPolarity::AccentOnly)
+        return StatCardProgressTone::Accent;
+
+    if (polarity == StatCardProgressPolarity::HigherIsWorse) {
+        if (normalized > 0.9f) return StatCardProgressTone::Critical;
+        if (normalized > 0.7f) return StatCardProgressTone::Warning;
+    } else { // HigherIsBetter
+        if (normalized < 0.7f) return StatCardProgressTone::Critical;
+        if (normalized < 0.9f) return StatCardProgressTone::Warning;
+    }
+    return StatCardProgressTone::Accent;
 }
 
 inline const char* operation_state_name(OperationState state) {
@@ -272,6 +328,28 @@ inline int stat_card_columns(float available_width, float ui_scale = 1.0f) {
 // Keeping the wording here makes every surface spell counts the same way.
 inline std::string count_label(int count, const char* noun) {
     return std::to_string(count) + " " + noun + (count == 1 ? "" : "s");
+}
+
+// List rows (content, worlds) put their name on the left and one or two
+// trailing columns against the right edge. Reserving those columns with a fixed
+// width lets the column nearest the edge collide with the one before it as soon
+// as that one holds longer text: a resource-pack row read "...EnabledLocal" and
+// pinned "Local" 90px off the edge. Reserving each column by the width of the
+// text it actually holds keeps the columns apart and gives the name the rest.
+struct ListRowColumns {
+    float name_width = 0.0f;        // width left for the name
+    float middle_reserve = 0.0f;    // right reserve for the column left of the trailing one
+    float trailing_reserve = 0.0f;  // right reserve for the column nearest the edge
+};
+
+inline ListRowColumns list_row_columns(float row_width, float trailing_width,
+                                       float middle_width, float right_margin,
+                                       float gutter) {
+    ListRowColumns columns;
+    columns.trailing_reserve = right_margin + trailing_width;
+    columns.middle_reserve = columns.trailing_reserve + gutter + middle_width;
+    columns.name_width = std::max(0.0f, row_width - columns.middle_reserve - gutter);
+    return columns;
 }
 
 // Essentials uses three information columns when there is room, and stacked

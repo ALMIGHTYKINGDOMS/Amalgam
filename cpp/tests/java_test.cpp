@@ -68,8 +68,9 @@ int main() {
         }
     }
     // scan_installed(): doesn't crash
+    std::vector<aml::java::Install> installs;
     {
-        std::vector<aml::java::Install> installs = aml::java::scan_installed();
+        installs = aml::java::scan_installed();
         // We can't assert specific results since it depends on the machine,
         // but we verify it doesn't crash and returns a sorted list.
         for (size_t i = 1; i < installs.size(); ++i) {
@@ -77,6 +78,38 @@ int main() {
                 std::cerr << "scan_installed() results are not sorted\n";
                 return 1;
             }
+        }
+    }
+    // Explicit runtime locations are documented as either a Java home or a
+    // java.exe/javaw.exe path.  Normalization must not turn a concrete
+    // executable into a bogus ...\\bin\\bin home.
+    {
+        if (aml::java::normalize_configured_runtime_home(L"C:\\SDK") != L"C:\\SDK" ||
+            aml::java::normalize_configured_runtime_home(L"C:\\SDK\\bin") != L"C:\\SDK" ||
+            aml::java::normalize_configured_runtime_home(L"C:\\SDK\\bin\\java.exe") != L"C:\\SDK" ||
+            aml::java::normalize_configured_runtime_home(L"C:\\SDK\\bin\\javaw.exe") != L"C:\\SDK") {
+            std::cerr << "configured Java path normalization returned the wrong home\n";
+            return 1;
+        }
+    }
+    // When an installed JRE is available, exercise the real validator against
+    // both documented input forms.  The test remains portable to machines
+    // with no Java by treating this as an optional live probe.
+    if (!installs.empty()) {
+        const auto& install = installs.front();
+        aml::java::JavaRuntime runtime;
+        std::string error;
+        if (!aml::java::ValidateConfiguredRuntime(install.exe, install.major, &runtime, &error) ||
+            std::filesystem::path(runtime.home) != std::filesystem::path(install.home) ||
+            runtime.executable != install.home + L"\\bin\\java.exe") {
+            std::cerr << "configured java.exe validation failed: " << error << "\n";
+            return 1;
+        }
+        const int wrong_major = install.major == 25 ? 24 : install.major + 1;
+        if (aml::java::ValidateConfiguredRuntime(install.home + L"\\bin", wrong_major,
+                                                 &runtime, &error)) {
+            std::cerr << "configured Java accepted a mismatched major version\n";
+            return 1;
         }
     }
     // Java version resolution follows Minecraft's supported runtime bands.

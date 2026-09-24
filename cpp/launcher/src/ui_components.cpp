@@ -294,6 +294,73 @@ bool ghost_button(const char* label, const ImVec2& size, bool disabled) {
     return r && !disabled;
 }
 
+bool danger_button(const char* label, const ImVec2& size, bool disabled) {
+    // Deletion and other high-impact actions need a strong, consistent visual
+    // boundary without becoming the dominant primary action on a dark page.
+    // Like primary_button/ghost_button, the transparent ImGui button owns
+    // input and focus while the draw list owns the launcher visual language.
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushFont(f_bold);
+
+    const std::string display_label = visible_button_label(label);
+    const ImVec2 text_size = ImGui::CalcTextSize(display_label.c_str());
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImVec2 fitted = size;
+    if (fitted.x > 0.0f)
+        fitted.x = std::max(fitted.x, text_size.x + style.FramePadding.x * 2.0f + ui_px(8.0f));
+    if (fitted.y > 0.0f)
+        fitted.y = std::max(fitted.y, ImGui::GetTextLineHeight() + style.FramePadding.y * 2.0f);
+
+    const bool pressed_result = ImGui::Button(label, fitted);
+    const ImVec2 bmin = ImGui::GetItemRectMin();
+    const ImVec2 bmax = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool pressed = ImGui::IsItemActive() && hovered;
+    const bool focused = ImGui::IsItemFocused();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float rounding = ui_px(8.0f);
+
+    ImVec4 fill = k.surface2;
+    ImVec4 border = with_alpha(k.red, 0.72f);
+    if (disabled) {
+        fill = k.surface;
+        border = k.border;
+    } else if (pressed) {
+        fill = ImVec4(k.red.x, k.red.y, k.red.z, 0.22f);
+        border = k.red;
+    } else if (hovered) {
+        fill = ImVec4(k.red.x, k.red.y, k.red.z, 0.14f);
+        border = with_alpha(k.red, 0.95f);
+    } else {
+        fill = ImVec4(k.red.x, k.red.y, k.red.z, 0.07f);
+    }
+
+    dl->AddRectFilled(bmin, bmax, c32(fill), rounding);
+    dl->AddLine(bmin + ImVec2(ui_px(8.0f), ui_px(1.0f)),
+                ImVec2(bmax.x - ui_px(8.0f), bmin.y + ui_px(1.0f)),
+                c32(with_alpha(k.red, disabled ? 0.08f : (hovered ? 0.55f : 0.30f))),
+                ui_px(1.0f));
+    dl->AddRect(bmin, bmax, c32(border), rounding, 0, ui_px(1.0f));
+    if (focused) {
+        dl->AddRect(bmin - ImVec2(ui_px(2.0f), ui_px(2.0f)),
+                    bmax + ImVec2(ui_px(2.0f), ui_px(2.0f)), c32(k.red),
+                    ui_px(10.0f), 0, ui_px(1.25f));
+    }
+    dl->AddText(ImVec2(bmin.x + (bmax.x - bmin.x - text_size.x) * 0.5f,
+                       bmin.y + (bmax.y - bmin.y - text_size.y) * 0.5f),
+                c32(disabled ? k.muted : k.red), display_label.c_str());
+
+    ImGui::PopFont();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(5);
+    return pressed_result && !disabled;
+}
+
 // Per-card hover animation state, keyed by the child id. Kept small; cards
 // are few per view. The map is bounded by callers reusing stable ids each
 // frame.
@@ -667,7 +734,7 @@ bool quick_search_dialog(std::string* selected_result) {
     ImGui::SetNextWindowSize(ImVec2(ui_px(600.0f), ui_px(400.0f)), ImGuiCond_Always);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
-                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_Modal |
+                             ImGuiWindowFlags_Modal |
                              ImGuiWindowFlags_NoSavedSettings;
     bool open = true;
     bool activated = false;
@@ -699,17 +766,22 @@ bool quick_search_dialog(std::string* selected_result) {
 
     if (ImGui::Begin("Quick Search", &open, flags)) {
         ImGui::PushFont(f_bold);
-        ImGui::TextUnformatted("Search");
+        ImGui::TextUnformatted("Search Amalgam");
         ImGui::PopFont();
+        ImGui::SameLine(0, ui_px(10.0f));
+        ImGui::TextColored(k.muted, "Profiles, content, settings, and tools");
         ImGui::Spacing();
 
         if (g_quick_search.focus_input) {
             ImGui::SetKeyboardFocusHere(0);
             g_quick_search.focus_input = false;
         }
-        const bool submitted = ImGui::InputText("##search", g_quick_search.query,
-                                                sizeof(g_quick_search.query),
-                                                ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool submitted = ImGui::InputTextWithHint(
+            "##search", "Type a profile, mod, setting, or command…", g_quick_search.query,
+            sizeof(g_quick_search.query), ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::Separator();
+
+        ImGui::BeginChild("##quick_search_results", ImVec2(-1, ui_px(248.0f)), false);
 
         if (strlen(g_quick_search.query) == 0 && !g_quick_search.recent_searches.empty()) {
             ImGui::Spacing();
@@ -729,6 +801,23 @@ bool quick_search_dialog(std::string* selected_result) {
             }
         }
 
+        if (!activated && strlen(g_quick_search.query) == 0 &&
+            g_quick_search.recent_searches.empty()) {
+            const float content_width = ImGui::GetContentRegionAvail().x;
+            const float text_width = ImGui::CalcTextSize("Start typing to search").x;
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ui_px(58.0f));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                                 std::max(0.0f, (content_width - text_width) * 0.5f));
+            ImGui::PushFont(f_h2);
+            ImGui::TextColored(k.text, "Start typing to search");
+            ImGui::PopFont();
+            const char* hint = "Find a profile, installed item, or launcher setting in one place.";
+            const float hint_width = ImGui::CalcTextSize(hint).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                                 std::max(0.0f, (content_width - hint_width) * 0.5f));
+            ImGui::TextColored(k.muted, "%s", hint);
+        }
+
         if (!activated && !g_quick_search.results.empty()) {
             ImGui::Spacing();
             ImGui::PushFont(f_small);
@@ -744,6 +833,35 @@ bool quick_search_dialog(std::string* selected_result) {
                 if (activated) break;
             }
         }
+
+        if (!activated && strlen(g_quick_search.query) > 0 && g_quick_search.results.empty()) {
+            const float content_width = ImGui::GetContentRegionAvail().x;
+            const char* title = "No matching results";
+            const char* hint = "Try a shorter name or browse Discover for new content.";
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ui_px(58.0f));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(
+                0.0f, (content_width - ImGui::CalcTextSize(title).x) * 0.5f));
+            ImGui::PushFont(f_h2);
+            ImGui::TextColored(k.text, "%s", title);
+            ImGui::PopFont();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(
+                0.0f, (content_width - ImGui::CalcTextSize(hint).x) * 0.5f));
+            ImGui::TextColored(k.muted, "%s", hint);
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        ImGui::TextColored(k.muted, "Enter");
+        ImGui::SameLine(0, ui_px(4.0f));
+        ImGui::TextColored(k.muted, "open");
+        ImGui::SameLine(0, ui_px(16.0f));
+        ImGui::TextColored(k.muted, "↑ ↓");
+        ImGui::SameLine(0, ui_px(4.0f));
+        ImGui::TextColored(k.muted, "navigate");
+        ImGui::SameLine(0, ui_px(16.0f));
+        ImGui::TextColored(k.muted, "Esc");
+        ImGui::SameLine(0, ui_px(4.0f));
+        ImGui::TextColored(k.muted, "close");
 
         if (!activated && (submitted || ImGui::IsKeyPressed(ImGuiKey_Enter)))
             activate_result(g_quick_search.selected_index);
@@ -770,6 +888,13 @@ void open_quick_search() {
     g_quick_search.query[0] = '\0';
     g_quick_search.selected_index = 0;
     g_quick_search.results.clear();
+}
+
+void reset_quick_search_fixture_state() {
+    // Named visual fixtures may be requested from a long-lived application
+    // during development.  Never let a real person's prior query or result
+    // history appear in a supposedly local, deterministic capture.
+    g_quick_search = QuickSearchState{};
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1300,13 @@ void show_toast(const char* title, const char* message, const ImVec4& color, flo
     }
 }
 
+void clear_toasts() {
+    // Snapshot routes own their notification state. Clearing here prevents a
+    // previous in-process fixture from leaking an expired/foreign toast into
+    // the next capture, while normal launcher sessions never call this helper.
+    g_toast_state.toasts.clear();
+}
+
 void draw_toasts() {
     if (g_toast_state.toasts.empty()) return;
     
@@ -1409,7 +1541,9 @@ void draw_circle_progress(const ImVec2& center, float radius, float progress,
 // ---------------------------------------------------------------------------
 
 float draw_stat_card(const char* label, const char* value, float progress,
-                     const ImVec4& accent, float width) {
+                     const ImVec4& accent, float width,
+                     ui_model::StatCardProgressPolarity polarity,
+                     const ImVec4* progress_color) {
     const float card_w = width > 0.0f ? width : ui_px(160.0f);
     const float pad = ui_px(14.0f);
     const float card_h = progress >= 0.0f ? ui_px(80.0f) : ui_px(56.0f);
@@ -1454,8 +1588,18 @@ float draw_stat_card(const char* label, const char* value, float progress,
             c32(k.surface2), bar_h * 0.5f);
         // Fill
         float fill_w = bar_w * std::clamp(progress, 0.0f, 1.0f);
-        ImVec4 bar_color = progress > 0.9f ? k.red :
-                           progress > 0.7f ? k.orange : ac;
+        ImVec4 bar_color = ac;
+        if (progress_color) {
+            // Some metrics already have an authoritative semantic color (for
+            // example green/yellow/red TPS health). Preserve it exactly.
+            bar_color = *progress_color;
+        } else {
+            switch (ui_model::stat_card_progress_tone(progress, polarity)) {
+                case ui_model::StatCardProgressTone::Critical: bar_color = k.red; break;
+                case ui_model::StatCardProgressTone::Warning: bar_color = k.orange; break;
+                case ui_model::StatCardProgressTone::Accent: break;
+            }
+        }
         dl->AddRectFilled(
             ImVec2(bar_x, bar_y),
             ImVec2(bar_x + fill_w, bar_y + bar_h),

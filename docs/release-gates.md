@@ -1,6 +1,6 @@
 # Release Candidate Gates
 
-Status: 2026-09-13.
+Status: 2026-09-22.
 
 The current launcher code, automated tests, renderer captures, and
 credential-free package can be completed locally. The gates below require a
@@ -43,16 +43,24 @@ the product a public CurseForge-quality release.
 - `tools/release-gate.ps1` chains build, tests, packaging, installer, package
   integrity, runtime validation, installer inputs, the cached launch matrix,
   launcher smoke, the Node suites, the secret scan, the embedded-updater-key
-  check, and Authenticode status in one command with an honest summary.
+  check, and Authenticode verification in one command with an honest summary.
 - The gate fails closed when the package would ship without its public backend
   and sign-in configuration (`AMALGAM_MICROSOFT_CLIENT_ID`,
   `AMALGAM_SUPABASE_URL`, `AMALGAM_SUPABASE_PUBLISHABLE_KEY`). Pass
-  `-AllowInertConfig` only for local test packages; the summary then reports
-  the result as NOT RELEASABLE.
-- Update signing is end-to-end verified: the signed feed manifest and payload
-  validate against the public key embedded in the shipped launcher, and a CLI
-  regression test keeps kebab-case flags from silently producing unsigned
-  manifests again.
+  `-AllowInertConfig` and `-AllowInertUpdates` only for a deliberately
+  non-releasable local test package; the summary labels that result accordingly.
+- The production gate (`-RequireSigned`) has an explicit byte-safe ordering:
+  it signs the staged launcher/DLL, regenerates the component manifest, SBOM,
+  release hashes, and ZIP from those signed bytes, builds the installer from
+  that finalized stage, signs the installer, and then verifies all artifacts
+  use one signing certificate. It requires an explicit signing identity,
+  update private-key path, and publisher-approved HTTPS payload URL; it does
+  not guess an endpoint or publish anything.
+- The production gate generates a fresh manifest only from the final ZIP,
+  signs both the manifest and payload, and verifies its hash, size, and both
+  signatures with the public key embedded in the shipped launcher. The
+  checked-in feed is not proof of a current candidate until this step has run
+  for that candidate.
 - A real install/uninstall cycle against the production Setup.exe passes:
   silent install verifies files and prereq checks; the data-preserving
   uninstall removes application files while profiles, worlds, and backups
@@ -76,15 +84,19 @@ the product a public CurseForge-quality release.
 4. **Bedrock live validation.** Install the Windows Bedrock UWP package on a
    test machine with its proper Store/Microsoft entitlement, then verify detect,
    launch, and addon import behavior.
-5. **Code signing and installer.** Obtain a Windows code-signing certificate,
-   run `tools/sign-release.ps1` to sign the launcher/DLL/installer with
-   timestamping, then rerun `tools/release-gate.ps1 -RequireSigned` and verify
+5. **Code signing and installer.** Obtain a Windows code-signing certificate.
+   The required order is: sign the staged launcher/DLL; run
+   `tools/package-release.ps1 -FinalizeExistingStage -RequireSignedStagedBinaries`;
+   build the installer from that refreshed stage; then sign the installer.
+   `tools/release-gate.ps1 -RequireSigned` automates and verifies those phases
+   when supplied the signing identity and update-manifest inputs. Verify
    SmartScreen/reputation behavior and upgrade/uninstall on a clean machine.
-6. **Update feed deployment.** Upload `dist/update-feed/manifest.json` to
-   `https://amalgam-mc.com/releases/launcher/manifest.json` and the ZIP to the
-   `download_url` it advertises. The manifest is signed with the release vault
-   key; the launcher embeds the matching public key and fails closed. Verify
-   the deployed URL serves the manifest verbatim after upload.
+6. **Update feed deployment.** Supply the production gate with the
+   publisher-approved HTTPS ZIP URL; it creates and locally verifies
+   `dist/update-feed/manifest.json` against that exact final ZIP. Upload that
+   manifest and ZIP only to the approved endpoint, then fetch both back and
+   compare them verbatim. The official website URL alone is not authorization
+   to assume a release-feed path.
 7. **Native module compatibility and policy review.** Perform controlled
    single-player and permitted-server checks for the native bridge/modules,
    then make the distribution policy explicit for advanced functionality.

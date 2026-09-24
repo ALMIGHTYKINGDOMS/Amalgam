@@ -9,6 +9,8 @@
 #include "readiness.h"
 #include "server_types.h"
 #include "ui_model.h"
+#include "ui_async_request.h"
+#include "account_passive_cache.h"
 #include "updater.h"
 
 #include "ai_core.h"
@@ -86,6 +88,10 @@ struct UiState {
     auth::Account account;
     std::atomic_bool auth_checked{false};
     std::atomic_bool auth_working{false};
+    // Each device-code login owns one generation. Destructive credential
+    // actions advance it so an older worker can never persist a stale account
+    // after the user has disconnected or started a newer flow.
+    std::atomic_uint64_t auth_operation_generation{0};
     std::string auth_status;
     bool login_wizard_open = false;
     bool microsoft_login_popup_open = false;
@@ -96,6 +102,17 @@ struct UiState {
     int login_expires_in = 0;
     AuthWizardState auth_wizard_state;
     std::mutex auth_mu;
+    // State-changing Amalgam-account requests share a single joined lane.
+    // This prevents sign-in, verification, recovery, and password mutations
+    // from racing each other or blocking the render thread.
+    AsyncUiRequestState auth_async_request;
+    // Security, Activity, and Overview statistics keep account-scoped,
+    // render-thread-owned cached values here. Remote Security/Activity reads
+    // reuse the serialized auth lane; the local-only instance statistics scan
+    // gets its own joined lane because it receives only render-thread copies.
+    // Worker results are accepted only when this scope still matches.
+    AccountPassiveCache account_passive_cache;
+    AsyncUiRequestState account_passive_stats_async_request;
 
     std::deque<std::string> logs;
     std::mutex log_mu;
@@ -158,6 +175,12 @@ struct UiState {
     std::mutex workers_mu;
     std::vector<std::thread> workers;
 
+    // Essentials and Social mutate account-backed state through joined
+    // launcher workers.  These hand-off states keep the render thread free of
+    // HTTP/disk work and reject stale worker completions by generation.
+    AsyncUiRequestState essentials_async_request;
+    AsyncUiRequestState social_async_request;
+
     int active_tab = 0;
     int sidebar_item = 0;
     bool sidebar_collapsed = false;
@@ -196,8 +219,20 @@ struct UiState {
     std::string rename_group_target;
     std::string delete_group_target;
     std::string delete_target;
+    // High-impact profile changes share one modal so every active entry point
+    // states its consequence before files are overwritten or deleted.
+    // 1=restore latest, 2=delete restore point, 3=restore game options.
+    bool profile_data_confirm_open = false;
+    int profile_data_confirm_action = 0;
+    instances::Instance profile_data_confirm_instance;
+    std::wstring profile_data_confirm_path;
+    std::string profile_data_confirm_label;
+    std::string profile_data_confirm_error;
     int version_change_kind = 0;   // 1 = minecraft version, 2 = loader
     bool version_change_backup = true;
+    // Kept with the confirmation state so a failed pre-change restore point
+    // remains visible and retryable instead of silently advancing the wizard.
+    std::string version_change_backup_error;
     bool wizard_open = false;
     int wizard_step = 0;
     int wizard_source = 0;
@@ -314,15 +349,12 @@ struct UiState {
     int mod_selected = -1;
     std::vector<std::string> mod_install_log;
 
+    // Readiness detail behind the Home summary; nothing gates Play on these.
     struct LaunchCheck {
         std::string label;
         std::string detail;
         bool passed = false;
-        bool blocking = false;
     };
-    std::vector<LaunchCheck> launch_checks;
-    bool launch_review_open = false;
-    bool launch_review_approved = false;
 
     struct DownloadJob {
         int id = 0;
@@ -376,6 +408,11 @@ struct UiState {
     int feedback_category = 0;
     int feedback_rating = 0;
     std::string feedback_message;
+    // The authenticated beta-feedback RPC runs on the shared account worker
+    // lane. Only this render-thread state controls the modal presentation.
+    bool feedback_submitting = false;
+    std::string feedback_submission_account_id;
+    uint64_t feedback_submission_generation = 0;
     bool local_feedback_open = false;
     int local_feedback_category = 0;
     std::string local_feedback_message;
@@ -410,6 +447,12 @@ struct UiState {
         uint64_t content_at_ms = 0;
         std::vector<instances::ContentEntry> content;
         bool content_scan_pending = false;
+        // A fresh cache is intentionally empty while its worker is reading the
+        // profile. Keep that distinct from a completed scan that found no
+        // content, and retain a filesystem error instead of rendering it as an
+        // empty profile.
+        bool content_initial_scan_complete = false;
+        std::string content_error;
         uint64_t counts_at_ms = 0;
         int world_count = 0;
         int screenshot_count = 0;
@@ -503,6 +546,19 @@ struct UiState {
     bool downloads_open = false;
     float log_h = 0.0f;
     bool fixture_mode = false;
+    // Release visual-QA state.  Populated only by `--ui-snapshot`; normal
+    // player sessions neither read nor persist these fields.
+    std::wstring fixture_root;
+    std::string fixture_case;
+    int fixture_scroll_position = 0;
+    // Fixture-only transient state. These flags are populated exclusively by
+    // named --ui-snapshot routes so screenshot evidence can prove popup and
+    // combo geometry without synthesizing clicks or touching live settings.
+    bool fixture_theme_selector_open = false;
+    // The page scroll range is known only after a fully laid-out frame. Keep
+    // that fixture-only value so the next frame can set the requested capture
+    // position before the page body is drawn.
+    float fixture_scroll_host_max_y = 0.0f;
     std::wstring capture_path;
     int capture_after_frames = 0;
     int rendered_frames = 0;

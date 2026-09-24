@@ -88,10 +88,15 @@ if(AMALGAM_ENABLE_CLANG_TIDY)
 endif()
 
 if(NOT DEFINED AMALGAM_JAVA_HOME)
-    set(AMALGAM_JAVA_HOME "$ENV{JAVA_HOME}")
+    # Prefer the project-specific environment variable used by the documented
+    # build commands, then fall back to the conventional JAVA_HOME.
+    set(AMALGAM_JAVA_HOME "$ENV{AMALGAM_JAVA_HOME}")
+    if(NOT AMALGAM_JAVA_HOME)
+        set(AMALGAM_JAVA_HOME "$ENV{JAVA_HOME}")
+    endif()
 endif()
 if(NOT AMALGAM_JAVA_HOME)
-    message(FATAL_ERROR "AMALGAM_JAVA_HOME or JAVA_HOME must point to a JDK with JNI headers")
+    message(FATAL_ERROR "AMALGAM_JAVA_HOME (CMake or environment) or JAVA_HOME must point to a JDK with JNI headers")
 endif()
 if(NOT EXISTS "${AMALGAM_JAVA_HOME}/include/jni.h")
     message(FATAL_ERROR "JNI headers not found under AMALGAM_JAVA_HOME: ${AMALGAM_JAVA_HOME}")
@@ -191,13 +196,17 @@ if(AMALGAM_BUILD_LAUNCHER)
          launcher/src/net.cpp
          launcher/src/model.cpp
          launcher/src/launch.cpp
+         launcher/src/natives.cpp
+         launcher/src/maven_artifact.cpp
          launcher/src/official_launcher_bridge.cpp
+         launcher/src/official_launcher_guard.cpp
          launcher/src/java.cpp
          launcher/src/extract.cpp
          launcher/src/config.cpp
          launcher/src/admin_auth.cpp
          launcher/src/mods.cpp
          launcher/src/performance.cpp
+         launcher/src/performance_cache.cpp
          launcher/src/ai.cpp
          ai/ai_core.cpp
          ai/ai_project_index.cpp
@@ -205,8 +214,9 @@ if(AMALGAM_BUILD_LAUNCHER)
          launcher/src/auth.cpp
           launcher/src/bedrock.cpp
           launcher/src/crash_report.cpp
-          launcher/src/readiness.cpp
+         launcher/src/readiness.cpp
          launcher/src/instances.cpp
+         launcher/src/profile_handoff.cpp
          launcher/src/import_pack.cpp
          launcher/src/ui_helpers.cpp
          launcher/src/ui_motion.cpp
@@ -219,6 +229,7 @@ if(AMALGAM_BUILD_LAUNCHER)
           launcher/src/essentials_manager.cpp
           launcher/src/server_manager.cpp
          launcher/src/server_providers.cpp
+         launcher/src/server_provision.cpp
          launcher/src/storage_manager.cpp
          launcher/src/sync_manager.cpp
          launcher/src/account_manager.cpp
@@ -358,7 +369,9 @@ if(BUILD_TESTING)
         src/core/game_mode_telemetry.cpp
         src/core/replay.cpp
         src/core/diagnostics_outbox.cpp)
-    target_include_directories(amalgam_diagnostics_outbox_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(amalgam_diagnostics_outbox_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
     if(AMALGAM_WINSQLITE_INCLUDE)
         target_include_directories(amalgam_diagnostics_outbox_test PRIVATE ${AMALGAM_WINSQLITE_INCLUDE}/..)
     endif()
@@ -459,6 +472,25 @@ if(BUILD_TESTING)
     target_link_libraries(amalgam_model_test PRIVATE wininet advapi32)
     add_test(NAME amalgam_model_test COMMAND amalgam_model_test)
 
+    add_executable(amalgam_profile_handoff_test
+        tests/profile_handoff_test.cpp
+        launcher/src/profile_handoff.cpp
+        launcher/src/instances.cpp
+        launcher/src/model.cpp
+        launcher/src/json.cpp
+        launcher/src/net.cpp)
+    target_include_directories(amalgam_profile_handoff_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    target_compile_definitions(amalgam_profile_handoff_test PRIVATE UNICODE _UNICODE)
+    target_link_libraries(amalgam_profile_handoff_test PRIVATE wininet advapi32)
+    add_test(NAME amalgam_profile_handoff_test COMMAND amalgam_profile_handoff_test)
+
+    add_executable(amalgam_official_launcher_guard_test
+        tests/official_launcher_guard_test.cpp
+        launcher/src/official_launcher_guard.cpp)
+    target_include_directories(amalgam_official_launcher_guard_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    target_compile_definitions(amalgam_official_launcher_guard_test PRIVATE UNICODE _UNICODE)
+    add_test(NAME amalgam_official_launcher_guard_test COMMAND amalgam_official_launcher_guard_test)
+
     add_executable(amalgam_net_test tests/net_test.cpp launcher/src/net.cpp)
     target_include_directories(amalgam_net_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src
                                                       ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -466,9 +498,19 @@ if(BUILD_TESTING)
     target_link_libraries(amalgam_net_test PRIVATE wininet advapi32 ws2_32)
     add_test(NAME amalgam_net_test COMMAND amalgam_net_test)
 
+    add_executable(amalgam_maven_artifact_test
+        tests/maven_artifact_test.cpp
+        launcher/src/maven_artifact.cpp
+        launcher/src/net.cpp)
+    target_include_directories(amalgam_maven_artifact_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    target_compile_definitions(amalgam_maven_artifact_test PRIVATE UNICODE _UNICODE)
+    target_link_libraries(amalgam_maven_artifact_test PRIVATE wininet advapi32)
+    add_test(NAME amalgam_maven_artifact_test COMMAND amalgam_maven_artifact_test)
+
     add_executable(amalgam_performance_test
         tests/performance_test.cpp
         launcher/src/performance.cpp
+        launcher/src/performance_cache.cpp
         launcher/src/net.cpp)
     target_include_directories(amalgam_performance_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
     target_compile_definitions(amalgam_performance_test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -492,7 +534,7 @@ if(BUILD_TESTING)
         launcher/src/json.cpp
         launcher/src/net.cpp)
     target_include_directories(amalgam_bedrock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
-    target_compile_definitions(amalgam_bedrock_test PRIVATE UNICODE _UNICODE)
+    target_compile_definitions(amalgam_bedrock_test PRIVATE UNICODE _UNICODE AML_BEDROCK_TESTING)
     target_link_libraries(amalgam_bedrock_test PRIVATE wininet advapi32 shell32 shlwapi)
     add_test(NAME amalgam_bedrock_test COMMAND amalgam_bedrock_test)
 
@@ -504,6 +546,16 @@ if(BUILD_TESTING)
     target_compile_definitions(amalgam_extract_test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(amalgam_extract_test PRIVATE wininet advapi32)
     add_test(NAME amalgam_extract_test COMMAND amalgam_extract_test)
+
+    add_executable(amalgam_natives_test
+        tests/natives_test.cpp
+        launcher/src/natives.cpp
+        launcher/src/extract.cpp
+        launcher/src/net.cpp)
+    target_include_directories(amalgam_natives_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    target_compile_definitions(amalgam_natives_test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(amalgam_natives_test PRIVATE wininet advapi32)
+    add_test(NAME amalgam_natives_test COMMAND amalgam_natives_test)
 
     add_executable(amalgam_auth_test
         tests/auth_test.cpp
@@ -529,6 +581,10 @@ if(BUILD_TESTING)
     add_executable(amalgam_ui_model_test tests/ui_model_test.cpp)
     target_include_directories(amalgam_ui_model_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
     add_test(NAME amalgam_ui_model_test COMMAND amalgam_ui_model_test)
+
+    add_executable(amalgam_ui_async_request_test tests/ui_async_request_test.cpp)
+    target_include_directories(amalgam_ui_async_request_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    add_test(NAME amalgam_ui_async_request_test COMMAND amalgam_ui_async_request_test)
 
     add_executable(amalgam_essentials_test tests/essentials_test.cpp)
     target_include_directories(amalgam_essentials_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
@@ -561,6 +617,18 @@ if(BUILD_TESTING)
     target_link_libraries(amalgam_server_providers_test PRIVATE wininet advapi32)
     add_test(NAME amalgam_server_providers_test COMMAND amalgam_server_providers_test)
 
+    add_executable(amalgam_server_provision_test
+        tests/server_provision_test.cpp
+        launcher/src/server_provision.cpp
+        launcher/src/server_providers.cpp
+        launcher/src/json.cpp
+        launcher/src/net.cpp
+        launcher/src/extract.cpp)
+    target_include_directories(amalgam_server_provision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/src)
+    target_compile_definitions(amalgam_server_provision_test PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(amalgam_server_provision_test PRIVATE wininet advapi32 shell32)
+    add_test(NAME amalgam_server_provision_test COMMAND amalgam_server_provision_test)
+
     add_executable(amalgam_cloud_hosting_test
         tests/cloud_hosting_test.cpp
         launcher/src/cloud_provider.cpp
@@ -587,6 +655,12 @@ if(BUILD_TESTING)
         set_tests_properties(amalgam_launcher_smoke PROPERTIES PASS_REGULAR_EXPRESSION "Java")
         add_test(NAME amalgam_prereq_smoke COMMAND amalgam_launcher --check-prereqs)
         set_tests_properties(amalgam_prereq_smoke PROPERTIES PASS_REGULAR_EXPRESSION "tar=OK")
+        add_test(NAME amalgam_fixture_inventory_test
+            COMMAND ${CMAKE_COMMAND}
+                "-DAMALGAM_LAUNCHER=$<TARGET_FILE:amalgam_launcher>"
+                "-DAMALGAM_MANIFEST=${CMAKE_CURRENT_SOURCE_DIR}/../tools/launcher-visual-qa-cases.full.json"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fixture_inventory_test.cmake)
+        set_tests_properties(amalgam_fixture_inventory_test PROPERTIES TIMEOUT 20)
     endif()
 
     find_program(AMALGAM_JAVAC javac
@@ -626,6 +700,16 @@ if(BUILD_TESTING)
                     "${CMAKE_CURRENT_BINARY_DIR}")
         set_tests_properties(amalgam_client_bridge_test PROPERTIES TIMEOUT 20)
     endif()
+
+    # assert() is what most of these tests check with, and the Release flags
+    # define NDEBUG, which compiles every one of them out: a suite that reports
+    # green whatever the code does. Undefine it for the test executables only.
+    get_property(amalgam_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(amalgam_target IN LISTS amalgam_all_targets)
+        if(amalgam_target MATCHES "_test$")
+            target_compile_options(${amalgam_target} PRIVATE /UNDEBUG)
+        endif()
+    endforeach()
 endif()
 
 # Install rules: copy launcher, DLL, and branding assets to CMAKE_INSTALL_PREFIX.

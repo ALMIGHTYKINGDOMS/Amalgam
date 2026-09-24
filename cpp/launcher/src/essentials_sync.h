@@ -51,6 +51,19 @@ private:
 // Join Manager - orchestrates the full join flow
 // ---------------------------------------------------------------------------
 
+// A render-safe snapshot of a long-running join.  The join itself can outlive
+// an Essentials dialog while Minecraft is running, so UI consumers identify
+// the exact operation by generation instead of treating a later status as a
+// completion for an older dialog.
+struct JoinProgressSnapshot {
+    uint64_t generation = 0;
+    bool active = false;
+    bool completed = false;
+    bool success = false;
+    float progress = 0.0f;
+    std::string status;
+};
+
 class JoinManager {
 public:
     static JoinManager& instance();
@@ -63,11 +76,14 @@ public:
 
     bool execute_join(const std::function<void(float, const std::string&)>& on_progress);
 
+    // Cancels preparation and invalidates visible progress.  Once Minecraft
+    // has been launched, its guest bridge remains alive until the game exits.
     void cancel_join();
 
     bool is_joining() const;
     float get_progress() const;
     std::string get_status_text() const;
+    JoinProgressSnapshot get_progress_snapshot() const;
 
 private:
     JoinManager() = default;
@@ -75,16 +91,36 @@ private:
     JoinManager(const JoinManager&) = delete;
     JoinManager& operator=(const JoinManager&) = delete;
 
+    bool is_active_generation(uint64_t generation) const;
+    bool report_progress(uint64_t generation, float progress,
+                         const std::string& status);
+    void finish_join(uint64_t generation, bool success,
+                     const std::string& status);
+
+    // Preparation data is written by the compatibility worker and copied by
+    // the long-lived join task.  Keep it separate from visible progress so a
+    // draw frame never races a worker while reading a string or vector.
+    mutable std::mutex prepared_mu_;
     CompatCheck compat_;
     SyncPlan sync_plan_;
-    std::atomic<bool> joining_{false};
-    std::atomic<float> progress_{0.0f};
-    std::string status_text_;
     std::string session_id_;
     std::string join_token_;
     std::string host_user_id_;
     std::string source_profile_id_;
-    std::unique_ptr<TcpDataChannelBridge> bridge_;
+
+    // A cancellation invalidates visible progress immediately, but a launch
+    // already handed to Minecraft still has to keep its guest bridge alive
+    // until the game process returns.  This flag prevents a second join from
+    // racing that intentionally long-lived process-owned job.
+    std::atomic_bool join_job_running_{false};
+    std::atomic_bool joining_{false};
+    std::atomic_uint64_t join_generation_{0};
+    mutable std::mutex progress_mu_;
+    uint64_t progress_generation_ = 0;
+    float progress_ = 0.0f;
+    std::string status_text_;
+    bool completed_ = false;
+    bool succeeded_ = false;
 };
 
 // ---------------------------------------------------------------------------

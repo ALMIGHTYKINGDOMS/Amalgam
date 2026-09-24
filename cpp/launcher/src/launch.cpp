@@ -5,8 +5,10 @@
 #include "instances.h"
 #include "java.h"
 #include "json.h"
+#include "maven_artifact.h"
 #include "model.h"
 #include "net.h"
+#include "natives.h"
 #include "performance.h"
 
 #include <windows.h>
@@ -131,42 +133,37 @@ std::string fetch_text(const std::wstring& url, std::string* err,
 bool download_maven_artifact(const std::wstring& url, const std::wstring& path,
                              std::function<bool(uint64_t, uint64_t)> progress,
                              std::string* err) {
-    std::vector<uint8_t> checksum_bytes;
-    if (!net::get(url + L".sha1", checksum_bytes, err)) return false;
-    std::string checksum(checksum_bytes.begin(), checksum_bytes.end());
-    while (!checksum.empty() && std::isspace(static_cast<unsigned char>(checksum.back())))
-        checksum.pop_back();
-    size_t first_space = checksum.find_first_of(" \t\r\n");
-    if (first_space != std::string::npos) checksum.resize(first_space);
-    if (checksum.size() != 40 ||
-        !std::all_of(checksum.begin(), checksum.end(), [](unsigned char c) { return std::isxdigit(c) != 0; })) {
-        if (err) *err = "Maven checksum is invalid";
-        return false;
-    }
-    for (char& c : checksum) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return net::download(url, path, std::move(progress), err, checksum, -1);
+    return maven_artifact::download_verified(url, path, std::move(progress), err);
 }
 
 std::wstring resolve_java_impl(int major, const launch::Options& opt,
                                const std::function<void(const std::wstring&)>& log,
                                std::string* err) {
+    const auto validate_configured = [&](const std::wstring& configured,
+                                        const std::wstring& source) -> std::wstring {
+        java::JavaRuntime runtime;
+        std::string validation_error;
+        if (!java::ValidateConfiguredRuntime(configured, major, &runtime, &validation_error)) {
+            if (err) {
+                *err = net::to_utf8(source) + " is not a usable Java " +
+                       std::to_string(major) + " runtime" +
+                       (validation_error.empty() ? std::string() : ": " + validation_error);
+            }
+            return std::wstring();
+        }
+        log(L"[launch] " + source + L" at " + runtime.home);
+        return runtime.home;
+    };
+
     if (!opt.java_path.empty()) {
-        std::wstring exe = opt.java_path;
-        size_t slash = exe.find_last_of(L"\\/");
-        if (slash != std::wstring::npos &&
-            exe.substr(slash + 1) == L"java.exe") {
-            exe = exe.substr(0, slash);
-        }
-        if (net::file_exists(exe + L"\\bin\\java.exe")) {
-            log(L"[launch] per-instance java at " + exe);
-            return exe;
-        }
+        // An explicit per-instance runtime is intentional configuration.  Do
+        // not silently substitute a discovered/downloaded Java if it points
+        // at the wrong major or an incomplete installation.
+        return validate_configured(opt.java_path, L"per-instance Java");
     }
     for (const auto& kv : opt.java_overrides) {
-        if (kv.first == major && !kv.second.empty() &&
-            net::file_exists(kv.second + L"\\bin\\java.exe")) {
-            return kv.second;
-        }
+        if (kv.first == major && !kv.second.empty())
+            return validate_configured(kv.second, L"configured Java override");
     }
     const std::wstring java_root = java::managed_root(opt.java_cache_dir);
     net::mkdirs(java_root);
@@ -498,8 +495,13 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
 
     std::wstring libs_dir = opt.base_dir + L"\\libraries";
     net::mkdirs(libs_dir);
-    std::wstring natives_dir = instance + L"\\natives";
-    net::mkdirs(natives_dir);
+    const std::wstring natives_root = instance + L"\\natives";
+    if (!net::mkdirs(natives_root)) {
+        if (err) *err = "cannot create native library directory";
+        return false;
+    }
+    std::wstring natives_dir;
+    std::vector<natives::Archive> native_archives;
 
     std::wstring jar_path = local_jar;
     if (jar_path.empty()) jar_path = instance + L"\\" + net::to_wide(opt.mc_id) + L".jar";
@@ -542,12 +544,8 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
                         return false;
                     }
                 }
-                std::string native_error;
-                if (!extract::zip(native_dst, natives_dir, &native_error)) {
-                    if (err) *err = native_error;
-                    return false;
-                }
-                log(L"[launch] extracted native classifier " + native_rel_path);
+                native_archives.push_back({native_dst, lib.extract_exclude});
+                log(L"[launch] queued native classifier " + native_rel_path);
             }
         }
         bool is_native = lib.name.find(":natives-windows") != std::string::npos;
@@ -595,16 +593,24 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
         }
         if (net::file_exists(dst)) {
             if (is_native) {
-                std::string ex_err;
-                if (!extract::zip(dst, natives_dir, &ex_err)) {
-                    if (err) *err = ex_err.empty() ? "native extraction failed" : ex_err;
-                    return false;
-                }
-                log(L"[launch] extracted natives from " + rel);
+                native_archives.push_back({dst, lib.extract_exclude});
+                log(L"[launch] queued natives from " + rel);
             } else {
                 classpath.push_back(dst);
             }
         }
+    }
+    {
+        std::string native_layout_error;
+        if (!natives::prepare_layout(natives_root, native_archives, &natives_dir,
+                                     &native_layout_error)) {
+            if (err) {
+                *err = native_layout_error.empty() ? "native extraction failed"
+                                                   : native_layout_error;
+            }
+            return false;
+        }
+        log(L"[launch] prepared immutable native layout " + natives_dir);
     }
     classpath.push_back(jar_path);
 
@@ -873,14 +879,41 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
     add_default_arg(L"--accessToken", net::to_wide(launch_access_token));
     add_default_arg(L"--userType", net::to_wide(launch_user_type));
 
+    // Validation always proved java.exe.  javaw.exe is preferable for the
+    // normal non-console path, but not every valid JRE distribution ships it.
+    // Fall back to the validated executable rather than handing CreateProcess
+    // a path that was never checked.
+    std::wstring java_executable = java_home + L"\\bin\\java.exe";
+    if (!opt.wait_for_exit) {
+        const std::wstring javaw = java_home + L"\\bin\\javaw.exe";
+        if (net::file_exists(javaw)) {
+            java_executable = javaw;
+        } else {
+            log(L"[launch] javaw.exe unavailable; using validated java.exe");
+        }
+    }
+
     std::vector<std::wstring> all;
-    all.push_back(java_home + L"\\bin\\" + (opt.wait_for_exit ? L"java.exe" : L"javaw.exe"));
+    all.push_back(java_executable);
     all.insert(all.end(), jvm.begin(), jvm.end());
     all.push_back(net::to_wide(vj.main_class));
     all.insert(all.end(), game.begin(), game.end());
 
     std::wstring cmdline = join(all);
     if (out) out->command_line = cmdline;
+
+    // CreateProcessW includes the terminating null in its documented 32,767
+    // character command-line limit.  Detect this before attempting a spawn so
+    // profiles with a pathological install path or classpath get a useful
+    // recovery message instead of opaque ERROR_FILENAME_EXCED_RANGE output.
+    constexpr size_t kWindowsCommandLineLimit = 32767;
+    if (cmdline.size() >= kWindowsCommandLineLimit) {
+        if (err) {
+            *err = "game launch command is too long for Windows (32,767 characters); "
+                   "shorten the game/instance path or reduce installed mods";
+        }
+        return false;
+    }
 
     std::wstring mutable_cmd(cmdline.size() + 1, L'\0');
     wcscpy_s(mutable_cmd.data(), mutable_cmd.size(), cmdline.c_str());
@@ -914,7 +947,7 @@ bool run(const Options& opt, const std::function<void(const std::wstring&)>& log
             }
         }
     }
-    if (!CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr,
+    if (!CreateProcessW(java_executable.c_str(), mutable_cmd.data(), nullptr, nullptr,
                         child_log != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW, nullptr,
                         instance.c_str(), &si, &pi)) {
         if (child_log != INVALID_HANDLE_VALUE) CloseHandle(child_log);

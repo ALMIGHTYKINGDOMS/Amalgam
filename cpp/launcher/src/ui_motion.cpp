@@ -6,9 +6,9 @@ namespace aml::ui {
 
 namespace {
 
-// The reduced-motion preference lives in the theme UI state. Read it through
-// a small indirection so the motion engine does not need to know about the
-// theme module directly. The theme_ui module registers its flag here.
+// The reduced-motion preference is applied from the persisted launcher config
+// through a small indirection so the motion engine does not need to depend on
+// the theme module or on storage.
 bool g_reduced_motion = false;
 
 // How many easing sweeps are in flight this frame. Written and read on the UI

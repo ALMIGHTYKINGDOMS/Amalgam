@@ -1,9 +1,9 @@
-import { updateSession } from "./util/state.js";
+import { updatePlayerSession } from "./util/state.js";
 
 export function readPlayerState(player) {
   const dimension = player?.dimension?.id ?? "unknown";
   const worldName = player?.getTags?.().find((tag) => tag.startsWith("amalgam:world="))?.slice(15) || "Current World";
-  updateSession({
+  updatePlayerSession(player, {
     playerName: player?.name ?? "Player",
     dimension,
     worldName,

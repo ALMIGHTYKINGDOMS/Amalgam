@@ -1,7 +1,6 @@
 #include "essentials_ui.h"
 #include "ui_internal.h"
 #include "ui_model.h"
-#include "loading_screen.h"
 #include "essentials.h"
 #include "essentials_manager.h"
 #include "essentials_session.h"
@@ -14,8 +13,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <exception>
+#include <functional>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 namespace aml::essentials {
 using namespace aml::ui;
@@ -47,10 +52,14 @@ struct EssentialsUIState {
     bool invite_show_online_only = false;
 
     bool join_dialog_open = false;
+    uint64_t join_dialog_generation = 0;
+    uint64_t join_intent_generation = 0;
     bool join_compat_shown = false;
     CompatCheck join_compat;
     SyncPlan join_sync_plan;
     bool join_syncing = false;
+    uint64_t join_execution_generation = 0;
+    std::string join_status_text;
     std::string join_session_id;
     std::string join_address;
     std::string join_token;
@@ -99,6 +108,211 @@ struct EssentialsUIState {
 static EssentialsUIState& get_essentials_ui_state() {
     static EssentialsUIState state;
     return state;
+}
+
+// Opening a fresh dialog invalidates an analysis result for any dialog the
+// player previously closed.  Reopening an already-running join deliberately
+// keeps its generation so it can display that task's guarded progress.
+static void open_fresh_join_dialog(EssentialsUIState& ui) {
+    ++ui.join_intent_generation;
+    if (ui.join_intent_generation == 0) ++ui.join_intent_generation;
+    ++ui.join_dialog_generation;
+    if (ui.join_dialog_generation == 0) ++ui.join_dialog_generation;
+    ui.join_dialog_open = true;
+    ui.join_compat_shown = false;
+    ui.join_step = 0;
+    ui.join_progress = 0.0f;
+    ui.join_status_text.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Account-backed UI work
+// ---------------------------------------------------------------------------
+//
+// Every manager operation below can reach Supabase, a local profile, or the
+// Essentials transport.  ImGui draw functions must only schedule that work;
+// the result comes back through UiState's joined worker list.  A single
+// serialized request lane also avoids issuing contradictory account mutations
+// (for example remove and block) against the same social graph at once.
+
+static bool essentials_request_is_working(const UiState& st,
+                                          const std::string& action) {
+    const auto snapshot = snapshot_async_ui_request(st.essentials_async_request);
+    return snapshot.working && snapshot.action == action;
+}
+
+static bool essentials_request_lane_busy(const UiState& st) {
+    return snapshot_async_ui_request(st.essentials_async_request).working;
+}
+
+static bool essentials_action_starts_with(const std::string& action,
+                                          const char* prefix) {
+    const size_t length = std::strlen(prefix);
+    return action.size() >= length && action.compare(0, length, prefix) == 0;
+}
+
+static bool essentials_request_failed(const UiState& st,
+                                      const std::string& action) {
+    const auto snapshot = snapshot_async_ui_request(st.essentials_async_request);
+    return !snapshot.working && snapshot.has_result &&
+           snapshot.action == action && !snapshot.result.success;
+}
+
+static void draw_essentials_request_feedback(const UiState& st,
+                                             const std::string& action,
+                                             const char* working_label) {
+    const auto snapshot = snapshot_async_ui_request(st.essentials_async_request);
+    if (snapshot.action != action) return;
+    if (snapshot.working) {
+        ImGui::TextColored(k.muted, "%s", working_label);
+    } else if (snapshot.has_result && !snapshot.result.success &&
+               !snapshot.result.detail.empty()) {
+        ImGui::TextColored(k.red, "%s", snapshot.result.detail.c_str());
+    }
+}
+
+static bool start_essentials_request(
+    UiState& st, const std::string& action,
+    std::function<AsyncUiRequestResult()> work) {
+    uint64_t generation = 0;
+    if (!begin_async_ui_request(st.essentials_async_request, action, &generation)) {
+        return false;
+    }
+
+    spawn_worker(st, std::thread([&st, action, generation,
+                                  work = std::move(work)]() mutable {
+        AsyncUiRequestResult result;
+        try {
+            result = work();
+        } catch (const std::exception&) {
+            result.success = false;
+            result.title = "Essentials request failed";
+            result.detail = "The request ended unexpectedly. Please try again.";
+        } catch (...) {
+            result.success = false;
+            result.title = "Essentials request failed";
+            result.detail = "The request ended unexpectedly. Please try again.";
+        }
+        // UiState remains alive until join_workers() returns.  During shutdown
+        // there is no visible surface left to consume a result, so leave it
+        // unpublished rather than resurrecting an obsolete UI state.
+        if (!st.shutting_down.load()) {
+            complete_async_ui_request(st.essentials_async_request, action,
+                                      generation, std::move(result));
+        }
+    }));
+    return true;
+}
+
+static void consume_essentials_request_result(UiState& st) {
+    AsyncUiRequestSnapshot completed;
+    if (!take_async_ui_request_result(st.essentials_async_request, &completed)) {
+        return;
+    }
+
+    auto& ui = get_essentials_ui_state();
+    const auto& result = completed.result;
+    if (result.success) {
+        if (completed.action == "friend-request") {
+            ui.add_friend_input.clear();
+            ui.show_add_friend = false;
+            ui.quick_add_friend = false;
+        } else if (essentials_action_starts_with(completed.action, "invite-accept:")) {
+            const uint64_t join_intent_generation = result.number_a > 0
+                ? static_cast<uint64_t>(result.number_a) : 0;
+            if (!ui.join_syncing && join_intent_generation != 0 &&
+                join_intent_generation == ui.join_intent_generation) {
+                ui.join_session_id = result.payload_a;
+                ui.join_address = result.payload_b;
+                ui.join_token = result.payload_c;
+                if (!ui.join_address.empty() && !ui.join_token.empty()) {
+                    open_fresh_join_dialog(ui);
+                }
+            }
+        } else if (completed.action == "host-start") {
+            ui.host_dialog_open = false;
+        } else if (completed.action == "invite-send") {
+            ui.selected_invitees.clear();
+            ui.invite_dialog_open = false;
+        } else if (completed.action == "join-analyze") {
+            const uint64_t dialog_generation = result.number_a > 0
+                ? static_cast<uint64_t>(result.number_a) : 0;
+            if (ui.join_dialog_open && dialog_generation != 0 &&
+                dialog_generation == ui.join_dialog_generation) {
+                ui.join_session_id = result.payload_a;
+                ui.join_address = result.payload_b;
+                auto& joins = JoinManager::instance();
+                ui.join_compat = joins.get_current_compat();
+                ui.join_sync_plan = joins.get_current_sync_plan();
+                ui.join_compat_shown = true;
+            }
+        } else if (completed.action == "join-execute") {
+            // The joined request only starts the intentionally long-lived
+            // JoinManager task.  Its own snapshot carries the matching
+            // generation and is the sole source of later progress updates.
+            ui.join_execution_generation = result.number_a > 0
+                ? static_cast<uint64_t>(result.number_a) : 0;
+            ui.join_syncing = ui.join_execution_generation != 0;
+            ui.join_status_text = ui.join_syncing
+                ? "Starting the session join..." : "Could not start the session join.";
+        } else if (completed.action == "status-set" && !result.payload_a.empty()) {
+            const int status = std::clamp(std::atoi(result.payload_a.c_str()), 0, 6);
+            ui.self_status = static_cast<FriendStatus>(status);
+            ui.status_editor_open = false;
+        } else if (completed.action == "host-stop") {
+            ui.session_manager_open = false;
+        }
+        if (!result.title.empty()) {
+            push_notice(st, result.warning ? ui_model::NoticeLevel::Warning
+                                            : ui_model::NoticeLevel::Success,
+                        result.title,
+                        result.detail);
+        }
+    } else {
+        if (completed.action == "join-execute") {
+            ui.join_syncing = false;
+            ui.join_execution_generation = 0;
+            ui.join_status_text = "Could not start the session join.";
+        }
+        if (!result.title.empty()) {
+        push_notice(st, ui_model::NoticeLevel::Error, result.title,
+                    result.detail.empty() ? "Please try again." : result.detail);
+        }
+    }
+}
+
+static void refresh_join_progress(UiState& st) {
+    auto& ui = get_essentials_ui_state();
+    if (!ui.join_syncing || ui.join_execution_generation == 0) return;
+
+    const JoinProgressSnapshot progress =
+        JoinManager::instance().get_progress_snapshot();
+    // A cancelled or superseded task is not allowed to alter a newer dialog's
+    // UI.  The generation comes from the joined request that initiated this
+    // exact task, rather than from the visual dialog itself.
+    if (progress.generation != ui.join_execution_generation) {
+        ui.join_syncing = false;
+        return;
+    }
+
+    ui.join_progress = std::clamp(progress.progress, 0.0f, 1.0f);
+    if (!progress.status.empty()) ui.join_status_text = progress.status;
+    if (progress.active) {
+        ui.join_step = std::clamp(static_cast<int>(ui.join_progress * 4.0f), 0, 3);
+        return;
+    }
+
+    if (progress.completed) {
+        ui.join_syncing = false;
+        const std::string detail = progress.status.empty()
+            ? (progress.success ? "The Minecraft session completed." :
+                                "The session could not be completed.")
+            : progress.status;
+        push_notice(st, progress.success ? ui_model::NoticeLevel::Success
+                                         : ui_model::NoticeLevel::Error,
+                    progress.success ? "Minecraft session complete" : "Session join failed",
+                    detail);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +454,701 @@ static void draw_connection_card(UiState& st);
 static void draw_friend_profile_panel(UiState& st);
 static void draw_essentials_empty_state(UiState& st);
 static void draw_essentials_info_card(UiState& st);
+
+// ---------------------------------------------------------------------------
+// Visual-review fixture — fully local Essentials façade
+// ---------------------------------------------------------------------------
+//
+// Essentials normally composes its views from friends, sessions, invites, and
+// account managers.  Some of those managers refresh remote state as a side
+// effect of a getter when a launcher process has an already-authenticated
+// account.  A visual fixture must never depend on, request, or disclose that
+// state.  Keep every Essentials fixture in this small, explicit façade rather
+// than trying to guard individual getters spread across the live UI.
+
+static int fixture_essentials_tab(const std::string& fixture_case) {
+    if (fixture_case == "essentials-invites") return 1;
+    if (fixture_case == "essentials-sessions" ||
+        fixture_case == "essentials-session-manager" ||
+        fixture_case == "essentials-session-manager-working" ||
+        fixture_case == "essentials-session-manager-error") return 2;
+    if (fixture_case == "essentials-notifications") return 3;
+    if (fixture_case == "essentials-messages") return 4;
+    if (fixture_case == "essentials-parties") return 5;
+    return 0;
+}
+
+static void fixture_essentials_tab_pill(const char* label, bool active, bool hot) {
+    const ImVec2 text_size = ImGui::CalcTextSize(label);
+    const ImVec2 size(text_size.x + ui_px(28.0f), ui_px(34.0f));
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(pos, pos + size, c32(active ? k.surface2 : ImVec4(0, 0, 0, 0)),
+                      ui_px(8.0f));
+    if (active)
+        dl->AddRect(pos, pos + size, c32(k.brand), ui_px(8.0f), 0, ui_px(1.5f));
+    if (hot)
+        dl->AddCircleFilled(pos + ImVec2(size.x - ui_px(9.0f), ui_px(8.0f)),
+                            ui_px(3.0f), c32(k.brand));
+    ImGui::InvisibleButton((std::string("##fixture_ess_tab_") + label).c_str(), size);
+    ImGui::PushFont(active ? f_bold : f_body);
+    dl->AddText(pos + ImVec2(ui_px(14.0f),
+                             (size.y - ImGui::GetTextLineHeight()) * 0.5f),
+                c32(active ? k.text : k.muted), label);
+    ImGui::PopFont();
+}
+
+enum class FixtureEssentialsDialogKind {
+    Host,
+    Invite,
+    Join,
+    SessionManager,
+};
+
+enum class FixtureEssentialsDialogState {
+    Ready,
+    Working,
+    Error,
+    Checking,
+    Incompatible,
+    Syncing,
+};
+
+// Fixture dialog routes intentionally use copied literals rather than any of
+// the live Essentials types.  They must remain safe even if a launcher happens
+// to start with an authenticated account and active local session.
+struct FixtureEssentialsDialog {
+    FixtureEssentialsDialogKind kind;
+    FixtureEssentialsDialogState state;
+    const char* title;
+    const char* subtitle;
+};
+
+static const FixtureEssentialsDialog* fixture_essentials_dialog_for_case(
+    const std::string& fixture_case) {
+    static constexpr FixtureEssentialsDialog kHostReady{
+        FixtureEssentialsDialogKind::Host, FixtureEssentialsDialogState::Ready,
+        "Host a world", "Set up a private session for your friends."};
+    static constexpr FixtureEssentialsDialog kHostWorking{
+        FixtureEssentialsDialogKind::Host, FixtureEssentialsDialogState::Working,
+        "Host a world", "Preparing the selected world for a hosted session."};
+    static constexpr FixtureEssentialsDialog kHostError{
+        FixtureEssentialsDialogKind::Host, FixtureEssentialsDialogState::Error,
+        "Host a world", "Review the saved world and Essentials address before retrying."};
+    static constexpr FixtureEssentialsDialog kInviteReady{
+        FixtureEssentialsDialogKind::Invite, FixtureEssentialsDialogState::Ready,
+        "Invite friends", "Choose people who can join this hosted world."};
+    static constexpr FixtureEssentialsDialog kInviteWorking{
+        FixtureEssentialsDialogKind::Invite, FixtureEssentialsDialogState::Working,
+        "Invite friends", "Sending invitations to the selected friends."};
+    static constexpr FixtureEssentialsDialog kInviteError{
+        FixtureEssentialsDialogKind::Invite, FixtureEssentialsDialogState::Error,
+        "Invite friends", "Review the session and selected friends before retrying."};
+    static constexpr FixtureEssentialsDialog kJoinReady{
+        FixtureEssentialsDialogKind::Join, FixtureEssentialsDialogState::Ready,
+        "Join a session", "Use the address and code shared by the host."};
+    static constexpr FixtureEssentialsDialog kJoinChecking{
+        FixtureEssentialsDialogKind::Join, FixtureEssentialsDialogState::Checking,
+        "Join a session", "Checking the session and local profile compatibility."};
+    static constexpr FixtureEssentialsDialog kJoinError{
+        FixtureEssentialsDialogKind::Join, FixtureEssentialsDialogState::Error,
+        "Join a session", "The session could not be checked with the supplied address and code."};
+    static constexpr FixtureEssentialsDialog kJoinIncompatible{
+        FixtureEssentialsDialogKind::Join, FixtureEssentialsDialogState::Incompatible,
+        "Join a session", "This session needs a compatible local profile before it can be joined."};
+    static constexpr FixtureEssentialsDialog kJoinSyncing{
+        FixtureEssentialsDialogKind::Join, FixtureEssentialsDialogState::Syncing,
+        "Join a session", "Synchronizing the compatible local profile before launch."};
+    static constexpr FixtureEssentialsDialog kSessionManagerReady{
+        FixtureEssentialsDialogKind::SessionManager, FixtureEssentialsDialogState::Ready,
+        "Session manager", "Review connection health and participant access."};
+    static constexpr FixtureEssentialsDialog kSessionManagerWorking{
+        FixtureEssentialsDialogKind::SessionManager, FixtureEssentialsDialogState::Working,
+        "Session manager", "Applying the requested session setting."};
+    static constexpr FixtureEssentialsDialog kSessionManagerError{
+        FixtureEssentialsDialogKind::SessionManager, FixtureEssentialsDialogState::Error,
+        "Session manager", "The requested session setting could not be applied."};
+
+    if (fixture_case == "essentials-host-dialog") return &kHostReady;
+    if (fixture_case == "essentials-host-dialog-working") return &kHostWorking;
+    if (fixture_case == "essentials-host-dialog-error") return &kHostError;
+    if (fixture_case == "essentials-invite-dialog") return &kInviteReady;
+    if (fixture_case == "essentials-invite-dialog-working") return &kInviteWorking;
+    if (fixture_case == "essentials-invite-dialog-error") return &kInviteError;
+    if (fixture_case == "essentials-join-dialog") return &kJoinReady;
+    if (fixture_case == "essentials-join-dialog-checking") return &kJoinChecking;
+    if (fixture_case == "essentials-join-dialog-error") return &kJoinError;
+    if (fixture_case == "essentials-join-dialog-incompatible") return &kJoinIncompatible;
+    if (fixture_case == "essentials-join-dialog-syncing") return &kJoinSyncing;
+    if (fixture_case == "essentials-session-manager") return &kSessionManagerReady;
+    if (fixture_case == "essentials-session-manager-working") return &kSessionManagerWorking;
+    if (fixture_case == "essentials-session-manager-error") return &kSessionManagerError;
+    return nullptr;
+}
+
+static void draw_fixture_essentials_local_notice() {
+    ImGui::TextColored(k.brand_hov,
+                       "LOCAL VISUAL FIXTURE — account, session, profile, and network services are not used.");
+    ImGui::TextColored(k.muted,
+                       "All example fields and action controls are disabled; this preview cannot change anything.");
+}
+
+static void draw_fixture_join_compat_row(const char* label, const char* state,
+                                         const char* detail, const ImVec4& color) {
+    ImGui::TextColored(k.text, "%s", label);
+    ImGui::SameLine(ui_px(166.0f));
+    ImGui::TextColored(color, "%s", state);
+    if (detail && detail[0] != '\0') {
+        ImGui::SameLine(ui_px(300.0f));
+        ImGui::TextColored(k.muted, "%s", detail);
+    }
+}
+
+static void draw_fixture_essentials_dialog(const std::string& fixture_case) {
+    const auto* dialog = fixture_essentials_dialog_for_case(fixture_case);
+
+    // This mirrors the dedicated friend-profile fixture: Close preview must be
+    // useful, but changing a local visual route must never read or change the
+    // live EssentialsUIState.
+    static std::string visible_fixture_case;
+    static bool preview_open = false;
+    if (visible_fixture_case != fixture_case) {
+        visible_fixture_case = fixture_case;
+        preview_open = dialog != nullptr;
+    }
+    if (!dialog || !preview_open) return;
+
+    constexpr bool kFixtureActionDisabled = true;
+    static std::string fixture_world = "Forsaken World SMP";
+    static std::string fixture_alias = "forsaken-world";
+    static std::string fixture_description = "A local sample session for visual review.";
+    static std::string fixture_address = "forsaken-world.amalgam-essentials";
+    static std::string fixture_code = "ORBIT-7Q";
+
+    const char* popup_name = "Essentials dialog preview###essentials_fixture_dialog";
+    float desired_height = 430.0f;
+    if (dialog->kind == FixtureEssentialsDialogKind::Host) {
+        desired_height = dialog->state == FixtureEssentialsDialogState::Ready
+            ? 520.0f : 540.0f;
+    } else if (dialog->kind == FixtureEssentialsDialogKind::Invite) {
+        desired_height = dialog->state == FixtureEssentialsDialogState::Ready
+            ? 410.0f : 480.0f;
+    } else if (dialog->kind == FixtureEssentialsDialogKind::Join) {
+        const bool expanded_join_detail =
+            dialog->state == FixtureEssentialsDialogState::Incompatible ||
+            dialog->state == FixtureEssentialsDialogState::Syncing;
+        desired_height = expanded_join_detail ? 500.0f : 440.0f;
+    }
+    ImGui::OpenPopup(popup_name);
+    set_next_adaptive_window(560.0f, desired_height, 360.0f, 280.0f,
+                             ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(popup_name, &preview_open,
+                                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                                 ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoScrollbar |
+                                 ImGuiWindowFlags_NoScrollWithMouse)) {
+        return;
+    }
+
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted(dialog->title);
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted, "%s", dialog->subtitle);
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // State-specific detail can outgrow a compact modal, especially at a
+    // higher DPI.  Keep the disclosure and controls in the parent so the
+    // only scroll owner is this intentional detail region and Close preview
+    // never becomes unreachable below an outer popup scroll range.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float footer_height = std::max(
+        ui_px(112.0f),
+        2.0f * ImGui::GetTextLineHeightWithSpacing() +
+            std::max(ui_px(32.0f), ImGui::GetFrameHeight()) +
+            5.0f * style.ItemSpacing.y + style.WindowPadding.y);
+    const bool detail_visible = ImGui::BeginChild(
+        "##fixture_essentials_dialog_detail", ImVec2(0.0f, -footer_height),
+        ImGuiChildFlags_None);
+
+    if (detail_visible && dialog->kind == FixtureEssentialsDialogKind::Host) {
+        ImGui::TextUnformatted("World name");
+        ImGui::BeginDisabled(kFixtureActionDisabled);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##fixture_host_world", &fixture_world);
+        ImGui::EndDisabled();
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Essentials address");
+        ImGui::BeginDisabled(kFixtureActionDisabled);
+        ImGui::SetNextItemWidth(ui_px(260.0f));
+        ImGui::InputText("##fixture_host_alias", &fixture_alias);
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, ui_px(8.0f));
+        ImGui::TextColored(k.muted, ".amalgam-essentials");
+        ImGui::TextColored(k.muted, "3–32 lowercase letters, numbers, and hyphens");
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted, "PRIVACY");
+        ImGui::TextColored(k.text, "Friends only  •  8 player limit");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Description");
+        ImGui::BeginDisabled(kFixtureActionDisabled);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextMultiline("##fixture_host_description", &fixture_description,
+                                  ImVec2(-1, ui_px(48.0f)));
+        ImGui::EndDisabled();
+
+        if (dialog->state == FixtureEssentialsDialogState::Working) {
+            ImGui::Spacing();
+            ImGui::TextColored(k.brand, "Starting hosted session…");
+            ImGui::TextColored(k.muted,
+                               "This static preview does not start a local world or transport.");
+        } else if (dialog->state == FixtureEssentialsDialogState::Error) {
+            ImGui::Spacing();
+            card_begin("##fixture_host_error", ImVec2(-1, 0));
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.red, "Could not start hosting");
+            ImGui::PopFont();
+            ImGui::TextWrapped("The sample world was not shared. Verify the world and address, then retry.");
+            card_end();
+        }
+    } else if (detail_visible && dialog->kind == FixtureEssentialsDialogKind::Invite) {
+        ImGui::TextColored(k.muted, "HOSTED SESSION");
+        ImGui::TextColored(k.text, "Forsaken World SMP");
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted, "SELECTED FRIENDS (3)");
+        ImGui::BeginDisabled(kFixtureActionDisabled);
+        const char* selected_friends[] = {"Alex", "MiraBuilds", "AveryStone"};
+        for (const char* friend_name : selected_friends) {
+            bool selected = true;
+            ImGui::Checkbox(friend_name, &selected);
+            ImGui::SameLine();
+            ImGui::TextColored(k.green, "● Online");
+        }
+        ImGui::EndDisabled();
+
+        if (dialog->state == FixtureEssentialsDialogState::Working) {
+            ImGui::Spacing();
+            ImGui::TextColored(k.brand, "Sending 3 invitations…");
+            ImGui::TextColored(k.muted,
+                               "This local preview is not sending messages or session invitations.");
+        } else if (dialog->state == FixtureEssentialsDialogState::Error) {
+            ImGui::Spacing();
+            card_begin("##fixture_invite_error", ImVec2(-1, 0));
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.red, "Could not send invites");
+            ImGui::PopFont();
+            ImGui::TextWrapped("No sample invitations were sent. Confirm the session is available, then retry.");
+            card_end();
+        }
+    } else if (detail_visible && dialog->kind == FixtureEssentialsDialogKind::Join) {
+        ImGui::TextUnformatted("Essentials address");
+        ImGui::BeginDisabled(kFixtureActionDisabled);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##fixture_join_address", &fixture_address);
+        ImGui::TextUnformatted("Join code");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##fixture_join_code", &fixture_code, ImGuiInputTextFlags_Password);
+        ImGui::EndDisabled();
+        ImGui::Spacing();
+
+        if (dialog->state == FixtureEssentialsDialogState::Checking) {
+            ImGui::TextColored(k.brand, "Checking the session and local profile compatibility…");
+            ImGui::TextColored(k.muted, "No address lookup, profile scan, or compatibility task is running.");
+        } else if (dialog->state == FixtureEssentialsDialogState::Error) {
+            card_begin("##fixture_join_error", ImVec2(-1, 0));
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.red, "Could not find session");
+            ImGui::PopFont();
+            ImGui::TextWrapped("The sample address could not be resolved. No join was started; you can retry safely.");
+            card_end();
+        } else if (dialog->state == FixtureEssentialsDialogState::Incompatible) {
+            ImGui::TextColored(k.brand, "COMPATIBILITY CHECK");
+            ImGui::Spacing();
+            draw_fixture_join_compat_row("Minecraft version", "✓ Compatible",
+                                         "1.20.1 vs 1.20.1", k.green);
+            draw_fixture_join_compat_row("Loader", "✓ Compatible", "Fabric vs Fabric", k.green);
+            draw_fixture_join_compat_row("Mods", "✕ Incompatible", "1 required mod missing", k.red);
+            ImGui::Spacing();
+            ImGui::TextColored(k.red, "Missing mod: Amalgam Essentials Bridge 2.4.0");
+            ImGui::TextColored(k.red, "Session is incompatible. Cannot join.");
+        } else if (dialog->state == FixtureEssentialsDialogState::Syncing) {
+            ImGui::TextColored(k.brand, "COMPATIBILITY CHECK");
+            draw_fixture_join_compat_row("Minecraft version", "✓ Compatible",
+                                         "1.20.1 vs 1.20.1", k.green);
+            draw_fixture_join_compat_row("Loader", "✓ Compatible", "Fabric vs Fabric", k.green);
+            draw_fixture_join_compat_row("Mods", "✓ Compatible", "2 updates queued", k.green);
+            ImGui::Spacing();
+            ImGui::TextColored(k.brand, "Syncing required mods (2 of 4)…");
+            progress_bar(0.58f, ImVec2(-1, ui_px(12.0f)));
+            ImGui::TextColored(k.muted,
+                               "Static progress only — no files are being downloaded or modified.");
+        } else {
+            ImGui::TextColored(k.muted,
+                               "Check compatibility before syncing or launching Minecraft.");
+        }
+    } else if (detail_visible) {
+        ImGui::TextColored(k.brand, "SESSION: Forsaken World SMP");
+        ImGui::Spacing();
+        ImGui::TextColored(k.text, "State");
+        ImGui::SameLine(ui_px(170.0f));
+        ImGui::TextColored(k.green, "● Online");
+        ImGui::TextColored(k.text, "Players");
+        ImGui::SameLine(ui_px(170.0f));
+        ImGui::TextColored(k.text, "4 / 12");
+        ImGui::TextColored(k.text, "Privacy");
+        ImGui::SameLine(ui_px(170.0f));
+        ImGui::TextColored(k.text, "Friends only");
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted, "CONNECTED PLAYERS");
+        ImGui::BeginDisabled(kFixtureActionDisabled);
+        bool sample_player = true;
+        ImGui::Checkbox("Alex  •  connected", &sample_player);
+        ImGui::SameLine();
+        ghost_button("Kick", ImVec2(ui_px(60.0f), ui_px(24.0f)), true);
+        ImGui::EndDisabled();
+
+        if (dialog->state == FixtureEssentialsDialogState::Working) {
+            ImGui::Spacing();
+            ImGui::TextColored(k.brand, "Applying session setting…");
+            ImGui::TextColored(k.muted,
+                               "This local preview is not changing privacy, players, or a hosted world.");
+        } else if (dialog->state == FixtureEssentialsDialogState::Error) {
+            ImGui::Spacing();
+            card_begin("##fixture_session_manager_error", ImVec2(-1, 0));
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.red, "Could not update session settings");
+            ImGui::PopFont();
+            ImGui::TextWrapped("The sample session remains unchanged. You can retry safely.");
+            card_end();
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    draw_fixture_essentials_local_notice();
+    ImGui::Spacing();
+    if (ghost_button("Close preview", ImVec2(ui_px(124.0f), ui_px(32.0f)))) {
+        preview_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine(0, ui_px(8.0f));
+
+    const bool working = dialog->state == FixtureEssentialsDialogState::Working ||
+                         dialog->state == FixtureEssentialsDialogState::Checking ||
+                         dialog->state == FixtureEssentialsDialogState::Syncing;
+    const bool error = dialog->state == FixtureEssentialsDialogState::Error;
+    const char* action_label = "Apply";
+    if (dialog->kind == FixtureEssentialsDialogKind::Host) {
+        action_label = working ? "Starting…" : (error ? "Retry hosting" : "Start hosting");
+    } else if (dialog->kind == FixtureEssentialsDialogKind::Invite) {
+        action_label = working ? "Sending…" : (error ? "Retry invites" : "Send invites (3)");
+    } else if (dialog->kind == FixtureEssentialsDialogKind::Join) {
+        action_label = working ? (dialog->state == FixtureEssentialsDialogState::Checking
+                                      ? "Checking…" : "Syncing…")
+                    : (error ? "Retry check" : "Sync & join");
+    } else {
+        action_label = working ? "Saving…" : (error ? "Retry update" : "Apply changes");
+    }
+    primary_button(action_label, ImVec2(ui_px(152.0f), ui_px(32.0f)),
+                   working, kFixtureActionDisabled);
+    ImGui::EndPopup();
+}
+
+// The live friend-row menu performs profile navigation and relationship
+// mutations.  This fixture reproduces its visual hierarchy with no callback
+// or selected-friend state, so context-menu evidence stays local and inert.
+static void draw_fixture_friend_context_menu(const std::string& fixture_case) {
+    constexpr const char* kFixtureCase = "essentials-friend-context-menu";
+    static std::string visible_fixture_case;
+    static bool preview_open = false;
+    if (visible_fixture_case != fixture_case) {
+        visible_fixture_case = fixture_case;
+        preview_open = fixture_case == kFixtureCase;
+    }
+    if (fixture_case != kFixtureCase || !preview_open) return;
+
+    constexpr const char* popup_name = "Friend options###essentials_fixture_friend_context";
+    const ImVec2 page_anchor = ImGui::GetWindowPos() + ImGui::GetWindowContentRegionMin();
+    ImGui::SetNextWindowPos(page_anchor + ImVec2(ui_px(38.0f), ui_px(198.0f)),
+                            ImGuiCond_Appearing);
+    ImGui::OpenPopup(popup_name);
+    if (!ImGui::BeginPopup(popup_name, ImGuiWindowFlags_NoSavedSettings)) return;
+
+    ImGui::TextColored(k.muted, "MiraBuilds");
+    ImGui::Separator();
+    ImGui::BeginDisabled(true);
+    ImGui::MenuItem("View Profile");
+    ImGui::MenuItem("Message");
+    ImGui::Separator();
+    ImGui::MenuItem("Remove Friend");
+    ImGui::MenuItem("Block User");
+    ImGui::EndDisabled();
+    ImGui::Separator();
+    ImGui::TextColored(k.brand_hov, "LOCAL FIXTURE — actions disabled");
+    if (ImGui::MenuItem("Close preview")) {
+        preview_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// Friend-profile routes deliberately render beside the normal fixture façade
+// rather than through the live account-backed profile panel. That panel
+// resolves a selected account friend and can begin account-backed work; visual
+// evidence needs a representative, entirely local composition instead.
+static bool is_fixture_friend_profile_case(const std::string& fixture_case) {
+    return fixture_case == "essentials-friend-profile" ||
+           fixture_case == "essentials-friend-profile-remove-working" ||
+           fixture_case == "essentials-friend-profile-remove-error" ||
+           fixture_case == "essentials-friend-profile-block-working" ||
+           fixture_case == "essentials-friend-profile-block-error";
+}
+
+static void draw_fixture_friend_profile(const std::string& fixture_case) {
+    const bool friend_profile_route = is_fixture_friend_profile_case(fixture_case);
+
+    // A capture process can traverse more than one fixture case. Reset local
+    // visibility whenever its route changes, including through another
+    // Essentials fixture, while allowing Close preview to work normally for
+    // the active route without changing live Essentials state.
+    static std::string visible_fixture_case;
+    static bool preview_open = false;
+    if (visible_fixture_case != fixture_case) {
+        visible_fixture_case = fixture_case;
+        preview_open = friend_profile_route;
+    }
+    if (!friend_profile_route || !preview_open) return;
+
+    const bool remove_working = fixture_case == "essentials-friend-profile-remove-working";
+    const bool remove_error = fixture_case == "essentials-friend-profile-remove-error";
+    const bool block_working = fixture_case == "essentials-friend-profile-block-working";
+    const bool block_error = fixture_case == "essentials-friend-profile-block-error";
+
+    // These are intentionally plain constants, not an EssentialsFriend. That
+    // keeps this visual-only presenter incapable of loading or disclosing an
+    // account's actual social graph.
+    struct FixtureFriendProfile {
+        const char* display_name;
+        const char* username;
+        const char* presence;
+        const char* current_profile;
+        const char* game_version;
+    };
+    constexpr FixtureFriendProfile friend_profile{
+        "MiraBuilds", "@mirabuilds", "Online — playing", "Forsaken World SMP", "MC 1.20.1 • Fabric"
+    };
+
+    constexpr const char* popup_name =
+        "Friend Profile###essentials_fixture_friend_profile";
+    ImGui::OpenPopup(popup_name);
+    ImGui::SetNextWindowSize(ImVec2(
+        std::min(ui_px(520.0f), ImGui::GetMainViewport()->WorkSize.x - ui_px(40.0f)),
+        std::min(ui_px(420.0f), ImGui::GetMainViewport()->WorkSize.y - ui_px(40.0f))),
+        ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(popup_name, &preview_open,
+                                ImGuiWindowFlags_NoResize |
+                                ImGuiWindowFlags_NoCollapse |
+                                ImGuiWindowFlags_NoSavedSettings)) {
+        return;
+    }
+
+    ImGui::PushFont(f_h2);
+    ImGui::TextColored(k.text, "%s", friend_profile.display_name);
+    ImGui::PopFont();
+    ImGui::SameLine(0, ui_px(8.0f));
+    ImGui::TextColored(k.muted, "%s", friend_profile.username);
+    ImGui::TextColored(k.green, "● %s", friend_profile.presence);
+    ImGui::Spacing();
+
+    ImGui::TextColored(k.muted, "PLAYING");
+    ImGui::TextColored(k.text, "%s", friend_profile.current_profile);
+    ImGui::TextColored(k.muted, "%s", friend_profile.game_version);
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextColored(k.brand_hov,
+                       "LOCAL VISUAL FIXTURE — static sample data; no account, request, or network service is used.");
+    ImGui::TextColored(k.muted,
+                       "Invite, message, remove, and block are preview-only and cannot change a friend relationship.");
+
+    if (remove_working || block_working) {
+        ImGui::Spacing();
+        ImGui::TextColored(k.brand, "%s", remove_working ? "Removing friend…" : "Blocking user…");
+        ImGui::TextColored(k.muted,
+                           "This local preview shows an in-progress state; no request is running.");
+    } else if (remove_error || block_error) {
+        ImGui::Spacing();
+        card_begin("##fixture_friend_profile_error", ImVec2(-1, 0));
+        ImGui::PushFont(f_bold);
+        ImGui::TextColored(k.red, "%s",
+                           remove_error ? "Could not remove friend" : "Could not block user");
+        ImGui::PopFont();
+        ImGui::TextWrapped("%s", remove_error
+            ? "The friend relationship was not changed. You can retry safely."
+            : "The user was not blocked. You can retry safely.");
+        card_end();
+    }
+
+    ImGui::Spacing();
+    const float button_width = ui_px(150.0f);
+    const ImVec2 action_size(button_width, ui_px(30.0f));
+    primary_button("Invite", action_size, false, true);
+    ImGui::SameLine(0, ui_px(8.0f));
+    ghost_button("Message", action_size, true);
+    ImGui::Spacing();
+    ghost_button(remove_working ? "Removing…" : "Remove Friend", action_size, true);
+    ImGui::SameLine(0, ui_px(8.0f));
+    ghost_button(block_working ? "Blocking…" : "Block", action_size, true);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    if (ghost_button("Close preview", ImVec2(ui_px(124.0f), ui_px(30.0f)))) {
+        preview_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+static void draw_fixture_essentials_tab(UiState& st) {
+    const int tab = fixture_essentials_tab(st.fixture_case);
+    draw_page_emblem(st, "essentials-emblem-ai.png");
+    page_title("Amalgam Essentials", "Connect, host, and play together — local visual representation");
+    draw_breadcrumbs({"Home", "Essentials"});
+
+    card_begin("##fixture_essentials_hero", ImVec2(-1, ui_px(116.0f)));
+    ImGui::PushFont(f_title);
+    ImGui::TextColored(k.text, "Your multiplayer hub");
+    ImGui::PopFont();
+    ImGui::TextColored(k.muted,
+                       "Invite friends, host worlds, and keep every session in one place.");
+    ImGui::Spacing();
+    ImGui::TextColored(k.green, "● 3 friends online");
+    ImGui::SameLine(0, ui_px(20.0f));
+    ImGui::TextColored(k.text, "2 new invites");
+    ImGui::SameLine(0, ui_px(20.0f));
+    ImGui::TextColored(k.text, "1 active session");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(365.0f));
+    primary_button("Host a world", ImVec2(ui_px(116.0f), ui_px(30.0f)), false, true);
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Invite friends", ImVec2(ui_px(116.0f), ui_px(30.0f)), true);
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Join via code", ImVec2(ui_px(116.0f), ui_px(30.0f)), true);
+    card_end();
+    ImGui::TextColored(k.brand_hov,
+                       "LOCAL VISUAL FIXTURE — no account, message, party, or session service is used.");
+    ImGui::Spacing();
+
+    const char* labels[] = {"Friends (3/5)", "Invites (2)", "Sessions (1)",
+                            "Messages", "Parties", "Notifications (!2)"};
+    const int ids[] = {0, 1, 2, 4, 5, 3};
+    for (int i = 0; i < 6; ++i) {
+        if (i > 0) ImGui::SameLine(0, ui_px(6.0f));
+        fixture_essentials_tab_pill(labels[i], ids[i] == tab,
+                                    ids[i] == 1 || ids[i] == 3);
+    }
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    if (tab == 0) {
+        struct FixtureFriend { const char* name; const char* status; ImVec4 color; };
+        const FixtureFriend friends[] = {
+            {"Alex", "Playing Forge 1.20.1", k.brand},
+            {"MiraBuilds", "In the launcher", k.blue},
+            {"AveryStone", "Hosting a world", k.yellow},
+            {"NovaCraft", "Away", k.muted},
+            {"PixelRanger", "Offline", k.muted},
+        };
+        card_begin("##fixture_essentials_friends", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Friends");
+        ImGui::PopFont();
+        ImGui::TextColored(k.muted, "Representative presence indicators and session context.");
+        ImGui::Spacing();
+        for (const auto& friend_entry : friends) {
+            ImGui::TextColored(friend_entry.color, "●");
+            ImGui::SameLine(0, ui_px(7.0f));
+            ImGui::PushFont(f_bold);
+            ImGui::TextColored(k.text, "%s", friend_entry.name);
+            ImGui::PopFont();
+            ImGui::SameLine(0, ui_px(9.0f));
+            ImGui::TextColored(k.muted, "%s", friend_entry.status);
+        }
+        card_end();
+        ImGui::Spacing();
+        card_begin("##fixture_essentials_activity", ImVec2(-1, 0));
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted("Active session");
+        ImGui::PopFont();
+        ImGui::TextColored(k.text, "Forsaken World SMP");
+        ImGui::TextColored(k.green, "● Online  •  4 / 12 participants  •  Fabric 1.20.1");
+        card_end();
+    } else if (tab == 1) {
+        card_begin("##fixture_essentials_invites", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Received invites");
+        ImGui::PopFont();
+        ImGui::Spacing();
+        ImGui::TextColored(k.text, "AveryStone invited you to Redstone Builders");
+        ImGui::TextColored(k.muted, "Fabric 1.20.1  •  3 / 8 players  •  just now");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextColored(k.text, "MiraBuilds invited you to Weekend Survival");
+        ImGui::TextColored(k.muted, "Vanilla 1.21.1  •  2 / 6 players  •  6m ago");
+        card_end();
+    } else if (tab == 2) {
+        card_begin("##fixture_essentials_sessions", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Your sessions");
+        ImGui::PopFont();
+        ImGui::TextColored(k.green, "● Forsaken World SMP is online");
+        ImGui::TextColored(k.muted, "AveryStone hosting  •  Fabric 1.20.1  •  4 / 12 players");
+        ImGui::Spacing();
+        ghost_button("Manage session", ImVec2(ui_px(128.0f), ui_px(28.0f)), true);
+        card_end();
+    } else if (tab == 3) {
+        card_begin("##fixture_essentials_notifications", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Notifications");
+        ImGui::PopFont();
+        ImGui::TextColored(k.text, "MiraBuilds accepted your invite");
+        ImGui::TextColored(k.muted, "Ready to join Forsaken World SMP  •  just now");
+        ImGui::Spacing();
+        ImGui::TextColored(k.text, "NovaCraft is back in the launcher");
+        ImGui::TextColored(k.muted, "Presence update  •  8m ago");
+        card_end();
+    } else if (tab == 4) {
+        card_begin("##fixture_essentials_messages", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Messages");
+        ImGui::PopFont();
+        ImGui::TextColored(k.brand_hov, "MiraBuilds");
+        ImGui::TextWrapped("I have the build ready. Want to join after this review pass?");
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted, "You  •  Absolutely — I will join once the visual review is complete.");
+        card_end();
+    } else {
+        card_begin("##fixture_essentials_parties", ImVec2(-1, 0));
+        ImGui::PushFont(f_h2);
+        ImGui::TextUnformatted("Parties");
+        ImGui::PopFont();
+        ImGui::TextColored(k.text, "Redstone Builders");
+        ImGui::TextColored(k.muted, "AveryStone  •  3 / 8 members  •  Public");
+        ImGui::Spacing();
+        ImGui::TextColored(k.text, "Weekend Survival");
+        ImGui::TextColored(k.muted, "MiraBuilds  •  2 / 6 members  •  Invite only");
+        card_end();
+    }
+
+    draw_fixture_essentials_dialog(st.fixture_case);
+    draw_fixture_friend_profile(st.fixture_case);
+    draw_fixture_friend_context_menu(st.fixture_case);
+}
 
 // ---------------------------------------------------------------------------
 // Activity feed — built from real manager data (notifications + sessions)
@@ -518,20 +1427,37 @@ static void draw_your_status(UiState& st) {
         input_text_hint("##self_status_msg", "What are you up to?",
                         &ui.self_status_message);
         ImGui::Spacing();
-        if (primary_button("Set Status", ImVec2(ui_px(90.0f), ui_px(26.0f)))) {
+        const bool setting_status = essentials_request_is_working(st, "status-set");
+        const bool status_lane_busy = essentials_request_lane_busy(st);
+        const bool retry_status = essentials_request_failed(st, "status-set");
+        if (primary_button(setting_status ? "Saving..." :
+                           (retry_status ? "Retry Status" : "Set Status"),
+                           ImVec2(ui_px(90.0f), ui_px(26.0f)), setting_status,
+                           status_lane_busy)) {
+            FriendStatus requested = FriendStatus::Online;
             switch (ui.status_editor_selection) {
-                case 0: ui.self_status = FriendStatus::Online; break;
-                case 1: ui.self_status = FriendStatus::Away; break;
-                case 2: ui.self_status = FriendStatus::InLauncher; break;
-                case 3: ui.self_status = FriendStatus::Offline; break;
+                case 0: requested = FriendStatus::Online; break;
+                case 1: requested = FriendStatus::Away; break;
+                case 2: requested = FriendStatus::InLauncher; break;
+                case 3: requested = FriendStatus::Offline; break;
+                default: break;
             }
-            auto& pm = PresenceManager::instance();
-            pm.set_status(ui.self_status, ui.self_status_message);
-            ui.status_editor_open = false;
+            const std::string message = ui.self_status_message;
+            start_essentials_request(st, "status-set", [requested, message] {
+                AsyncUiRequestResult result;
+                result.success = PresenceManager::instance().set_status(requested, message);
+                result.title = result.success ? "Status updated" : "Could not update status";
+                result.detail = result.success
+                    ? "Your presence is now visible to friends."
+                    : "Your previous presence remains active. You can retry.";
+                result.payload_a = std::to_string(static_cast<int>(requested));
+                return result;
+            });
         }
         ImGui::SameLine();
-        if (ghost_button("Cancel", ImVec2(ui_px(70.0f), ui_px(26.0f))))
+        if (ghost_button("Cancel", ImVec2(ui_px(70.0f), ui_px(26.0f)), status_lane_busy))
             ui.status_editor_open = false;
+        draw_essentials_request_feedback(st, "status-set", "Updating your status...");
     }
     card_end();
 }
@@ -713,17 +1639,43 @@ static void draw_friend_profile_panel(UiState& st) {
             ImGui::Spacing();
         }
 
-        if (ghost_button("Remove Friend", ImVec2(bw, bh))) {
-            if (FriendsManager::instance().remove_friend(fri_profile.user_id))
-                push_notice(st, ui_model::NoticeLevel::Success, "Friend Removed",
-                            fri_profile.display_name + " has been removed.");
+        const std::string remove_action = "friend-remove:" + fri_profile.user_id;
+        const bool removing = essentials_request_is_working(st, remove_action);
+        const bool action_lane_busy = essentials_request_lane_busy(st);
+        if (ghost_button(removing ? "Removing..." : "Remove Friend", ImVec2(bw, bh),
+                         action_lane_busy)) {
+            const std::string user_id = fri_profile.user_id;
+            const std::string display_name = fri_profile.display_name.empty()
+                ? fri_profile.username : fri_profile.display_name;
+            start_essentials_request(st, remove_action, [user_id, display_name] {
+                AsyncUiRequestResult result;
+                result.success = FriendsManager::instance().remove_friend(user_id);
+                result.title = result.success ? "Friend removed" : "Could not remove friend";
+                result.detail = result.success
+                    ? display_name + " has been removed."
+                    : "The friend relationship was not changed. You can retry safely.";
+                return result;
+            });
         }
         ImGui::SameLine();
-        if (ghost_button("Block", ImVec2(bw, bh))) {
-            if (FriendsManager::instance().block_user(fri_profile.user_id))
-                push_notice(st, ui_model::NoticeLevel::Success, "User Blocked",
-                            fri_profile.display_name + " has been blocked.");
+        const std::string block_action = "friend-block:" + fri_profile.user_id;
+        const bool blocking = essentials_request_is_working(st, block_action);
+        if (ghost_button(blocking ? "Blocking..." : "Block", ImVec2(bw, bh), action_lane_busy)) {
+            const std::string user_id = fri_profile.user_id;
+            const std::string display_name = fri_profile.display_name.empty()
+                ? fri_profile.username : fri_profile.display_name;
+            start_essentials_request(st, block_action, [user_id, display_name] {
+                AsyncUiRequestResult result;
+                result.success = FriendsManager::instance().block_user(user_id);
+                result.title = result.success ? "User blocked" : "Could not block user";
+                result.detail = result.success
+                    ? display_name + " has been blocked."
+                    : "The user was not blocked. You can retry safely.";
+                return result;
+            });
         }
+        draw_essentials_request_feedback(st, remove_action, "Removing friend...");
+        draw_essentials_request_feedback(st, block_action, "Blocking user...");
     }
     ImGui::End();
 }
@@ -773,20 +1725,26 @@ static void draw_essentials_empty_state(UiState& st) {
         ImGui::TextColored(k.brand, "Friend code (AMG-XXXX-XXXX):");
         ImGui::SetNextItemWidth(-1);
         ImGui::InputText("##add_friend_input", &ui.add_friend_input);
-        if (ghost_button("Send Request", ImVec2(ui_px(140.0f), ui_px(26.0f)))) {
+        const bool sending_request = essentials_request_is_working(st, "friend-request");
+        const bool request_lane_busy = essentials_request_lane_busy(st);
+        const bool retry_request = essentials_request_failed(st, "friend-request");
+        if (ghost_button(sending_request ? "Sending..." :
+                         (retry_request ? "Retry Request" : "Send Request"),
+                         ImVec2(ui_px(140.0f), ui_px(26.0f)), request_lane_busy)) {
             if (!ui.add_friend_input.empty()) {
-                if (FriendsManager::instance().send_request(ui.add_friend_input))
-                    push_notice(st, ui_model::NoticeLevel::Success,
-                                "Friend Request Sent",
-                                "Waiting for the other user to accept.");
-                else
-                    push_notice(st, ui_model::NoticeLevel::Error,
-                                "Request Failed",
-                                "Could not send friend request.");
-                ui.add_friend_input.clear();
-                ui.show_add_friend = false;
+                const std::string friend_code = ui.add_friend_input;
+                start_essentials_request(st, "friend-request", [friend_code] {
+                    AsyncUiRequestResult result;
+                    result.success = FriendsManager::instance().send_request(friend_code);
+                    result.title = result.success ? "Friend request sent" : "Request failed";
+                    result.detail = result.success
+                        ? "Waiting for the other player to accept."
+                        : "The request was not sent. Check the code and retry.";
+                    return result;
+                });
             }
         }
+        draw_essentials_request_feedback(st, "friend-request", "Sending friend request...");
     }
     card_end();
 
@@ -821,8 +1779,9 @@ static void draw_essentials_empty_state(UiState& st) {
     }
     ImGui::SameLine();
     if (ghost_button("Join via Code", ImVec2(ui_px(130.0f), ui_px(32.0f)))) {
-        ui.join_dialog_open = true;
         ui.hero_join_code = true;
+        if (ui.join_syncing) ui.join_dialog_open = true;
+        else open_fresh_join_dialog(ui);
     }
 }
 
@@ -899,7 +1858,8 @@ static void draw_essentials_hero(UiState& st) {
 
     if (place_right("Join via Code", false)) {
         ui.hero_join_code = true;
-        ui.join_dialog_open = true;
+        if (ui.join_syncing) ui.join_dialog_open = true;
+        else open_fresh_join_dialog(ui);
     }
     if (place_right("Invite Friends", false)) {
         auto& sm2 = SessionManager::instance();
@@ -991,6 +1951,13 @@ static void draw_toast_notification(UiState& /*st*/) {
 // ---------------------------------------------------------------------------
 
 void draw_essentials_tab(UiState& st) {
+    if (st.fixture_mode) {
+        draw_fixture_essentials_tab(st);
+        return;
+    }
+
+    consume_essentials_request_result(st);
+    refresh_join_progress(st);
     auto& ui = get_essentials_ui_state();
 
     draw_page_emblem(st, "essentials-emblem-ai.png");
@@ -1249,11 +2216,23 @@ static void draw_session_card_hosting(UiState& st) {
         ui.manage_session_id = session.id;
     }
     ImGui::SameLine();
-    if (ghost_button("Stop Hosting", ImVec2(ui_px(120.0f), bh))) {
-        wh.stop_hosting();
-        push_notice(st, ui_model::NoticeLevel::Info,
-                    "Session Ended", "World hosting has been stopped.");
+    const bool stopping_host = essentials_request_is_working(st, "host-stop");
+    const bool host_action_busy = essentials_request_lane_busy(st);
+    const bool retry_stop = essentials_request_failed(st, "host-stop");
+    if (ghost_button(stopping_host ? "Stopping..." :
+                     (retry_stop ? "Retry Stop" : "Stop Hosting"),
+                     ImVec2(ui_px(120.0f), bh), host_action_busy)) {
+        start_essentials_request(st, "host-stop", [] {
+            AsyncUiRequestResult result;
+            result.success = WorldHost::instance().stop_hosting();
+            result.title = result.success ? "Session ended" : "Could not stop hosting";
+            result.detail = result.success
+                ? "World hosting has been stopped."
+                : "The session remains active. You can retry safely.";
+            return result;
+        });
     }
+    draw_essentials_request_feedback(st, "host-stop", "Stopping hosted world...");
 
     card_end();
 }
@@ -1265,7 +2244,6 @@ static void draw_session_card_hosting(UiState& st) {
 static void draw_invite_card(const EssentialsInvite& invite, bool received,
                              UiState& st) {
     auto& ui = get_essentials_ui_state();
-
     std::string card_id = "##invite_" + invite.id;
     card_begin(card_id.c_str());
 
@@ -1331,37 +2309,77 @@ static void draw_invite_card(const EssentialsInvite& invite, bool received,
     // Action buttons
     if (invite.status == InviteStatus::Pending) {
         if (received) {
-            if (primary_button("JOIN",
-                               ImVec2(ui_px(90.0f), ui_px(28.0f)))) {
-                EssentialsInvite accepted;
-                if (InviteManager::instance().accept_invite(invite.id, &accepted)) {
-                    ui.join_session_id = accepted.session_id;
-                    ui.join_address = accepted.session_address;
-                    ui.join_token = accepted.join_token;
-                    ui.join_dialog_open = !ui.join_address.empty() && !ui.join_token.empty();
-                    push_notice(st, ui_model::NoticeLevel::Success,
-                                 "Invite Accepted",
-                                 "Joining " + invite.world_name + "...");
-                } else {
-                    push_notice(st, ui_model::NoticeLevel::Error,
-                                 "Accept Failed",
-                                 "Could not accept invite. Please try again.");
-                }
+            const std::string accept_action = "invite-accept:" + invite.id;
+            const std::string decline_action = "invite-decline:" + invite.id;
+            const bool invite_lane_busy = essentials_request_lane_busy(st);
+            const bool accepting = essentials_request_is_working(st, accept_action);
+            const bool retry_accept = essentials_request_failed(st, accept_action);
+            if (primary_button(accepting ? "JOINING..." :
+                               (retry_accept ? "RETRY" : "JOIN"),
+                               ImVec2(ui_px(90.0f), ui_px(28.0f)), accepting,
+                               invite_lane_busy)) {
+                const std::string invite_id = invite.id;
+                const std::string world_name = invite.world_name;
+                ++ui.join_intent_generation;
+                if (ui.join_intent_generation == 0) ++ui.join_intent_generation;
+                const uint64_t join_intent_generation = ui.join_intent_generation;
+                start_essentials_request(st, accept_action,
+                    [invite_id, world_name, join_intent_generation] {
+                    EssentialsInvite accepted;
+                    AsyncUiRequestResult result;
+                    result.number_a = static_cast<int64_t>(join_intent_generation);
+                    result.success = InviteManager::instance().accept_invite(invite_id, &accepted);
+                    result.title = result.success ? "Invite accepted" : "Accept failed";
+                    result.detail = result.success
+                        ? "Preparing " + world_name + " for compatibility checks."
+                        : "The invite is still pending. You can retry.";
+                    if (result.success) {
+                        result.payload_a = accepted.session_id;
+                        result.payload_b = accepted.session_address;
+                        result.payload_c = accepted.join_token;
+                    }
+                    return result;
+                });
             }
             ImGui::SameLine();
-            if (ghost_button("DECLINE",
-                             ImVec2(ui_px(90.0f), ui_px(28.0f)))) {
-                if (!InviteManager::instance().decline_invite(invite.id))
-                    push_notice(st, ui_model::NoticeLevel::Error,
-                                "Decline Failed", "Could not decline invite.");
+            const bool declining = essentials_request_is_working(st, decline_action);
+            const bool retry_decline = essentials_request_failed(st, decline_action);
+            if (ghost_button(declining ? "DECLINING..." :
+                             (retry_decline ? "RETRY DECLINE" : "DECLINE"),
+                             ImVec2(ui_px(90.0f), ui_px(28.0f)), invite_lane_busy)) {
+                const std::string invite_id = invite.id;
+                start_essentials_request(st, decline_action, [invite_id] {
+                    AsyncUiRequestResult result;
+                    result.success = InviteManager::instance().decline_invite(invite_id);
+                    result.title = result.success ? "Invite declined" : "Decline failed";
+                    result.detail = result.success
+                        ? "The host has been notified."
+                        : "The invite is still pending. You can retry.";
+                    return result;
+                });
             }
+            draw_essentials_request_feedback(st, accept_action, "Accepting invite...");
+            draw_essentials_request_feedback(st, decline_action, "Declining invite...");
         } else {
-            if (ghost_button("CANCEL",
-                             ImVec2(ui_px(90.0f), ui_px(28.0f)))) {
-                if (!InviteManager::instance().cancel_invite(invite.id))
-                    push_notice(st, ui_model::NoticeLevel::Error,
-                                "Cancel Failed", "Could not cancel invite.");
+            const std::string cancel_action = "invite-cancel:" + invite.id;
+            const bool invite_lane_busy = essentials_request_lane_busy(st);
+            const bool cancelling = essentials_request_is_working(st, cancel_action);
+            const bool retry_cancel = essentials_request_failed(st, cancel_action);
+            if (ghost_button(cancelling ? "CANCELLING..." :
+                             (retry_cancel ? "RETRY" : "CANCEL"),
+                             ImVec2(ui_px(90.0f), ui_px(28.0f)), invite_lane_busy)) {
+                const std::string invite_id = invite.id;
+                start_essentials_request(st, cancel_action, [invite_id] {
+                    AsyncUiRequestResult result;
+                    result.success = InviteManager::instance().cancel_invite(invite_id);
+                    result.title = result.success ? "Invite cancelled" : "Cancel failed";
+                    result.detail = result.success
+                        ? "The invitation is no longer active."
+                        : "The invitation was not cancelled. You can retry.";
+                    return result;
+                });
             }
+            draw_essentials_request_feedback(st, cancel_action, "Cancelling invite...");
         }
     } else {
         const char* status_text = "Unknown";
@@ -1479,16 +2497,39 @@ static void draw_friend_row(const EssentialsFriend& fri, UiState& st) {
             ui.current_tab = 4;
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Remove Friend")) {
-            if (FriendsManager::instance().remove_friend(fri.user_id))
-                push_notice(st, ui_model::NoticeLevel::Success, "Friend Removed",
-                            fri.display_name + " has been removed.");
+        const std::string remove_action = "friend-remove:" + fri.user_id;
+        const std::string block_action = "friend-block:" + fri.user_id;
+        const bool action_lane_busy = essentials_request_lane_busy(st);
+        if (ImGui::MenuItem("Remove Friend", nullptr, false, !action_lane_busy)) {
+            const std::string user_id = fri.user_id;
+            const std::string display_name = fri.display_name.empty()
+                ? fri.username : fri.display_name;
+            start_essentials_request(st, remove_action, [user_id, display_name] {
+                AsyncUiRequestResult result;
+                result.success = FriendsManager::instance().remove_friend(user_id);
+                result.title = result.success ? "Friend removed" : "Could not remove friend";
+                result.detail = result.success
+                    ? display_name + " has been removed."
+                    : "The friend relationship was not changed. You can retry safely.";
+                return result;
+            });
         }
-        if (ImGui::MenuItem("Block User")) {
-            if (FriendsManager::instance().block_user(fri.user_id))
-                push_notice(st, ui_model::NoticeLevel::Success, "User Blocked",
-                            fri.display_name + " has been blocked.");
+        if (ImGui::MenuItem("Block User", nullptr, false, !action_lane_busy)) {
+            const std::string user_id = fri.user_id;
+            const std::string display_name = fri.display_name.empty()
+                ? fri.username : fri.display_name;
+            start_essentials_request(st, block_action, [user_id, display_name] {
+                AsyncUiRequestResult result;
+                result.success = FriendsManager::instance().block_user(user_id);
+                result.title = result.success ? "User blocked" : "Could not block user";
+                result.detail = result.success
+                    ? display_name + " has been blocked."
+                    : "The user was not blocked. You can retry safely.";
+                return result;
+            });
         }
+        draw_essentials_request_feedback(st, remove_action, "Removing friend...");
+        draw_essentials_request_feedback(st, block_action, "Blocking user...");
         ImGui::EndPopup();
     }
 
@@ -1543,20 +2584,26 @@ static void draw_friends_tab(UiState& st) {
             ImGui::TextColored(k.muted, "Friend code (AMG-XXXX-XXXX):");
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##add_friend_input", &ui.add_friend_input);
-            if (ghost_button("Send Request", ImVec2(-1, ui_px(26.0f)))) {
+            const bool sending_request = essentials_request_is_working(st, "friend-request");
+            const bool request_lane_busy = essentials_request_lane_busy(st);
+            const bool retry_request = essentials_request_failed(st, "friend-request");
+            if (ghost_button(sending_request ? "Sending..." :
+                             (retry_request ? "Retry Request" : "Send Request"),
+                             ImVec2(-1, ui_px(26.0f)), request_lane_busy)) {
                 if (!ui.add_friend_input.empty()) {
-                    if (fm.send_request(ui.add_friend_input))
-                        push_notice(st, ui_model::NoticeLevel::Success,
-                                    "Friend Request Sent",
-                                    "Waiting for the other user to accept.");
-                    else
-                        push_notice(st, ui_model::NoticeLevel::Error,
-                                    "Request Failed",
-                                    "Could not send friend request.");
-                    ui.add_friend_input.clear();
-                    ui.show_add_friend = false;
+                    const std::string friend_code = ui.add_friend_input;
+                    start_essentials_request(st, "friend-request", [friend_code] {
+                        AsyncUiRequestResult result;
+                        result.success = FriendsManager::instance().send_request(friend_code);
+                        result.title = result.success ? "Friend request sent" : "Request failed";
+                        result.detail = result.success
+                            ? "Waiting for the other player to accept."
+                            : "The request was not sent. Check the code and retry.";
+                        return result;
+                    });
                 }
             }
+            draw_essentials_request_feedback(st, "friend-request", "Sending friend request...");
         }
 
         // Pending requests
@@ -1571,20 +2618,41 @@ static void draw_friends_tab(UiState& st) {
                 ImGui::PushID(req.id.c_str());
                 card_begin("##req_row", ImVec2(-1, 0));
                 ImGui::TextColored(k.text, "%s", req.sender_username.c_str());
-                if (ghost_button("Accept", ImVec2(ui_px(70.0f), ui_px(24.0f)))) {
-                    if (fm.accept_request(req.id))
-                        push_notice(st, ui_model::NoticeLevel::Success,
-                                    "Request Accepted", req.sender_username + " is now your friend.");
-                    else
-                        push_notice(st, ui_model::NoticeLevel::Error,
-                                    "Accept Failed", "Could not accept request.");
+                const std::string accept_action = "friend-accept:" + req.id;
+                const std::string decline_action = "friend-decline:" + req.id;
+                const bool request_action_busy = essentials_request_lane_busy(st);
+                const bool accepting = essentials_request_is_working(st, accept_action);
+                if (ghost_button(accepting ? "Accepting..." : "Accept",
+                                 ImVec2(ui_px(70.0f), ui_px(24.0f)), request_action_busy)) {
+                    const std::string request_id = req.id;
+                    const std::string username = req.sender_username;
+                    start_essentials_request(st, accept_action, [request_id, username] {
+                        AsyncUiRequestResult result;
+                        result.success = FriendsManager::instance().accept_request(request_id);
+                        result.title = result.success ? "Request accepted" : "Accept failed";
+                        result.detail = result.success
+                            ? username + " is now your friend."
+                            : "The friend request is still pending. You can retry.";
+                        return result;
+                    });
                 }
                 ImGui::SameLine();
-                if (ghost_button("Decline", ImVec2(ui_px(70.0f), ui_px(24.0f)))) {
-                    if (!fm.decline_request(req.id))
-                        push_notice(st, ui_model::NoticeLevel::Error,
-                                    "Decline Failed", "Could not decline request.");
+                const bool declining = essentials_request_is_working(st, decline_action);
+                if (ghost_button(declining ? "Declining..." : "Decline",
+                                 ImVec2(ui_px(70.0f), ui_px(24.0f)), request_action_busy)) {
+                    const std::string request_id = req.id;
+                    start_essentials_request(st, decline_action, [request_id] {
+                        AsyncUiRequestResult result;
+                        result.success = FriendsManager::instance().decline_request(request_id);
+                        result.title = result.success ? "Request declined" : "Decline failed";
+                        result.detail = result.success
+                            ? "The friend request was declined."
+                            : "The friend request is still pending. You can retry.";
+                        return result;
+                    });
                 }
+                draw_essentials_request_feedback(st, accept_action, "Accepting friend request...");
+                draw_essentials_request_feedback(st, decline_action, "Declining friend request...");
                 card_end();
                 ImGui::PopID();
             }
@@ -1823,12 +2891,10 @@ static void draw_sessions_tab(UiState&) {
     ImGui::SetNextItemWidth(join_input_w);
     ImGui::InputText("##join_code_tok", &ui.join_token, ImGuiInputTextFlags_Password);
     ImGui::Spacing();
-    if (primary_button("JOIN", ImVec2(ui_px(100.0f), ui_px(32.0f))) &&
+    if (primary_button("JOIN", ImVec2(ui_px(100.0f), ui_px(32.0f)), false,
+                       ui.join_syncing) &&
         !ui.join_address.empty() && !ui.join_token.empty()) {
-        ui.join_dialog_open = true;
-        ui.join_compat_shown = false;
-        ui.join_step = 0;
-        ui.join_progress = 0.0f;
+        open_fresh_join_dialog(ui);
     }
     card_end();
     ImGui::Spacing();
@@ -1943,14 +3009,12 @@ static void draw_sessions_tab(UiState&) {
         if (sess.state == SessionState::Online &&
             sess.player_count < sess.player_limit) {
             if (primary_button("Join",
-                               ImVec2(ui_px(100.0f), ui_px(30.0f)))) {
-                ui.join_dialog_open = true;
+                               ImVec2(ui_px(100.0f), ui_px(30.0f)), false,
+                               ui.join_syncing)) {
                 ui.join_session_id = sess.id;
                 ui.join_address = sess.address;
                 ui.join_token.clear();
-                ui.join_compat_shown = false;
-                ui.join_step = 0;
-                ui.join_progress = 0.0f;
+                open_fresh_join_dialog(ui);
             }
         } else if (sess.player_count >= sess.player_limit) {
             ImGui::TextColored(k.red, "Session Full");
@@ -1967,7 +3031,7 @@ static void draw_sessions_tab(UiState&) {
 // Notifications Tab
 // ---------------------------------------------------------------------------
 
-static void draw_notifications_tab(UiState& /*st*/) {
+static void draw_notifications_tab(UiState& st) {
     auto& sm = SessionManager::instance();
     auto notifs = sm.get_notifications();
 
@@ -2020,20 +3084,46 @@ static void draw_notifications_tab(UiState& /*st*/) {
 
         // Action buttons
         if (notif.on_accept) {
-            if (primary_button("Accept",
-                               ImVec2(ui_px(80.0f), ui_px(26.0f)))) {
-                notif.on_accept();
-                sm.clear_notification(notif.id);
+            const std::string accept_action = "notification-accept:" + notif.id;
+            const bool accepting = essentials_request_is_working(st, accept_action);
+            if (primary_button(accepting ? "Accepting..." : "Accept",
+                               ImVec2(ui_px(80.0f), ui_px(26.0f)), accepting,
+                               essentials_request_lane_busy(st))) {
+                const auto callback = notif.on_accept;
+                const std::string notification_id = notif.id;
+                start_essentials_request(st, accept_action, [callback, notification_id] {
+                    callback();
+                    SessionManager::instance().clear_notification(notification_id);
+                    AsyncUiRequestResult result;
+                    result.success = true;
+                    result.title = "Action accepted";
+                    result.detail = "The notification was handled.";
+                    return result;
+                });
             }
             ImGui::SameLine();
+            draw_essentials_request_feedback(st, accept_action, "Accepting notification action...");
         }
         if (notif.on_decline) {
-            if (ghost_button("Decline",
-                             ImVec2(ui_px(80.0f), ui_px(26.0f)))) {
-                notif.on_decline();
-                sm.clear_notification(notif.id);
+            const std::string decline_action = "notification-decline:" + notif.id;
+            const bool declining = essentials_request_is_working(st, decline_action);
+            if (ghost_button(declining ? "Declining..." : "Decline",
+                             ImVec2(ui_px(80.0f), ui_px(26.0f)),
+                             essentials_request_lane_busy(st))) {
+                const auto callback = notif.on_decline;
+                const std::string notification_id = notif.id;
+                start_essentials_request(st, decline_action, [callback, notification_id] {
+                    callback();
+                    SessionManager::instance().clear_notification(notification_id);
+                    AsyncUiRequestResult result;
+                    result.success = true;
+                    result.title = "Action declined";
+                    result.detail = "The notification was handled.";
+                    return result;
+                });
             }
             ImGui::SameLine();
+            draw_essentials_request_feedback(st, decline_action, "Declining notification action...");
         }
 
         if (ghost_button("Dismiss",
@@ -2122,7 +3212,12 @@ static void draw_host_dialog(UiState& st) {
         float bw = ui_px(180.0f);
         float bh = ui_px(34.0f);
 
-        if (primary_button("START HOSTING", ImVec2(bw, bh))) {
+        const bool starting_host = essentials_request_is_working(st, "host-start");
+        const bool host_lane_busy = essentials_request_lane_busy(st);
+        const bool retry_host = essentials_request_failed(st, "host-start");
+        if (primary_button(starting_host ? "STARTING..." :
+                           (retry_host ? "RETRY HOSTING" : "START HOSTING"),
+                           ImVec2(bw, bh), starting_host, host_lane_busy)) {
             if (ui.host_world_name.empty()) {
                 push_notice(st, ui_model::NoticeLevel::Error,
                             "World Name Required",
@@ -2137,35 +3232,39 @@ static void draw_host_dialog(UiState& st) {
                 opts.privacy = ui.host_privacy;
                 opts.player_limit = ui.host_player_limit;
 
-                auto& wh = WorldHost::instance();
-                EssentialsAddressResolver resolver;
                 if (!EssentialsAddressResolver::IsValidAlias(opts.alias)) {
                     push_notice(st, ui_model::NoticeLevel::Error,
                                 "Invalid Address", "Choose a valid non-reserved Essentials address.");
-                } else if (!resolver.IsAvailable(opts.alias)) {
-                    const auto suggestions = EssentialsAddressResolver::Suggestions(opts.alias);
-                    push_notice(st, ui_model::NoticeLevel::Error,
-                                "Address Unavailable",
-                                "That address is already active. Try " + suggestions[0] +
-                                " or " + suggestions[1] + ".");
-                } else if (wh.start_hosting(opts, [](float, const std::string&) {})) {
-                    ui.host_dialog_open = false;
-                    push_notice(st, ui_model::NoticeLevel::Success,
-                                "Hosting Started",
-                                "Your world is online at " + EssentialsAddressResolver::ToAddress(opts.alias));
                 } else {
-                    push_notice(st, ui_model::NoticeLevel::Error,
-                                "Hosting Failed",
-                                "The local world or Essentials transport could not be started.");
+                    start_essentials_request(st, "host-start", [opts] {
+                        AsyncUiRequestResult result;
+                        EssentialsAddressResolver resolver;
+                        if (!resolver.IsAvailable(opts.alias)) {
+                            const auto suggestions = EssentialsAddressResolver::Suggestions(opts.alias);
+                            result.title = "Address unavailable";
+                            result.detail = "That address is already active. Try " +
+                                suggestions[0] + " or " + suggestions[1] + ".";
+                            return result;
+                        }
+                        result.success = WorldHost::instance().start_hosting(
+                            opts, [](float, const std::string&) {});
+                        result.title = result.success ? "Hosting started" : "Hosting failed";
+                        result.detail = result.success
+                            ? "Your world is online at " +
+                                EssentialsAddressResolver::ToAddress(opts.alias)
+                            : "The local world or Essentials transport could not be started. You can retry.";
+                        return result;
+                    });
                 }
             }
         }
 
         ImGui::SameLine();
 
-        if (ghost_button("CANCEL", ImVec2(bw, bh))) {
+        if (ghost_button("CANCEL", ImVec2(bw, bh), host_lane_busy)) {
             ui.host_dialog_open = false;
         }
+        draw_essentials_request_feedback(st, "host-start", "Creating session and starting host...");
 
         ImGui::EndPopup();
     }
@@ -2307,43 +3406,49 @@ static void draw_invite_dialog(UiState& st) {
             send_label += " (" + std::to_string(ui.selected_invitees.size()) + ")";
         }
 
-        if (primary_button(send_label.c_str(), ImVec2(bw, bh))) {
+        const bool sending_invites = essentials_request_is_working(st, "invite-send");
+        const bool invite_lane_busy = essentials_request_lane_busy(st);
+        const bool retry_invites = essentials_request_failed(st, "invite-send");
+        if (primary_button(sending_invites ? "SENDING..." :
+                           (retry_invites ? "RETRY INVITES" : send_label.c_str()),
+                           ImVec2(bw, bh), sending_invites, invite_lane_busy)) {
             if (ui.selected_invitees.empty()) {
                 push_notice(st, ui_model::NoticeLevel::Warning,
                             "No Friends Selected",
                             "Select at least one friend to invite.");
             } else {
-                auto& im = InviteManager::instance();
                 auto& sm = SessionManager::instance();
                 auto session = sm.get_session(ui.invite_session_id);
-                int sent = 0, failed = 0;
-                for (auto& uid : ui.selected_invitees) {
-                    if (im.send_invite(uid, session))
-                        ++sent;
-                    else
-                        ++failed;
-                }
-                if (failed > 0)
-                    push_notice(st, ui_model::NoticeLevel::Warning,
-                                "Partial Failure",
-                                std::to_string(sent) + " invite(s) sent, " +
-                                std::to_string(failed) + " failed.");
-                else
-                    push_notice(st, ui_model::NoticeLevel::Success,
-                                "Invites Sent",
-                                "Invitations sent to " + std::to_string(sent) +
-                                    " friend(s).");
-                ui.selected_invitees.clear();
-                ui.invite_dialog_open = false;
+                const auto invitees = ui.selected_invitees;
+                start_essentials_request(st, "invite-send", [invitees, session] {
+                    int sent = 0;
+                    int failed = 0;
+                    for (const auto& user_id : invitees) {
+                        if (InviteManager::instance().send_invite(user_id, session)) ++sent;
+                        else ++failed;
+                    }
+                    AsyncUiRequestResult result;
+                    result.success = sent > 0;
+                    result.warning = sent > 0 && failed > 0;
+                    result.title = result.success
+                        ? (result.warning ? "Some invites could not be sent" : "Invites sent")
+                        : "Could not send invites";
+                    result.detail = result.success
+                        ? std::to_string(sent) + " invite(s) sent" +
+                            (failed > 0 ? "; " + std::to_string(failed) + " failed." : ".")
+                        : "No invitations were sent. Check the session and retry.";
+                    return result;
+                });
             }
         }
 
         ImGui::SameLine();
 
-        if (ghost_button("CANCEL", ImVec2(bw, bh))) {
+        if (ghost_button("CANCEL", ImVec2(bw, bh), invite_lane_busy)) {
             ui.selected_invitees.clear();
             ui.invite_dialog_open = false;
         }
+        draw_essentials_request_feedback(st, "invite-send", "Sending invitations...");
 
         ImGui::EndPopup();
     }
@@ -2356,22 +3461,29 @@ static void draw_invite_dialog(UiState& st) {
 // Join Dialog
 // ---------------------------------------------------------------------------
 
-static void draw_join_dialog(UiState&) {
+static void draw_join_dialog(UiState& st) {
     auto& ui = get_essentials_ui_state();
 
-    ImGui::SetNextWindowSize(ImVec2(ui_px(500.0f), ui_px(480.0f)),
+    set_next_adaptive_window(500.0f, 480.0f, 360.0f, 280.0f,
                              ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Join Session", &ui.join_dialog_open,
-                               ImGuiWindowFlags_NoResize)) {
+                               ImGuiWindowFlags_NoResize |
+                               ImGuiWindowFlags_NoScrollbar |
+                               ImGuiWindowFlags_NoScrollWithMouse)) {
 
         if (!ui.join_compat_shown) {
+            const bool checking_join = essentials_request_is_working(st, "join-analyze");
+            const bool join_lane_busy = essentials_request_lane_busy(st);
+            const bool retry_check = essentials_request_failed(st, "join-analyze");
             ImGui::TextUnformatted("Essentials Address");
             ImGui::SetNextItemWidth(-1.0f);
+            ImGui::BeginDisabled(join_lane_busy);
             ImGui::InputText("##join_address", &ui.join_address);
             ImGui::TextUnformatted("Join code");
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputText("##join_token", &ui.join_token,
                              ImGuiInputTextFlags_Password);
+            ImGui::EndDisabled();
             if (ui.join_address.empty() || ui.join_token.empty()) {
                 ImGui::TextColored(k.muted, "Enter the address and host join code to continue.");
                 ImGui::Spacing();
@@ -2380,41 +3492,85 @@ static void draw_join_dialog(UiState&) {
                 ImGui::EndPopup();
                 return;
             }
-            if (ui.join_session_id.empty()) {
-                EssentialsAddressResolver resolver;
-                const auto resolved = resolver.Resolve(ui.join_address);
-                if (!resolved.success) {
-                    ImGui::TextColored(k.red, "%s", resolved.error.c_str());
-                    ImGui::Spacing();
-                    if (ghost_button("Close", ImVec2(ui_px(100.0f), ui_px(30.0f))))
-                        ui.join_dialog_open = false;
-                    ImGui::EndPopup();
-                    return;
-                }
-                ui.join_session_id = resolved.session_id;
-                ui.join_address = resolved.address;
-            }
-            ImGui::TextColored(k.muted, "Checking compatibility...");
             ImGui::Spacing();
-
-            auto& jm = JoinManager::instance();
-            auto result = jm.analyze_and_prepare(ui.join_session_id, ui.join_token);
-            ui.join_compat = jm.get_current_compat();
-            ui.join_sync_plan = jm.get_current_sync_plan();
-            ui.join_compat_shown = true;
-
-            if (!result.success) {
-                ImGui::TextColored(k.red, "Error: %s",
-                                   result.error.c_str());
+            if (checking_join) {
+                ImGui::TextColored(k.muted,
+                                   "Checking the session and local profile compatibility...");
                 ImGui::Spacing();
-                if (ghost_button("Close",
-                                 ImVec2(ui_px(100.0f), ui_px(30.0f)))) {
+                if (ghost_button("Close", ImVec2(ui_px(100.0f), ui_px(30.0f)))) {
+                    // Closing only hides this dialog.  The result is generation
+                    // guarded and will not reopen it after the user leaves.
                     ui.join_dialog_open = false;
                 }
                 ImGui::EndPopup();
                 return;
             }
+            if (retry_check) {
+                draw_essentials_request_feedback(st, "join-analyze", "Checking compatibility...");
+                ImGui::Spacing();
+            } else {
+                ImGui::TextColored(k.muted,
+                                   "Check compatibility before syncing or launching Minecraft.");
+            }
+            if (primary_button(retry_check ? "Retry Check" : "Check Compatibility",
+                               ImVec2(ui_px(180.0f), ui_px(32.0f)), false,
+                               join_lane_busy)) {
+                const std::string supplied_session_id = ui.join_session_id;
+                const std::string supplied_address = ui.join_address;
+                const std::string supplied_token = ui.join_token;
+                const uint64_t dialog_generation = ui.join_dialog_generation;
+                start_essentials_request(st, "join-analyze",
+                    [supplied_session_id, supplied_address, supplied_token, dialog_generation] {
+                        AsyncUiRequestResult result;
+                        result.number_a = static_cast<int64_t>(dialog_generation);
+                        std::string session_id = supplied_session_id;
+                        std::string address = supplied_address;
+                        if (session_id.empty()) {
+                            EssentialsAddressResolver resolver;
+                            const auto resolved = resolver.Resolve(address);
+                            if (!resolved.success) {
+                                result.title = "Could not find session";
+                                result.detail = resolved.error.empty()
+                                    ? "The address could not be resolved. You can retry."
+                                    : resolved.error;
+                                return result;
+                            }
+                            session_id = resolved.session_id;
+                            address = resolved.address;
+                        }
+                        const auto analysis = JoinManager::instance().analyze_and_prepare(
+                            session_id, supplied_token);
+                        result.success = analysis.success;
+                        result.title = analysis.success ? "" : "Compatibility check failed";
+                        result.detail = analysis.success ? "" : analysis.error;
+                        if (analysis.success) {
+                            result.payload_a = session_id;
+                            result.payload_b = address;
+                        }
+                        return result;
+                    });
+            }
+            ImGui::SameLine();
+            if (ghost_button("Close", ImVec2(ui_px(100.0f), ui_px(32.0f)))) {
+                ui.join_dialog_open = false;
+            }
+            ImGui::EndPopup();
+            return;
         }
+
+        // The compatibility result can include several bounded lists and
+        // progress detail.  Reserve a stable footer before laying it out so
+        // Sync & Join / Cancel never follows an outer popup scroll range.
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float footer_height = std::max(
+            ui_px(64.0f),
+            std::max(ui_px(34.0f), ImGui::GetFrameHeight()) +
+                3.0f * style.ItemSpacing.y + style.WindowPadding.y);
+        const bool can_join = ui.join_compat.overall !=
+                                  CompatibilityLevel::Incompatible &&
+                              !ui.join_syncing;
+        ImGui::BeginChild("##join_session_detail", ImVec2(0.0f, -footer_height),
+                          ImGuiChildFlags_None);
 
         // Step indicators
         const char* step_labels[] = {"Check", "Sync", "Download", "Launch"};
@@ -2470,6 +3626,11 @@ static void draw_join_dialog(UiState&) {
                               c32(k.brand), ui_px(3.0f));
 
             ImGui::Dummy(ImVec2(bar_w, bar_h));
+            ImGui::Spacing();
+            ImGui::TextColored(k.muted, "%s", ui.join_status_text.empty()
+                ? "Joining session..." : ui.join_status_text.c_str());
+            ImGui::TextColored(k.muted,
+                "You can close this window; the session task keeps running safely in the background.");
             ImGui::Spacing();
         }
 
@@ -2556,10 +3717,6 @@ static void draw_join_dialog(UiState&) {
 
         ImGui::Spacing();
 
-        bool can_join = ui.join_compat.overall !=
-                            CompatibilityLevel::Incompatible &&
-                        !ui.join_syncing;
-
         if (can_join) {
             if (!ui.join_sync_plan.mods_to_download.empty() ||
                 !ui.join_sync_plan.mods_to_update.empty()) {
@@ -2573,61 +3730,54 @@ static void draw_join_dialog(UiState&) {
             }
         }
 
+        draw_essentials_request_feedback(st, "join-execute", "Starting session join...");
+        if (!can_join && ui.join_compat.overall ==
+                             CompatibilityLevel::Incompatible) {
+            ImGui::TextColored(k.red, "Session is incompatible. Cannot join.");
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::Separator();
         ImGui::Spacing();
 
         float bw = ui_px(160.0f);
         float bh = ui_px(34.0f);
 
         if (can_join) {
-            if (primary_button(ui.join_syncing ? "Syncing..." : "Sync & Join",
-                               ImVec2(bw, bh))) {
-                ui.join_syncing = true;
-                ui.join_step = 1;
-                ui.join_progress = 0.1f;
-                auto& loading = aml::ui::LoadingScreen::instance();
-                loading.show_fullscreen("Joining Session",
-                                        "Preparing to connect...");
-                loading.begin_steps({"Check Compatibility", "Sync Profile",
-                                     "Download Mods", "Launch Game",
-                                     "Connect to Host"});
-
-                std::string session_id = ui.join_session_id;
-                ui.join_dialog_open = false;
-
-                std::thread([session_id]() {
-                    auto& jm = JoinManager::instance();
-                    auto& loading = aml::ui::LoadingScreen::instance();
-                    loading.advance_step("Checking compatibility...");
-                    jm.execute_join([&loading](float prog, const std::string& status) {
-                        if (!status.empty()) {
-                            if (prog < 0.3f)
-                                loading.advance_step("Checking compatibility...");
-                            else if (prog < 0.6f)
-                                loading.advance_step("Syncing profile...");
-                            else if (prog < 0.8f)
-                                loading.advance_step("Setting up relay...");
-                            else
-                                loading.advance_step("Launching game...");
+            const bool starting_join = essentials_request_is_working(st, "join-execute");
+            const bool essentials_busy = essentials_request_lane_busy(st);
+            if (primary_button(starting_join ? "Starting..." : "Sync & Join",
+                               ImVec2(bw, bh), starting_join, essentials_busy)) {
+                if (start_essentials_request(st, "join-execute", [] {
+                        auto& joins = JoinManager::instance();
+                        AsyncUiRequestResult result;
+                        result.success = joins.execute_join({});
+                        if (!result.success) {
+                            result.title = "Could not start session join";
+                            result.detail = "Another join is already active, or the join task could not start.";
+                            return result;
                         }
-                    });
-
-                    if (jm.is_joining()) {
-                        loading.advance_step("Connected!");
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(600));
-                    }
-                    loading.hide();
-                }).detach();
-
-                ui.join_syncing = false;
+                        const JoinProgressSnapshot progress = joins.get_progress_snapshot();
+                        result.number_a = static_cast<int64_t>(progress.generation);
+                        if (result.number_a <= 0) {
+                            result.success = false;
+                            result.title = "Could not start session join";
+                            result.detail = "The join task did not publish a valid progress state.";
+                        }
+                        return result;
+                    })) {
+                    // The worker-owned handoff stays visible until its matching
+                    // JoinProgressSnapshot reaches a terminal state.
+                    ui.join_syncing = true;
+                    ui.join_execution_generation = 0;
+                    ui.join_step = 0;
+                    ui.join_progress = 0.0f;
+                    ui.join_status_text = "Starting the session join...";
+                }
             }
-        } else if (ui.join_compat.overall ==
-                   CompatibilityLevel::Incompatible) {
-            ImGui::TextColored(k.red,
-                               "Session is incompatible. Cannot join.");
+            ImGui::SameLine();
         }
-
-        ImGui::SameLine();
 
         if (ghost_button("CANCEL", ImVec2(bw, bh))) {
             ui.join_dialog_open = false;
@@ -2688,8 +3838,20 @@ static void draw_session_manager(UiState& st) {
             for (int i = 0; i < 4; ++i) {
                 auto p = static_cast<SessionPrivacy>(i);
                 bool selected = (session.privacy == p);
-                if (ImGui::Selectable(privacy_short_name(p), selected)) {
-                    wh.update_privacy(p);
+                const bool session_action_busy = essentials_request_lane_busy(st);
+                if (ImGui::Selectable(privacy_short_name(p), selected,
+                                      session_action_busy ? ImGuiSelectableFlags_Disabled
+                                                          : ImGuiSelectableFlags_None)) {
+                    start_essentials_request(st, "host-privacy", [p] {
+                        AsyncUiRequestResult result;
+                        result.success = WorldHost::instance().update_privacy(p);
+                        result.title = result.success ? "Session privacy updated"
+                                                     : "Could not update session privacy";
+                        result.detail = result.success
+                            ? std::string("Session is now ") + privacy_short_name(p) + "."
+                            : "The previous privacy setting remains active. You can retry.";
+                        return result;
+                    });
                 }
                 if (selected) ImGui::SetItemDefaultFocus();
             }
@@ -2705,10 +3867,26 @@ static void draw_session_manager(UiState& st) {
 
         int limit = session.player_limit;
         ImGui::SetNextItemWidth(ui_px(160.0f));
-        if (ImGui::SliderInt("##mgr_limit", &limit, 2, 32)) {
-            wh.update_player_limit(limit);
+        const bool session_action_busy = essentials_request_lane_busy(st);
+        ImGui::BeginDisabled(session_action_busy);
+        ImGui::SliderInt("##mgr_limit", &limit, 2, 32);
+        const bool limit_committed = ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::EndDisabled();
+        if (!session_action_busy && limit_committed && limit != session.player_limit) {
+            start_essentials_request(st, "host-player-limit", [limit] {
+                AsyncUiRequestResult result;
+                result.success = WorldHost::instance().update_player_limit(limit);
+                result.title = result.success ? "Player limit updated"
+                                             : "Could not update player limit";
+                result.detail = result.success
+                    ? "The session now allows " + std::to_string(limit) + " players."
+                    : "The previous player limit remains active. You can retry.";
+                return result;
+            });
         }
         ImGui::Columns(1);
+        draw_essentials_request_feedback(st, "host-privacy", "Updating session privacy...");
+        draw_essentials_request_feedback(st, "host-player-limit", "Updating player limit...");
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -2736,21 +3914,41 @@ static void draw_session_manager(UiState& st) {
 
                 ImGui::SameLine(ui_px(300.0f));
 
-                if (ghost_button("Kick",
-                                 ImVec2(ui_px(60.0f), ui_px(22.0f)))) {
-                    wh.kick_player(pid);
-                    push_notice(st, ui_model::NoticeLevel::Info,
-                                "Player Kicked",
-                                pid + " has been kicked.");
+                const std::string kick_action = "host-kick:" + pid;
+                const std::string ban_action = "host-ban:" + pid;
+                const bool player_action_busy = essentials_request_lane_busy(st);
+                const bool kicking = essentials_request_is_working(st, kick_action);
+                if (ghost_button(kicking ? "Kicking..." : "Kick",
+                                 ImVec2(ui_px(60.0f), ui_px(22.0f)), player_action_busy)) {
+                    const std::string player_id = pid;
+                    start_essentials_request(st, kick_action, [player_id] {
+                        AsyncUiRequestResult result;
+                        result.success = WorldHost::instance().kick_player(player_id);
+                        result.title = result.success ? "Player kicked" : "Could not kick player";
+                        result.detail = result.success
+                            ? player_id + " has been kicked."
+                            : "The player remains connected. You can retry.";
+                        return result;
+                    });
                 }
                 ImGui::SameLine();
-                if (ghost_button("Ban",
-                                 ImVec2(ui_px(60.0f), ui_px(22.0f)))) {
-                    wh.ban_player(pid);
-                    push_notice(st, ui_model::NoticeLevel::Warning,
-                                "Player Banned",
-                                pid + " has been banned.");
+                const bool banning = essentials_request_is_working(st, ban_action);
+                if (ghost_button(banning ? "Banning..." : "Ban",
+                                 ImVec2(ui_px(60.0f), ui_px(22.0f)), player_action_busy)) {
+                    const std::string player_id = pid;
+                    start_essentials_request(st, ban_action, [player_id] {
+                        AsyncUiRequestResult result;
+                        result.success = WorldHost::instance().ban_player(player_id);
+                        result.title = result.success ? "Player banned" : "Could not ban player";
+                        result.detail = result.success
+                            ? player_id + " has been banned."
+                            : "The player remains connected. You can retry.";
+                        result.warning = result.success;
+                        return result;
+                    });
                 }
+                draw_essentials_request_feedback(st, kick_action, "Kicking player...");
+                draw_essentials_request_feedback(st, ban_action, "Banning player...");
 
                 card_end();
             }
@@ -2772,10 +3970,23 @@ static void draw_session_manager(UiState& st) {
             for (auto& ban : bans) {
                 ImGui::TextColored(k.red, "%s", ban.username.c_str());
                 ImGui::SameLine();
-                if (ghost_button("Unban",
-                                 ImVec2(ui_px(60.0f), ui_px(22.0f)))) {
-                    wh.unban_player(ban.user_id);
+                const std::string unban_action = "host-unban:" + ban.user_id;
+                const bool unbanning = essentials_request_is_working(st, unban_action);
+                if (ghost_button(unbanning ? "Unbanning..." : "Unban",
+                                 ImVec2(ui_px(60.0f), ui_px(22.0f)),
+                                 essentials_request_lane_busy(st))) {
+                    const std::string user_id = ban.user_id;
+                    start_essentials_request(st, unban_action, [user_id] {
+                        AsyncUiRequestResult result;
+                        result.success = WorldHost::instance().unban_player(user_id);
+                        result.title = result.success ? "Player unbanned" : "Could not unban player";
+                        result.detail = result.success
+                            ? user_id + " can join again."
+                            : "The ban remains in place. You can retry.";
+                        return result;
+                    });
                 }
+                draw_essentials_request_feedback(st, unban_action, "Removing ban...");
             }
             ImGui::EndChild();
         }
@@ -2785,19 +3996,27 @@ static void draw_session_manager(UiState& st) {
         float bw = ui_px(120.0f);
         float bh = ui_px(30.0f);
 
-        if (ghost_button("Stop Hosting", ImVec2(bw, bh))) {
-            wh.stop_hosting();
-            ui.session_manager_open = false;
-            push_notice(st, ui_model::NoticeLevel::Info,
-                        "Session Ended",
-                        "World hosting has been stopped.");
+        const bool stopping_host = essentials_request_is_working(st, "host-stop");
+        const bool session_lane_busy = essentials_request_lane_busy(st);
+        if (ghost_button(stopping_host ? "Stopping..." : "Stop Hosting", ImVec2(bw, bh),
+                         session_lane_busy)) {
+            start_essentials_request(st, "host-stop", [] {
+                AsyncUiRequestResult result;
+                result.success = WorldHost::instance().stop_hosting();
+                result.title = result.success ? "Session ended" : "Could not stop hosting";
+                result.detail = result.success
+                    ? "World hosting has been stopped."
+                    : "The session remains active. You can retry safely.";
+                return result;
+            });
         }
 
         ImGui::SameLine();
 
-        if (ghost_button("Close", ImVec2(bw, bh))) {
+        if (ghost_button("Close", ImVec2(bw, bh), session_lane_busy)) {
             ui.session_manager_open = false;
         }
+        draw_essentials_request_feedback(st, "host-stop", "Stopping hosted world...");
 
         ImGui::EndPopup();
     }

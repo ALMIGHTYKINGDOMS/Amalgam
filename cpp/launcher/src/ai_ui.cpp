@@ -293,10 +293,169 @@ void draw_hardware_card() {
     card_end();
 }
 
+// ---------------------------------------------------------------------------
+// Visual-fixture AI-profile facade
+// ---------------------------------------------------------------------------
+//
+// The normal AI profile surface begins by loading a conversation from the
+// profile, then may inspect hardware, profile content, model files, screenshots
+// or provider state.  A release screenshot must be hermetic instead: it should
+// demonstrate the information hierarchy without reading a reviewer's machine
+// or starting any AI work.
+
+void draw_fixture_ai_mode_pills() {
+    primary_button("Ask", ImVec2(ui_px(58.0f), ui_px(26.0f)), false, true);
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Build", ImVec2(ui_px(64.0f), ui_px(26.0f)), true);
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Agent", ImVec2(ui_px(64.0f), ui_px(26.0f)), true);
+    ImGui::SameLine(0, ui_px(6.0f));
+    ghost_button("Auto", ImVec2(ui_px(60.0f), ui_px(26.0f)), true);
+}
+
+void draw_fixture_ai_runtime_card() {
+    card_begin("##fixture_ai_runtime");
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Runtime isolation");
+    ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+    ImGui::TextWrapped(
+        "Local visual-review sample. This screen does not inspect the reviewer machine.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+    draw_meta_line("Hardware", "Not queried");
+    draw_meta_line("Local model files", "Not inspected");
+    draw_meta_line("Profile content", "Not indexed");
+    draw_meta_line("AI provider", "Not contacted");
+    card_end();
+}
+
+void draw_fixture_ai_vision_card() {
+    card_begin("##fixture_ai_vision");
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Live Vision");
+    ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+    ImGui::TextWrapped("Window capture is unavailable in visual-fixture mode.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+    primary_button("Capture & Describe", ImVec2(-1, ui_px(30.0f)), false, true);
+    card_end();
+}
+
+void draw_fixture_ai_art_card() {
+    card_begin("##fixture_ai_art");
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("AI Art");
+    ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+    ImGui::TextWrapped(
+        "Generation is disabled so no provider request or profile write can occur.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+    std::string prompt = "Describe an original voxel-fantasy banner...";
+    ImGui::BeginDisabled(true);
+    ImGui::InputTextMultiline("##fixture_ai_art_prompt", &prompt, ImVec2(-1, ui_px(46.0f)));
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    primary_button("Generate Art", ImVec2(-1, ui_px(30.0f)), false, true);
+    card_end();
+}
+
+void draw_fixture_ai_profile_actions() {
+    card_begin("##fixture_ai_actions");
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("Profile actions");
+    ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+    ImGui::TextWrapped(
+        "Profile inspection, checkpoints, restore, and conversation writes are disabled.");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+    ghost_button("Analyze Profile", ImVec2(-1, ui_px(28.0f)), true);
+    ghost_button("Create Checkpoint", ImVec2(-1, ui_px(28.0f)), true);
+    ghost_button("Undo Last Change", ImVec2(-1, ui_px(28.0f)), true);
+    ghost_button("Clear Conversation", ImVec2(-1, ui_px(28.0f)), true);
+    card_end();
+}
+
+void draw_fixture_ai_profile_tab(UiState&) {
+    const float full = ImGui::GetContentRegionAvail().x;
+    const bool two_col = full > ui_px(900.0f);
+    const float left_w = two_col ? full * 0.68f : full;
+    if (two_col) {
+        ImGui::Columns(2, "##fixture_ai_cols", false);
+        ImGui::SetColumnWidth(0, left_w);
+    }
+
+    card_begin("##fixture_ai_chat", ImVec2(-1, ui_px(400.0f)));
+    ImGui::PushFont(f_h2);
+    ImGui::TextColored(k.brand, "AMALGAM AI");
+    ImGui::PopFont();
+    ImGui::SameLine(0, ui_px(10.0f));
+    ImGui::TextColored(k.blue, "LOCAL FIXTURE");
+    ImGui::Spacing();
+    draw_fixture_ai_mode_pills();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::BeginChild("##fixture_ai_transcript", ImVec2(0, ui_px(238.0f)));
+    ImGui::PushFont(f_bold);
+    ImGui::TextColored(ImVec4(0.75f, 0.65f, 1.0f, 1.0f), "YOU");
+    ImGui::PopFont();
+    ImGui::TextWrapped("Help me plan a lightweight 1.21.1 exploration profile.");
+    ImGui::Spacing();
+    ImGui::PushFont(f_bold);
+    ImGui::TextColored(k.brand, "AMALGAM AI");
+    ImGui::PopFont();
+    ImGui::TextWrapped(
+        "Fixture response: start with a clear performance target, a small world-generation "
+        "theme, and a reviewable content list before making any changes.");
+    ImGui::Spacing();
+    ImGui::TextColored(k.muted,
+                       "Sample response only — it was not generated by a model or provider.");
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    std::string question = "Ask a question about this profile...";
+    ImGui::BeginDisabled(true);
+    ImGui::InputTextMultiline("##fixture_ai_input", &question, ImVec2(-ui_px(92.0f), ui_px(52.0f)));
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    primary_button("Send", ImVec2(ui_px(82.0f), ui_px(52.0f)), false, true);
+    card_end();
+
+    if (two_col) ImGui::NextColumn();
+    ImGui::PushFont(f_h2);
+    ImGui::TextUnformatted("AI tools");
+    ImGui::PopFont();
+    ImGui::Spacing();
+    draw_fixture_ai_runtime_card();
+    ImGui::Spacing();
+    draw_fixture_ai_vision_card();
+    ImGui::Spacing();
+    draw_fixture_ai_art_card();
+    ImGui::Spacing();
+    draw_fixture_ai_profile_actions();
+
+    if (two_col) ImGui::Columns(1);
+}
+
 }  // namespace
 
 void draw_ai_profile_tab(UiState& st, const std::string& profile_id,
                          const std::wstring& profile_root) {
+    // Keep visual-review evidence hermetic. This branch must precede
+    // conversation loading, hardware detection, profile indexing, model-file
+    // inspection, window capture, provider calls, and profile writes.
+    if (st.fixture_mode) {
+        draw_fixture_ai_profile_tab(st);
+        return;
+    }
+
     if (st.ai_active_profile != profile_id) {
         std::lock_guard<std::mutex> lock(st.ai_mu);
         st.ai_request_id.fetch_add(1, std::memory_order_acq_rel);

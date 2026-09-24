@@ -4,14 +4,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ServerProcessManager, appendConsoleData } from "./server-lifecycle.js";
-import { checkTimeouts } from "./operations.js";
+import { checkTimeouts, handleDelete } from "./operations.js";
+
+const SERVER_ONE = "11111111-1111-4111-8111-111111111111";
+const SERVER_TWO = "22222222-2222-4222-8222-222222222222";
 
 function tempConfig() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "amalgam-harden-"));
   return { dataDir, javaPath: "java" };
 }
 
-function instance(id = "server-1", name = "Test Server") {
+function instance(id = SERVER_ONE, name = "Test Server") {
   return { id, name, world_name: "world" };
 }
 
@@ -78,7 +81,7 @@ test("start without a deployed jar fails safely", () => {
   const result = manager.start(instance());
   assert.equal(result.success, false);
   assert.match(result.error, /jar not found/);
-  assert.equal(manager.isRunning("server-1"), false);
+  assert.equal(manager.isRunning(SERVER_ONE), false);
   fs.rmSync(config.dataDir, { recursive: true, force: true });
 });
 
@@ -95,7 +98,7 @@ test("a process that dies immediately is cleaned from the running set", async ()
   const config = tempConfig();
   config.javaPath = process.execPath; // node, which rejects "-jar" and exits 9
   const manager = new ServerProcessManager(config);
-  const srv = instance("crashy", "Crashy");
+  const srv = instance(SERVER_TWO, "Crashy");
   const dir = manager.getServerDir(srv.id, srv.name);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "server.jar"), "this is not a jar");
@@ -103,8 +106,8 @@ test("a process that dies immediately is cleaned from the running set", async ()
   assert.equal(start.success, true);
   // Node exits with code 9 on the bad "-jar" option almost immediately.
   await new Promise((resolve) => setTimeout(resolve, 1200));
-  assert.equal(manager.isRunning("crashy"), false);
-  assert.equal(manager.servers.has("crashy"), false, "dead process removed from the map");
+  assert.equal(manager.isRunning(SERVER_TWO), false);
+  assert.equal(manager.servers.has(SERVER_TWO), false, "dead process removed from the map");
   fs.rmSync(config.dataDir, { recursive: true, force: true });
 });
 
@@ -179,20 +182,143 @@ test("exit flush emits a final partial line and recovers on restart", () => {
 // Path safety
 // ---------------------------------------------------------------------------
 
-test("server directory names are sanitized (no path escape)", () => {
+test("server storage is UUID-keyed and rejects path-like IDs", () => {
   const config = tempConfig();
   const manager = new ServerProcessManager(config);
-  const evil = manager.getServerDir("srv-1", "../..\\..\\evil");
-  const resolved = path.resolve(evil);
+  const serverDir = manager.getServerDir(SERVER_ONE, "../..\\..\\evil");
+  const resolved = path.resolve(serverDir);
   const base = path.resolve(config.dataDir, "servers");
   assert.equal(path.relative(base, resolved).startsWith(".."), false);
+  assert.equal(path.basename(serverDir), `server-${SERVER_ONE}`);
+  assert.equal(manager.getServerDir(SERVER_ONE.toUpperCase()), serverDir);
+  assert.throws(() => manager.getServerDir("../evil"), /Server ID must be a UUID/);
+  assert.throws(() => manager.getServerDir("server-1"), /Server ID must be a UUID/);
+  fs.rmSync(config.dataDir, { recursive: true, force: true });
+});
+
+test("same-normalized display names cannot collide and delete isolation holds", async () => {
+  const config = tempConfig();
+  const manager = new ServerProcessManager(config);
+  const first = instance(SERVER_ONE, "Alpha/Beta");
+  const second = instance(SERVER_TWO, "Alpha?Beta");
+  const firstDir = manager.getServerDir(first.id, first.name);
+  const secondDir = manager.getServerDir(second.id, second.name);
+
+  // Both names would have mapped to Alpha_Beta in the former name-keyed
+  // layout. The immutable UUIDs must instead produce distinct roots.
+  assert.notEqual(firstDir, secondDir);
+  fs.mkdirSync(path.join(firstDir, "world"), { recursive: true });
+  fs.mkdirSync(path.join(secondDir, "world"), { recursive: true });
+  fs.writeFileSync(path.join(firstDir, "world", "marker.txt"), "first");
+  fs.writeFileSync(path.join(secondDir, "world", "marker.txt"), "second");
+
+  const deleteCalls = [];
+  const supabase = {
+    from: (table) => {
+      assert.equal(table, "server_instances");
+      return {
+        delete: () => ({
+          eq: (idColumn, id) => {
+            deleteCalls.push({ idColumn, id });
+            return {
+              eq: async (nodeColumn, nodeId) => {
+                deleteCalls.push({ nodeColumn, nodeId });
+                return { error: null };
+              },
+            };
+          },
+        }),
+      };
+    },
+  };
+
+  // Exercise the real delete handler: its target must come from getServerDir,
+  // so deletion of the first UUID cannot select the second server's data.
+  const result = await handleDelete(supabase, { id: "node-1" }, {}, manager, first, {});
+  assert.equal(result.success, true);
+  assert.equal(fs.existsSync(firstDir), false);
+  assert.ok(result.recovery_path, "delete returns the recoverable data location");
+  assert.equal(fs.readFileSync(path.join(result.recovery_path, "world", "marker.txt"), "utf-8"), "first");
+  assert.equal(fs.readFileSync(path.join(secondDir, "world", "marker.txt"), "utf-8"), "second");
+  assert.deepEqual(deleteCalls, [
+    { idColumn: "id", id: first.id },
+    { nodeColumn: "node_id", nodeId: "node-1" },
+  ]);
+  fs.rmSync(config.dataDir, { recursive: true, force: true });
+});
+
+test("delete restores server data when control-plane removal fails", async () => {
+  const config = tempConfig();
+  const manager = new ServerProcessManager(config);
+  const srv = instance(SERVER_TWO, "Rollback Delete");
+  const serverDir = manager.getServerDir(srv.id, srv.name);
+  const marker = path.join(serverDir, "world", "marker.txt");
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, "keep me");
+
+  const supabase = {
+    from: () => ({
+      delete: () => ({
+        eq: () => ({
+          eq: async () => ({ error: { message: "control plane unavailable" } }),
+        }),
+      }),
+    }),
+  };
+  const result = await handleDelete(supabase, { id: "node-1" }, {}, manager, srv, {});
+  assert.equal(result.success, false);
+  assert.match(result.error, /control plane unavailable/i);
+  assert.equal(fs.readFileSync(marker, "utf-8"), "keep me");
+  fs.rmSync(config.dataDir, { recursive: true, force: true });
+});
+
+test("delete refuses to remove data or the record until a slow process exits", async () => {
+  const config = tempConfig();
+  const realManager = new ServerProcessManager(config);
+  const srv = instance(SERVER_ONE, "Slow Exit");
+  const serverDir = realManager.getServerDir(srv.id, srv.name);
+  fs.mkdirSync(path.join(serverDir, "world"), { recursive: true });
+  const marker = path.join(serverDir, "world", "marker.txt");
+  fs.writeFileSync(marker, "must survive");
+
+  const calls = [];
+  const slowManager = {
+    isRunning: (serverId) => {
+      calls.push(`running:${serverId}`);
+      return true;
+    },
+    stop: (serverId) => {
+      calls.push(`stop:${serverId}`);
+      return { success: true };
+    },
+    waitForExit: async (serverId) => {
+      calls.push(`wait:${serverId}`);
+      return false;
+    },
+    getServerDir: realManager.getServerDir.bind(realManager),
+  };
+  const supabase = {
+    from: () => {
+      throw new Error("database deletion must not be attempted before process exit");
+    },
+  };
+
+  const result = await handleDelete(supabase, { id: "node-1" }, {}, slowManager, srv, {});
+  assert.equal(result.success, false);
+  assert.match(result.error, /did not exit/i);
+  assert.equal(fs.readFileSync(marker, "utf-8"), "must survive");
+  assert.deepEqual(calls, [
+    `running:${srv.id}`,
+    `stop:${srv.id}`,
+    `wait:${srv.id}`,
+  ]);
   fs.rmSync(config.dataDir, { recursive: true, force: true });
 });
 
 test("applySettings sanitizes level-name and writes server.properties", () => {
   const config = tempConfig();
   const manager = new ServerProcessManager(config);
-  const srv = instance("srv-1", "Test Server");
+  const srv = instance(SERVER_TWO, "Test Server");
   const dir = manager.getServerDir(srv.id, srv.name);
   fs.mkdirSync(dir, { recursive: true });
   const result = manager.applySettings(srv, {
@@ -209,6 +335,42 @@ test("applySettings sanitizes level-name and writes server.properties", () => {
   assert.notEqual(levelName, ".");
   assert.match(props, /^max-players=7/m);
   assert.match(props, /^server-port=25565/m);
+  fs.rmSync(config.dataDir, { recursive: true, force: true });
+});
+
+test("applySettings rejects injected and unsupported properties without replacing the live file", () => {
+  const config = tempConfig();
+  const manager = new ServerProcessManager(config);
+  const srv = instance(SERVER_TWO, "Property Guard");
+  const dir = manager.getServerDir(srv.id, srv.name);
+
+  const initial = manager.applySettings(srv, {
+    motd: "A safe Amalgam server",
+    "enforce-secure-profile": true,
+  });
+  assert.equal(initial.success, true);
+  const propertiesPath = path.join(dir, "server.properties");
+  const knownGood = fs.readFileSync(propertiesPath, "utf-8");
+  assert.match(knownGood, /^enforce-secure-profile=true$/m);
+
+  const injected = manager.applySettings(srv, {
+    motd: "safe\nonline-mode=false",
+  });
+  assert.equal(injected.success, false);
+  assert.match(injected.error, /line breaks/i);
+  assert.equal(fs.readFileSync(propertiesPath, "utf-8"), knownGood);
+
+  const unsupported = manager.applySettings(srv, { "evil-property": "value" });
+  assert.equal(unsupported.success, false);
+  assert.match(unsupported.error, /unsupported server property/i);
+  assert.equal(fs.readFileSync(propertiesPath, "utf-8"), knownGood);
+
+  const templateInjection = manager.applySettings(
+    { ...srv, metadata: { "sp_evil-property": "value" } },
+    {}
+  );
+  assert.equal(templateInjection.success, false);
+  assert.equal(fs.readFileSync(propertiesPath, "utf-8"), knownGood);
   fs.rmSync(config.dataDir, { recursive: true, force: true });
 });
 

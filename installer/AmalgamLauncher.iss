@@ -1,4 +1,6 @@
+#ifndef MyAppName
 #define MyAppName "Amalgam Launcher"
+#endif
 #ifndef MyAppVersion
 #error A release version must be supplied with /DMyAppVersion=<version>
 #endif
@@ -16,14 +18,26 @@
 #ifndef OutputBaseFilename
 #define OutputBaseFilename "AmalgamLauncher-" + MyAppVersion + "-Setup"
 #endif
+#ifndef InstallerAppId
+#define InstallerAppId "{{B4D03A61-7F06-4E44-9F42-5B6C0B1C2F9E}"
+#endif
+#ifndef DefaultInstallDir
+#define DefaultInstallDir "{localappdata}\AmalgamLauncher"
+#endif
+; This is deliberately overrideable only at compile time.  Production builds
+; retain {localappdata}; the uninstall integration test compiles a separately
+; identified installer rooted in a verified temporary sandbox.
+#ifndef UserDataRoot
+#define UserDataRoot "{localappdata}"
+#endif
 
 [Setup]
-AppId={{B4D03A61-7F06-4E44-9F42-5B6C0B1C2F9E}
+AppId={#InstallerAppId}
 AppName={#MyAppName}
 AppVerName={#MyAppVerName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\AmalgamLauncher
+DefaultDirName={#DefaultInstallDir}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -80,19 +94,19 @@ Source: "{#SourceDir}\prerequisites.json"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#SourceDir}\component-manifest.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\sbom.cdx.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\release.sha256"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceDir}\tools\ai-bootstrap.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
-Source: "{#SourceDir}\tools\ai-bootstrap.cmd"; DestDir: "{app}\tools"; Flags: ignoreversion
-Source: "{#SourceDir}\ai\ai-package-manifest.json"; DestDir: "{app}\ai"; Flags: ignoreversion
-Source: "{#SourceDir}\ai\ai-manifest.json"; DestDir: "{app}\ai"; Flags: ignoreversion
-Source: "{#SourceDir}\ai\knowledge\*"; DestDir: "{app}\ai\knowledge"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\tools\ai-bootstrap.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\tools\ai-bootstrap.cmd"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\ai\ai-package-manifest.json"; DestDir: "{app}\ai"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\ai\ai-manifest.json"; DestDir: "{app}\ai"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\ai\knowledge\*"; DestDir: "{app}\ai\knowledge"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: ai
 Source: "{#SourceDir}\legal\TERMS.txt"; DestDir: "{app}\legal"; Flags: ignoreversion
 Source: "{#SourceDir}\legal\PRIVACY.txt"; DestDir: "{app}\legal"; Flags: ignoreversion
-Source: "{#SourceDir}\legal\AI_TERMS.txt"; DestDir: "{app}\legal"; Flags: ignoreversion
+Source: "{#SourceDir}\legal\AI_TERMS.txt"; DestDir: "{app}\legal"; Flags: ignoreversion; Components: ai
 Source: "{#SourceDir}\legal\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}\legal"; Flags: ignoreversion
-Source: "{#SourceDir}\runtimes\ai\llama\*.exe"; DestDir: "{app}\runtimes\ai\llama"; Flags: ignoreversion
-Source: "{#SourceDir}\runtimes\ai\llama\*.dll"; DestDir: "{app}\runtimes\ai\llama"; Flags: ignoreversion
-Source: "{#SourceDir}\runtimes\ai\sd\*.exe"; DestDir: "{app}\runtimes\ai\sd"; Flags: ignoreversion
-Source: "{#SourceDir}\runtimes\ai\sd\*.dll"; DestDir: "{app}\runtimes\ai\sd"; Flags: ignoreversion
+Source: "{#SourceDir}\runtimes\ai\llama\*.exe"; DestDir: "{app}\runtimes\ai\llama"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\runtimes\ai\llama\*.dll"; DestDir: "{app}\runtimes\ai\llama"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\runtimes\ai\sd\*.exe"; DestDir: "{app}\runtimes\ai\sd"; Flags: ignoreversion; Components: ai
+Source: "{#SourceDir}\runtimes\ai\sd\*.dll"; DestDir: "{app}\runtimes\ai\sd"; Flags: ignoreversion; Components: ai
 Source: "{#SourceDir}\USER-GUIDE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\branding\*"; DestDir: "{app}\branding"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -104,15 +118,15 @@ Name: "{app}\bedrock"
 Name: "{app}\instances"
 Name: "{app}\assets"
 Name: "{app}\runtimes\java"
-Name: "{app}\runtimes\ai\llama"
-Name: "{app}\runtimes\ai\sd"
+Name: "{app}\runtimes\ai\llama"; Components: ai
+Name: "{app}\runtimes\ai\sd"; Components: ai
 Name: "{app}\branding"
 Name: "{app}\legal"
-Name: "{app}\ai"
-Name: "{app}\tools"
-Name: "{localappdata}\Amalgam\AI\Models\brain"
-Name: "{localappdata}\Amalgam\AI\Models\art"
-Name: "{localappdata}\Amalgam\AI\Downloads"
+Name: "{app}\ai"; Components: ai
+Name: "{app}\tools"; Components: ai
+Name: "{#UserDataRoot}\Amalgam\AI\Models\brain"; Components: ai
+Name: "{#UserDataRoot}\Amalgam\AI\Models\art"; Components: ai
+Name: "{#UserDataRoot}\Amalgam\AI\Downloads"; Components: ai
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\amalgam_launcher.exe"; WorkingDir: "{app}"; Tasks: startmenu
@@ -137,6 +151,11 @@ var
   PrivPage: TWizardPage;
   PrivAck: TNewCheckBox;
 
+function IsAISelected(): Boolean;
+begin
+  Result := WizardIsComponentSelected('ai');
+end;
+
 // ── Welcome page customization ───────────────────────────────────────────
 procedure InitializeWizard();
 var
@@ -154,7 +173,7 @@ begin
   InfoText.WordWrap := True;
   InfoText.SetBounds(0, ScaleY(8), AIMsgPage.SurfaceWidth, ScaleY(200));
   InfoText.Caption :=
-    'Amalgam AI runs locally on your PC. No cloud API or external software is required.' + #13#10 + #13#10 +
+    'Local Amalgam AI runs on your PC after you install local models. Optional online providers are configured separately and are never required for local AI.' + #13#10 + #13#10 +
     'AI Brain: Chat, reasoning, coding, project analysis, and live Minecraft vision.' + #13#10 +
     'AI Art: Generate textures, FancyMenu art, item concepts, and GUI graphics.' + #13#10 + #13#10 +
     'Models: ~10.2 GB download (installed later from Settings > AI)' + #13#10 +
@@ -185,7 +204,7 @@ begin
     '  Vulkan-compatible GPU (AMD, NVIDIA, Intel)' + #13#10 +
     '  ~25 GB free disk space for models' + #13#10 + #13#10 +
     'CPU-only fallback is supported but AI art generation will be slower.' + #13#10 + #13#10 +
-    'The installer will verify your hardware and download the best models for your system.';
+    'After installation, Amalgam checks your hardware during local AI setup. Models download later from Settings > AI.';
 
   // ── Privacy / Data Page ──────────────────────────────────────────────────
   PrivPage := CreateCustomPage(wpLicense, 'Your Data & Privacy',
@@ -224,10 +243,18 @@ begin
   end
   else if CurPageID = wpInstalling then
     WizardForm.StatusLabel.Caption := 'Installing Amalgam...'
-  else if CurPageID = wpFinished then
-    WizardForm.FinishedLabel.Caption :=
-      'Amalgam is installed and ready to launch.' + #13#10 +
-      'Install AI models from Settings > AI after launch (~10.2 GB).';
+  else if CurPageID = wpFinished then begin
+    WizardForm.FinishedLabel.Caption := 'Amalgam is installed and ready to launch.';
+    if IsAISelected() then
+      WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10 +
+        'Install local AI models from Settings > AI after launch (~10.2 GB).';
+  end;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (not IsAISelected()) and
+    ((PageID = AIMsgPage.ID) or (PageID = HwCheckPage.ID));
 end;
 
 // ── Progress display during file copy ───────────────────────────────────
@@ -248,7 +275,7 @@ begin
     MsgBox('Please confirm that you understand the Microsoft account requirement.', mbError, MB_OK);
     Result := False;
   end;
-  if (CurPageID = AIMsgPage.ID) and (not WizardSilent()) and not AIAck.Checked then begin
+  if IsAISelected() and (CurPageID = AIMsgPage.ID) and (not WizardSilent()) and not AIAck.Checked then begin
     MsgBox('Please confirm you understand and will review AI output before use.', mbError, MB_OK);
     Result := False;
   end;
@@ -264,10 +291,10 @@ begin
        'Do you also want to remove Amalgam AI models, profiles, modpacks, worlds, servers, backups, and downloaded content?' + #13#10 + #13#10 +
        'This permanently deletes Amalgam data for this Windows account. Files outside Amalgam folders are not removed.',
        mbConfirmation, MB_YESNO) = IDYES) then begin
-    DelTree(ExpandConstant('{localappdata}\Amalgam'), True, True, True);
-    DelTree(ExpandConstant('{localappdata}\instances'), True, True, True);
-    DelTree(ExpandConstant('{localappdata}\modpacks'), True, True, True);
-    DelTree(ExpandConstant('{localappdata}\backups'), True, True, True);
+    DelTree(ExpandConstant('{#UserDataRoot}\Amalgam'), True, True, True);
+    DelTree(ExpandConstant('{#UserDataRoot}\instances'), True, True, True);
+    DelTree(ExpandConstant('{#UserDataRoot}\modpacks'), True, True, True);
+    DelTree(ExpandConstant('{#UserDataRoot}\backups'), True, True, True);
     DelTree(ExpandConstant('{app}\instances'), True, True, True);
     DelTree(ExpandConstant('{app}\assets'), True, True, True);
     // Runtime-written configuration in the install directory is Amalgam data
@@ -287,7 +314,10 @@ begin
   Result :=
     'Amalgam is ready to install.' + NewLine + NewLine +
     MemoDir + NewLine + NewLine +
-    'AI models can be installed from Settings > AI after launch (~10.2 GB).' + NewLine + NewLine +
-    'Included: Launcher, AI runtime, bridges, branding, legal documents.' + NewLine + NewLine +
+    'Included: Launcher, bridges, Bedrock content, branding, and legal documents.';
+  if IsAISelected() then
+    Result := Result + NewLine + NewLine +
+      'Local AI runtime is included. Models can be installed from Settings > AI after launch (~10.2 GB).';
+  Result := Result + NewLine + NewLine +
     'Shortcuts:' + NewLine + MemoTasks;
 end;

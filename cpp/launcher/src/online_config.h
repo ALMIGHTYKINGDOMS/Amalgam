@@ -23,10 +23,11 @@ struct OnlineConfig {
     // Public website (account management, plans, checkout, billing pages).
     std::string website_url = "https://amalgam-mc.com/";
 
-    // The branded Amalgam network players join in game: host:port as typed
-    // into Minecraft's multiplayer screen.
+    // The branded Amalgam network players join in game. Keep the canonical
+    // hostname here; Minecraft's default Java port is implied when no port is
+    // supplied, matching the public Amalgam Network address.
     std::string network_name = "Amalgam Network";
-    std::string network_address = "play.amalgam-network.com:9564";
+    std::string network_address = "play.amalgam-network.com";
 
     // Amalgam API backend (Replit or equivalent). The launcher talks ONLY to
     // this endpoint; it never talks to infrastructure providers directly.
@@ -44,7 +45,8 @@ struct OnlineConfig {
         if (root.rfind("http://", 0) != 0 && root.rfind("https://", 0) != 0)
             root.insert(0, "https://");
         while (root.size() > 1 && root.back() == '/') root.pop_back();
-        if (!path.empty() && path.front() == '/') return root + path;
+        if (path.empty()) return root;
+        if (path.front() == '/') return root + path;
         return root + "/" + path;
     }
 
@@ -59,6 +61,19 @@ struct OnlineConfig {
     std::string terms_url() const { return page_url("terms"); }
     std::string privacy_url() const { return page_url("privacy"); }
     std::string microsoft_url() const { return page_url("microsoft"); }
+
+    // The browser is the canonical surface for account recovery and for
+    // users who prefer the official website's account UI.  Keep these links
+    // on the same configured origin as the rest of the launcher so a custom
+    // or stale host cannot silently split account flows across products.
+    // `return=launcher` is a fixed, non-user-controlled hint; it never carries
+    // credentials or a redirect destination.
+    std::string login_url() const { return page_url("login?return=launcher"); }
+    std::string register_url() const { return page_url("register?return=launcher"); }
+    std::string password_reset_url() const {
+        return page_url("forgot-password?return=launcher");
+    }
+    std::string account_url() const { return page_url("account"); }
 };
 
 // The single source of truth for online endpoints.  Populated at startup from

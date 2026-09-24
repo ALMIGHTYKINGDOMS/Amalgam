@@ -22,6 +22,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+// Keep this in lockstep with the launcher's update parser. A release tool
+// must never sign a manifest the launcher is guaranteed to reject.
+export const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024 * 1024;
+
 const FIELD_ORDER = [
   "channel",
   "download_url",
@@ -60,6 +64,60 @@ export function signFile(pemPrivateKey, filePath) {
     .toString("base64");
 }
 
+/** Verify a base64 RSA-SHA256 signature over raw file bytes. */
+export function verifyFile(pemPublicKey, filePath, signatureB64) {
+  try {
+    return crypto.verify(
+      "sha256",
+      fs.readFileSync(filePath),
+      pemPublicKey,
+      Buffer.from(signatureB64, "base64")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Return a precise validity result for an update payload size. */
+export function validatePayloadSize(value) {
+  const size = Number(value);
+  if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_PAYLOAD_BYTES) {
+    return { ok: false, size: null, error: `size must be a positive integer no greater than ${MAX_PAYLOAD_BYTES}` };
+  }
+  return { ok: true, size, error: null };
+}
+
+/** Verify a manifest's declared payload identity against a local final ZIP. */
+export function verifyPayload(manifest, filePath, pemPublicKey, {
+  requirePayloadSignature = true,
+} = {}) {
+  if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    return { ok: false, error: "payload file is missing" };
+  }
+  const sizeResult = validatePayloadSize(manifest?.size);
+  if (!sizeResult.ok) return sizeResult;
+  const actualSize = fs.statSync(filePath).size;
+  if (actualSize !== sizeResult.size) {
+    return { ok: false, error: `payload size mismatch: manifest=${sizeResult.size} actual=${actualSize}` };
+  }
+  if (!/^[a-f0-9]{64}$/i.test(manifest?.sha256 || "")) {
+    return { ok: false, error: "manifest payload hash is malformed" };
+  }
+  const actualHash = sha256File(filePath);
+  if (actualHash !== manifest.sha256.toLowerCase()) {
+    return { ok: false, error: "payload hash mismatch" };
+  }
+  if (!manifest.signature) {
+    return requirePayloadSignature
+      ? { ok: false, error: "missing payload signature" }
+      : { ok: true, error: null };
+  }
+  if (!verifyFile(pemPublicKey, filePath, manifest.signature)) {
+    return { ok: false, error: "payload signature verification failed" };
+  }
+  return { ok: true, error: null };
+}
+
 /** Verify a base64 RSA-SHA256 signature over a string. Returns bool. */
 export function verifyString(pemPublicKey, data, signatureB64) {
   try {
@@ -89,9 +147,9 @@ export function verifyManifest(manifest, pemPublicKey, { requireSigned = true } 
 
 function usage() {
   console.log(`Usage:
-  node update-manifest.mjs generate --version V --channel CH --url URL --sha256 H [--size N] [--min-version MV] [--notes TEXT] [--mandatory] [--private-key KEY.pem] [--out manifest.json]
+  node update-manifest.mjs generate --version V --channel CH --url URL (--file payload.zip | --sha256 H --size N) [--min-version MV] [--notes TEXT] [--mandatory] --private-key KEY.pem [--out manifest.json] [--allow-unsigned-dev]
   node update-manifest.mjs sign-payload --manifest manifest.json --file payload.zip --private-key KEY.pem [--out manifest.json]
-  node update-manifest.mjs verify --manifest manifest.json --public-key PUB.pem [--require-signed]
+  node update-manifest.mjs verify --manifest manifest.json --public-key PUB.pem [--payload payload.zip] [--require-payload-signature] [--allow-unsigned-dev]
   node update-manifest.mjs hash --file PATH`);
 }
 
@@ -104,7 +162,8 @@ function parseArgs(argv) {
     // key and produced unsigned manifests.
     const name = key.slice(2).replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase());
     const val = argv[i + 1];
-    if (key === "--mandatory" || key === "--require-signed") {
+    if (key === "--mandatory" || key === "--require-signed" ||
+        key === "--require-payload-signature" || key === "--allow-unsigned-dev") {
       args[name] = true;
       i -= 1;
     } else {
@@ -133,16 +192,47 @@ function main() {
   }
 
   if (cmd === "generate") {
-    if (!a.version || !a.channel || !a.url || !a.sha256) {
-      console.error("generate requires --version --channel --url --sha256");
+    if (!a.version || !a.channel || !a.url) {
+      console.error("generate requires --version --channel --url and a payload identity");
+      process.exit(2);
+    }
+    if (a.file) {
+      if (!fs.existsSync(a.file) || !fs.statSync(a.file).isFile()) {
+        console.error("--file must name an existing payload file");
+        process.exit(2);
+      }
+      const derivedHash = sha256File(a.file);
+      const derivedSize = fs.statSync(a.file).size;
+      if (a.sha256 && a.sha256.toLowerCase() !== derivedHash) {
+        console.error("--sha256 does not match --file");
+        process.exit(2);
+      }
+      if (a.size !== undefined && Number(a.size) !== derivedSize) {
+        console.error("--size does not match --file");
+        process.exit(2);
+      }
+      a.sha256 = derivedHash;
+      a.size = String(derivedSize);
+    }
+    if (!a.sha256 || a.size === undefined) {
+      console.error("generate requires --file or both --sha256 and --size");
       process.exit(2);
     }
     if (!/^[a-f0-9]{64}$/i.test(a.sha256)) {
       console.error("--sha256 must be a 64-character hex digest");
       process.exit(2);
     }
+    const sizeResult = validatePayloadSize(a.size);
+    if (!sizeResult.ok) {
+      console.error(`--${sizeResult.error}`);
+      process.exit(2);
+    }
     if (a.url && !a.url.startsWith("https://")) {
       console.error("--url must be https://");
+      process.exit(2);
+    }
+    if (!a.privateKey && !a.allowUnsignedDev) {
+      console.error("generate requires --private-key (use --allow-unsigned-dev only for local fixtures)");
       process.exit(2);
     }
     const manifest = {
@@ -150,7 +240,7 @@ function main() {
       channel: a.channel,
       download_url: a.url,
       sha256: a.sha256.toLowerCase(),
-      size: a.size !== undefined ? Number(a.size) : -1,
+      size: sizeResult.size,
       min_version: a.minVersion || "",
       notes: a.notes || "",
       mandatory: Boolean(a.mandatory),
@@ -167,7 +257,7 @@ function main() {
     }
     const out = a.out || "manifest.json";
     fs.writeFileSync(out, JSON.stringify(manifest, null, 2) + "\n");
-    console.log(`wrote ${out}${key ? " (signed)" : " (UNSIGNED — not for production)"}`);
+    console.log(`wrote ${out}${key ? " (signed)" : " (unsigned development fixture)"}`);
     return;
   }
 
@@ -187,6 +277,11 @@ function main() {
     }
     manifest.sha256 = actual;
     manifest.size = fs.statSync(a.file).size;
+    const sizeResult = validatePayloadSize(manifest.size);
+    if (!sizeResult.ok) {
+      console.error(sizeResult.error);
+      process.exit(2);
+    }
     // Payload signature covers the raw file bytes; re-sign the manifest
     // because size/hash were pinned to the real artifact.
     manifest.signature = signFile(key, a.file);
@@ -201,16 +296,23 @@ function main() {
     const manifest = JSON.parse(fs.readFileSync(a.manifest, "utf-8"));
     const pub = fs.readFileSync(a.publicKey, "utf-8");
     const result = verifyManifest(manifest, pub, {
-      requireSigned: Boolean(a.requireSigned),
+      requireSigned: !a.allowUnsignedDev,
     });
     if (!result.ok) {
       console.error(`VERIFY FAIL: ${result.error}`);
       process.exit(1);
     }
-    if (manifest.signature) {
-      // Payload signature cannot be checked without the payload file; the
-      // C++ updater checks it against the staged bytes.
-      console.log("VERIFY OK (manifest_signature valid; payload signature checked by updater)");
+    if (a.payload) {
+      const payloadResult = verifyPayload(manifest, a.payload, pub, {
+        requirePayloadSignature: !a.allowUnsignedDev || Boolean(a.requirePayloadSignature),
+      });
+      if (!payloadResult.ok) {
+        console.error(`VERIFY FAIL: ${payloadResult.error}`);
+        process.exit(1);
+      }
+      console.log("VERIFY OK (manifest + final payload signatures, hash, and size valid)");
+    } else if (manifest.signature) {
+      console.log("VERIFY OK (manifest signature valid; pass --payload to verify final payload bytes)");
     } else {
       console.log("VERIFY OK (manifest signature valid; unsigned payload)");
     }

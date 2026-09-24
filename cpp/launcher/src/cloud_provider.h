@@ -10,10 +10,10 @@ namespace aml::hosting {
 // ---------------------------------------------------------------------------
 // Website catalog provider
 //
-// The launcher does not provision or manage Amalgam Cloud servers. This
-// provider supplies the approved read-only plan catalog for the Cloud landing
-// page; all deployment, billing, and management happen on the website.
-// Mutating operations deliberately fail with a website-managed explanation.
+// The launcher does not provision or manage Amalgam Cloud servers, and it does
+// not claim a current plan catalog or deployment list without an authorized
+// read-only integration. All Cloud details and actions remain on the official
+// website; this compatibility surface returns a website-managed explanation.
 // ---------------------------------------------------------------------------
 
 class WebsiteCatalogProvider : public IHostingProvider {
@@ -113,7 +113,7 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Read-only catalog accessor
+// Website-handoff provider accessor
 // ---------------------------------------------------------------------------
 
 IHostingProvider* cloud_provider();

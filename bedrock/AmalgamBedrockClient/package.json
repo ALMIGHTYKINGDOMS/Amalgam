@@ -6,6 +6,7 @@
   "scripts": {
     "validate": "node tools/validate.js",
     "version": "node tools/version.js",
+    "test": "node --test test/truth-correctness.test.mjs",
     "build": "node tools/package.js --build-only",
     "package": "node tools/package.js"
   },

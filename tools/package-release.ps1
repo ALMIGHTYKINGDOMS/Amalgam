@@ -8,14 +8,217 @@ param(
     [string]$WebsiteUrl = $env:AMALGAM_WEBSITE_URL,
     [string]$ApiUrl = $env:AMALGAM_API_URL,
     [switch]$RequireOnlineConfig,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    # Regenerate only the derived package metadata and ZIP from an existing
+    # staged payload. This is the only safe post-signing path: it never copies
+    # fresh unsigned binaries over the signed stage.
+    [switch]$FinalizeExistingStage,
+    # Intended for the production signing sequence. It verifies that the two
+    # staged native binaries are authenticode-valid before their new hashes and
+    # the final ZIP are written.
+    [switch]$RequireSignedStagedBinaries
 )
 
 $ErrorActionPreference = "Stop"
-$BuildDir = (Resolve-Path $BuildDir).Path
+if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
+    throw "Version may contain only letters, digits, dots, underscores, and hyphens"
+}
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
-$stage = Join-Path $OutputDir "amalgam-$Version"
-$zip = Join-Path $OutputDir "amalgam-$Version.zip"
+$stage = [IO.Path]::GetFullPath((Join-Path $OutputDir "amalgam-$Version"))
+$zip = [IO.Path]::GetFullPath((Join-Path $OutputDir "amalgam-$Version.zip"))
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+
+function Assert-ReleaseArtifactPath([string]$Path, [string]$Name) {
+    $rootPath = [IO.Path]::GetFullPath($OutputDir)
+    if (-not $rootPath.EndsWith([IO.Path]::DirectorySeparatorChar)) {
+        $rootPath += [IO.Path]::DirectorySeparatorChar
+    }
+    if (-not $Path.StartsWith($rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Name escapes the requested output directory"
+    }
+}
+
+function Remove-DerivedReleaseFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Expected a file at derived artifact path, found a directory: $Path"
+    }
+    Remove-Item -LiteralPath $Path -Force
+}
+
+function Assert-StagedNativeBinaries([string]$StageDir, [switch]$RequireSignatures) {
+    foreach ($name in @("amalgam_launcher.exe", "amalgam.dll")) {
+        $path = Join-Path $StageDir $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Staged native artifact is missing: $path"
+        }
+        if ((Get-Item -LiteralPath $path).Length -le 0) {
+            throw "Staged native artifact is empty: $path"
+        }
+        if ($RequireSignatures) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            if ($signature.Status -ne "Valid") {
+                throw "Staged native artifact is not validly signed: $name ($($signature.Status))"
+            }
+        }
+    }
+}
+
+function Assert-BedrockPackageIntegrity(
+    [string]$PackagePath,
+    [string]$InventoryPath,
+    [string]$HashPath,
+    [string]$ReleaseVersion,
+    [string]$PackageContext
+) {
+    foreach ($artifact in @(
+        @{ path = $PackagePath; name = "Bedrock client package" },
+        @{ path = $InventoryPath; name = "Bedrock package inventory" },
+        @{ path = $HashPath; name = "Bedrock package SHA-256 record" }
+    )) {
+        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) {
+            throw "$($artifact.name) is missing or is not a file: $($artifact.path)"
+        }
+    }
+
+    try {
+        $bedrockInventory = Get-Content -LiteralPath $InventoryPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Bedrock package inventory is invalid JSON: $InventoryPath"
+    }
+    if ($null -eq $bedrockInventory -or $bedrockInventory -is [System.Array]) {
+        throw "Bedrock package inventory must contain one JSON object: $InventoryPath"
+    }
+
+    $expectedArchive = "AmalgamBedrockClient-$ReleaseVersion.mcaddon"
+    $inventoryVersion = [string]$bedrockInventory.version
+    $inventoryPackage = [string]$bedrockInventory.package
+    if ($inventoryVersion -ne $ReleaseVersion -or $inventoryPackage -ne $expectedArchive) {
+        throw "Bedrock package metadata version mismatch. Expected $ReleaseVersion, found $inventoryVersion"
+    }
+
+    $inventoryHash = ([string]$bedrockInventory.sha256).Trim()
+    if ($inventoryHash -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "Bedrock package inventory SHA-256 is missing or malformed: $InventoryPath"
+    }
+    $inventoryHash = $inventoryHash.ToLowerInvariant()
+
+    $hashLines = @(Get-Content -LiteralPath $HashPath)
+    if ($hashLines.Count -ne 1) {
+        throw "Bedrock package SHA-256 record must contain exactly one archive entry: $HashPath"
+    }
+    if (([string]$hashLines[0]) -notmatch '^(?<hash>[0-9a-fA-F]{64})\s{2,}(?<archive>.+)$') {
+        throw "Bedrock package SHA-256 record is malformed: $HashPath"
+    }
+    if ($Matches['archive'] -cne $expectedArchive) {
+        throw "Bedrock package hash metadata version mismatch for $ReleaseVersion"
+    }
+    $hashRecordHash = $Matches['hash'].ToLowerInvariant()
+
+    $actualHash = (Get-FileHash -LiteralPath $PackagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($inventoryHash -ne $actualHash) {
+        throw "Bedrock package inventory SHA-256 does not match $PackageContext bytes. Rebuild bedrock\\AmalgamBedrockClient with npm run package, then package again."
+    }
+    if ($hashRecordHash -ne $actualHash) {
+        throw "Bedrock package SHA-256 record does not match $PackageContext bytes. Rebuild bedrock\\AmalgamBedrockClient with npm run package, then package again."
+    }
+}
+
+function Write-ReleaseMetadata([string]$StageDir, [string]$ReleaseVersion) {
+    # A previous packaging pass leaves derived files behind. Remove only these
+    # exact, known output files before recomputing metadata so the SBOM cannot
+    # be self-referential and signatures/hashes cannot describe stale bytes.
+    foreach ($derivedName in @("component-manifest.json", "sbom.cdx.json", "release.sha256")) {
+        Remove-DerivedReleaseFile (Join-Path $StageDir $derivedName)
+    }
+
+    $components = @(
+        Get-ChildItem -LiteralPath $StageDir -Recurse -File |
+            Where-Object { $_.Name -notin @("component-manifest.json", "sbom.cdx.json", "release.sha256") } |
+            Sort-Object FullName |
+            ForEach-Object {
+                $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+                [PSCustomObject]@{
+                    name = $_.FullName.Substring($StageDir.Length + 1).Replace("\", "/")
+                    sha256 = $hash.Hash.ToLowerInvariant()
+                    size = $_.Length
+                }
+            }
+    )
+    if ($components.Count -eq 0) {
+        throw "Staged release contains no payload files: $StageDir"
+    }
+    [IO.File]::WriteAllText((Join-Path $StageDir "component-manifest.json"),
+        ($components | ConvertTo-Json -Depth 3), $utf8)
+
+    $sbomComponents = @(
+        $components | ForEach-Object {
+            [PSCustomObject]@{
+                type = if ($_.name -like "bridges/*") { "library" } else { "application" }
+                name = $_.name
+                version = $ReleaseVersion
+                hashes = @([PSCustomObject]@{ alg = "SHA-256"; content = $_.sha256 })
+            }
+        }
+    )
+    $sbom = [ordered]@{
+        bomFormat = "CycloneDX"
+        specVersion = "1.5"
+        serialNumber = "urn:uuid:$([guid]::NewGuid())"
+        version = 1
+        metadata = [ordered]@{
+            timestamp = [DateTime]::UtcNow.ToString("o")
+            tools = @([ordered]@{ vendor = "Amalgam"; name = "package-release.ps1"; version = "1" })
+        }
+        components = $sbomComponents
+    }
+    [IO.File]::WriteAllText((Join-Path $StageDir "sbom.cdx.json"),
+        ($sbom | ConvertTo-Json -Depth 8), $utf8)
+
+    $hashLines = @()
+    Get-ChildItem -LiteralPath $StageDir -Recurse -File | Sort-Object FullName | ForEach-Object {
+        $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+        $relative = $_.FullName.Substring($StageDir.Length + 1).Replace("\", "/")
+        $hashLines += "$($hash.Hash.ToLowerInvariant())  $relative"
+    }
+    [IO.File]::WriteAllLines((Join-Path $StageDir "release.sha256"), $hashLines, $utf8)
+}
+
+function Write-ReleaseArchive([string]$StageDir, [string]$ArchivePath) {
+    Remove-DerivedReleaseFile $ArchivePath
+    Compress-Archive -Path (Join-Path $StageDir "*") -DestinationPath $ArchivePath -CompressionLevel Optimal
+    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf) -or
+        (Get-Item -LiteralPath $ArchivePath).Length -le 0) {
+        throw "Final release archive was not created: $ArchivePath"
+    }
+}
+
+Assert-ReleaseArtifactPath $stage "Release staging directory"
+Assert-ReleaseArtifactPath $zip "Release archive"
+if ($RequireSignedStagedBinaries -and -not $FinalizeExistingStage) {
+    throw "-RequireSignedStagedBinaries is only valid with -FinalizeExistingStage"
+}
+
+if ($FinalizeExistingStage) {
+    if (-not (Test-Path -LiteralPath $stage -PathType Container)) {
+        throw "Existing release staging directory is missing: $stage"
+    }
+    Assert-StagedNativeBinaries $stage -RequireSignatures:$RequireSignedStagedBinaries
+    $stagedBedrockDir = Join-Path $stage "bedrock"
+    Assert-BedrockPackageIntegrity `
+        -PackagePath (Join-Path $stagedBedrockDir "AmalgamBedrockClient.mcaddon") `
+        -InventoryPath (Join-Path $stagedBedrockDir "package-inventory.json") `
+        -HashPath (Join-Path $stagedBedrockDir "package-sha256.txt") `
+        -ReleaseVersion $Version `
+        -PackageContext "staged Bedrock package"
+    Write-ReleaseMetadata $stage $Version
+    Write-ReleaseArchive $stage $zip
+    Write-Output "Finalized staged release after signing: $zip"
+    return
+}
+
+$BuildDir = (Resolve-Path $BuildDir).Path
 
 if ([string]::IsNullOrWhiteSpace($WebsiteUrl)) { $WebsiteUrl = "https://amalgam-mc.com/" }
 if (-not [string]::IsNullOrWhiteSpace($MicrosoftClientId) -and
@@ -110,19 +313,12 @@ if (-not (Test-Path -LiteralPath $bedrockPackage)) {
 }
 $bedrockInventoryPath = Join-Path $bedrockDir "package-inventory.json"
 $bedrockHashPath = Join-Path $bedrockDir "package-sha256.txt"
-if (-not (Test-Path -LiteralPath $bedrockInventoryPath) -or
-    -not (Test-Path -LiteralPath $bedrockHashPath)) {
-    throw "Bedrock package metadata is missing: expected package-inventory.json and package-sha256.txt"
-}
-$bedrockInventory = Get-Content -LiteralPath $bedrockInventoryPath -Raw | ConvertFrom-Json
-if ($bedrockInventory.version -ne $Version -or
-    $bedrockInventory.package -ne "AmalgamBedrockClient-$Version.mcaddon") {
-    throw "Bedrock package metadata version mismatch. Expected $Version, found $($bedrockInventory.version)"
-}
-$bedrockHashLine = (Get-Content -LiteralPath $bedrockHashPath | Select-Object -First 1)
-if ($bedrockHashLine -notmatch [regex]::Escape("AmalgamBedrockClient-$Version.mcaddon") + '$') {
-    throw "Bedrock package hash metadata version mismatch for $Version"
-}
+Assert-BedrockPackageIntegrity `
+    -PackagePath $bedrockPackage `
+    -InventoryPath $bedrockInventoryPath `
+    -HashPath $bedrockHashPath `
+    -ReleaseVersion $Version `
+    -PackageContext "build Bedrock package"
 $bedrockListing = (& "C:\Windows\System32\tar.exe" -tf $bedrockPackage 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0 -or
     $bedrockListing -notmatch [regex]::Escape("Amalgam Bedrock Behavior Pack.mcpack") -or
@@ -138,12 +334,26 @@ if (-not $SkipTests) {
     }
     if (-not $ctest) { throw "ctest.exe was not found" }
     $ctestPath = if ($ctest.Source) { $ctest.Source } else { $ctest.FullName }
+    # CTest considers an empty test registry a successful invocation. A release
+    # package must never use that as proof that its native test gate ran.
+    $ctestInventory = (& $ctestPath --test-dir $BuildDir -N 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "CTest could not enumerate tests: $ctestInventory" }
+    if ($ctestInventory -notmatch 'Total Tests:\s+([1-9][0-9]*)') {
+        throw "CTest found no configured tests in $BuildDir"
+    }
     & $ctestPath --test-dir $BuildDir --output-on-failure
     if ($LASTEXITCODE -ne 0) { throw "CTest failed" }
 }
 
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+if (Test-Path -LiteralPath $stage) {
+    if (-not (Test-Path -LiteralPath $stage -PathType Container)) {
+        throw "Expected a staging directory, found a file: $stage"
+    }
+    # $stage is version-validated and asserted to be below the requested
+    # output root above; no user profile, workspace, or wildcard is removed.
+    Remove-Item -LiteralPath $stage -Recurse -Force
+}
+Remove-DerivedReleaseFile $zip
 New-Item -ItemType Directory -Path (Join-Path $stage "bridges") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $stage "branding") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $stage "bedrock") -Force | Out-Null
@@ -156,6 +366,12 @@ foreach ($metadata in @("package-inventory.json", "package-sha256.txt")) {
         Copy-Item -LiteralPath $metadataPath -Destination (Join-Path $stage "bedrock")
     }
 }
+Assert-BedrockPackageIntegrity `
+    -PackagePath (Join-Path $stage "bedrock\AmalgamBedrockClient.mcaddon") `
+    -InventoryPath (Join-Path $stage "bedrock\package-inventory.json") `
+    -HashPath (Join-Path $stage "bedrock\package-sha256.txt") `
+    -ReleaseVersion $Version `
+    -PackageContext "staged Bedrock package"
 foreach ($bridge in $bridges) {
     Copy-Item -LiteralPath $bridge.FullName -Destination (Join-Path $stage "bridges")
 }
@@ -275,14 +491,12 @@ $templateData = [ordered]@{
     microsoft_client_id = $MicrosoftClientId
     supabase_url = $SupabaseUrl
     supabase_anon_key = $SupabasePublishableKey
-    supabase_service_key = ""
     website_url = $WebsiteUrl
     api_url = $ApiUrl
     username = ""
     ai_providers = @()
 }
 $template = $templateData | ConvertTo-Json -Depth 4
-$utf8 = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $stage "launcher.json.template"), $template, $utf8)
 $prerequisites = @'
 {
@@ -292,53 +506,6 @@ $prerequisites = @'
 } 
 '@
 [IO.File]::WriteAllText((Join-Path $stage "prerequisites.json"), $prerequisites, $utf8)
-
-$components = @(
-    Get-ChildItem -LiteralPath $stage -Recurse -File |
-        Where-Object { $_.Name -notin @("component-manifest.json", "release.sha256") } |
-        Sort-Object FullName |
-        ForEach-Object {
-            $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
-            [PSCustomObject]@{
-                name = $_.FullName.Substring($stage.Length + 1).Replace("\", "/")
-                sha256 = $hash.Hash.ToLowerInvariant()
-                size = $_.Length
-            }
-        }
-)
-[IO.File]::WriteAllText((Join-Path $stage "component-manifest.json"),
-    ($components | ConvertTo-Json -Depth 3), $utf8)
-
-$sbomComponents = @(
-    $components | ForEach-Object {
-        [PSCustomObject]@{
-            type = if ($_.name -like "bridges/*") { "library" } else { "application" }
-            name = $_.name
-            version = $Version
-            hashes = @([PSCustomObject]@{ alg = "SHA-256"; content = $_.sha256 })
-        }
-    }
-)
-$sbom = [ordered]@{
-    bomFormat = "CycloneDX"
-    specVersion = "1.5"
-    serialNumber = "urn:uuid:$([guid]::NewGuid())"
-    version = 1
-    metadata = [ordered]@{
-        timestamp = [DateTime]::UtcNow.ToString("o")
-        tools = @([ordered]@{ vendor = "Amalgam"; name = "package-release.ps1"; version = "1" })
-    }
-    components = $sbomComponents
-}
-[IO.File]::WriteAllText((Join-Path $stage "sbom.cdx.json"),
-    ($sbom | ConvertTo-Json -Depth 8), $utf8)
-
-$hashLines = @()
-Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName | ForEach-Object {
-    $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
-    $relative = $_.FullName.Substring($stage.Length + 1).Replace("\", "/")
-    $hashLines += "$($hash.Hash.ToLowerInvariant())  $relative"
-}
-[IO.File]::WriteAllLines((Join-Path $stage "release.sha256"), $hashLines, $utf8)
-Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
+Write-ReleaseMetadata $stage $Version
+Write-ReleaseArchive $stage $zip
 Write-Output "Packaged $zip"

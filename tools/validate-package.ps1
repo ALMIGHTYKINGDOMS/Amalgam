@@ -72,8 +72,8 @@ try {
         }
     }
     $templateConfig = Get-Content -LiteralPath $templatePath -Raw | ConvertFrom-Json
-    if (-not [string]::IsNullOrWhiteSpace([string]$templateConfig.supabase_service_key)) {
-        throw "Supabase service-role credentials must never ship in the launcher"
+    if ($templateConfig.PSObject.Properties.Name -contains "supabase_service_key") {
+        throw "Launcher configuration template must not contain a Supabase service-role key field"
     }
     $publicOnline = @(
         [string]$templateConfig.microsoft_client_id,

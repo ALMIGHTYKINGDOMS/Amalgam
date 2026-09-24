@@ -53,17 +53,22 @@ export class EventCollector {
   }
 
   metric(name, value, options = {}) {
+    // Telemetry callers use null for a genuinely unobservable measurement.
+    // Do not coerce null, an empty string, or a boolean into zero: that turns
+    // "unknown" into a misleading healthy-looking datapoint.
+    if (typeof value !== "number" || !Number.isFinite(value)) return false;
     this.metricBuffer.push({
       source: this.source,
       source_node_id: this.nodeId,
       user_id: options.userId || null,
       metric_name: name,
       metric_type: options.type || "gauge",
-      value: Number.isFinite(Number(value)) ? Number(value) : 0,
+      value,
       unit: options.unit || "",
       tags: options.tags || {},
     });
     this._maybeFlush();
+    return true;
   }
 
   error(errorType, message, options = {}) {

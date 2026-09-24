@@ -2,14 +2,21 @@ param(
     [string]$BuildDir = 'cpp/build-release'
 )
 
-$ErrorActionPreference = 'Continue'
-$tests = Get-ChildItem $BuildDir -Filter 'amalgam_*_test.exe'
+$ErrorActionPreference = 'Stop'
+$BuildDir = (Resolve-Path -LiteralPath $BuildDir).Path
+$tests = @(Get-ChildItem -LiteralPath $BuildDir -Filter 'amalgam_*_test.exe' -File |
+    Sort-Object Name)
+if ($tests.Count -eq 0) {
+    throw "No native test executables were found in $BuildDir"
+}
 $fail = 0
 $passed = 0
 foreach ($t in $tests) {
-    & $t.FullName *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Output ("FAIL: " + $t.Name + " exit=" + $LASTEXITCODE)
+    $output = & $t.FullName 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        Write-Output ("FAIL: " + $t.Name + " exit=" + $exitCode)
+        if ($output) { $output | Write-Output }
         $fail++
     } else {
         Write-Output ("PASS: " + $t.Name)

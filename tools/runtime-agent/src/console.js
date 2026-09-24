@@ -65,11 +65,14 @@ export async function collectAndReportTelemetry(supabase, nodeInfo, config, mana
         p_server_id: serverId,
         p_node_id: nodeInfo.id,
         p_node_secret: config.nodeSecret,
-        p_cpu_pct: 0, // Would need OS-level monitoring
-        p_memory_used_mb: 0, // Would need jstat or JMX
-        p_memory_max_mb: 0,
-        p_memory_pct: 0,
-        p_disk_used_mb: 0,
+        // Per-process CPU, heap, and disk metrics are not available without a
+        // JVM/JMX probe. Send null so the database can preserve "unknown"
+        // rather than storing a fabricated zero.
+        p_cpu_pct: null,
+        p_memory_used_mb: null,
+        p_memory_max_mb: null,
+        p_memory_pct: null,
+        p_disk_used_mb: null,
         p_thread_count: parsed.threadCount,
         p_heap_used_mb: parsed.heapUsedMb,
         p_heap_max_mb: parsed.heapMaxMb,
@@ -81,7 +84,17 @@ export async function collectAndReportTelemetry(supabase, nodeInfo, config, mana
         p_player_count: parsed.playerCount,
         p_chunk_count: parsed.chunkCount,
         p_uptime_ms: uptimeMs,
-        p_metadata: parsed.metadata,
+        p_metadata: {
+          ...parsed.metadata,
+          availability: {
+            tps: parsed.tps !== null,
+            mspt: parsed.mspt !== null,
+            players: parsed.playerCount !== null,
+            entities: parsed.entityCount !== null,
+            chunks: parsed.chunkCount !== null,
+            heap: parsed.heapUsedMb !== null || parsed.heapMaxMb !== null,
+          },
+        },
       });
       if (error) throw new Error(error.message || "telemetry RPC failed");
       eventCollector?.telemetryReported(serverId, {
@@ -105,16 +118,16 @@ export async function collectAndReportTelemetry(supabase, nodeInfo, config, mana
  */
 export function parseMinecraftMetrics(lines) {
   const metrics = {
-    tps: 20.0,
-    mspt: 0,
-    playerCount: 0,
-    entityCount: 0,
-    chunkCount: 0,
-    threadCount: 0,
-    heapUsedMb: 0,
-    heapMaxMb: 0,
-    gcCount: 0,
-    gcTimeMs: 0,
+    tps: null,
+    mspt: null,
+    playerCount: null,
+    entityCount: null,
+    chunkCount: null,
+    threadCount: null,
+    heapUsedMb: null,
+    heapMaxMb: null,
+    gcCount: null,
+    gcTimeMs: null,
     metadata: {},
   };
 
@@ -159,7 +172,7 @@ export function parseMinecraftMetrics(lines) {
     if (gcMatch) {
       metrics.heapUsedMb = parseInt(gcMatch[2], 10);
       metrics.heapMaxMb = parseInt(gcMatch[3], 10);
-      metrics.gcCount++;
+      metrics.gcCount = (metrics.gcCount || 0) + 1;
     }
 
     // Memory from /gc or /memory command output

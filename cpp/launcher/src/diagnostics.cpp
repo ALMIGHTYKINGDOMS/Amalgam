@@ -3,8 +3,8 @@
 #include "java.h"
 #include "ai.h"
 #include "ai_core.h"
-#include "config.h"
-#include "net.h"
+#include "ui.h"
+#include "updater.h"
 
 #include <windows.h>
 #include <filesystem>
@@ -37,7 +37,12 @@ CheckResult check_launcher_version() {
     auto sz = fs::file_size(p, ec);
     if (ec || sz < 1000000)  // less than 1MB is suspicious
         return err("Launcher", "Binary integrity", "Executable missing or too small");
-    return ok("Launcher", "Binary integrity", "Version 1.0.0");
+    const char* version = ui::launcher_version();
+    if (!version || !*version) {
+        return err("Launcher", "Binary integrity",
+                   "Launcher release version is unavailable.");
+    }
+    return ok("Launcher", "Binary integrity", local_state::version_detail(version));
 }
 
 CheckResult check_java_runtime() {
@@ -52,14 +57,8 @@ CheckResult check_java_runtime() {
     return ok("Java", "Runtime detection", versions);
 }
 
-CheckResult check_backend_connectivity() {
-    // Lightweight check: try to reach a known endpoint.
-    std::vector<uint8_t> response;
-    std::string error;
-    bool reachable = net::get(L"https://api.modrinth.com/v2/tag/game_version", response, &error);
-    if (!reachable)
-        return warn("Backend", "Network connectivity", "Cannot reach Modrinth API: " + error);
-    return ok("Backend", "Network connectivity", "Modrinth API reachable");
+CheckResult check_backend_connectivity(const config::Config& config, bool backend_initialized) {
+    return local_state::backend(config, backend_initialized);
 }
 
 CheckResult check_ai_models() {
@@ -92,38 +91,16 @@ CheckResult check_ai_art() {
 }
 
 CheckResult check_providers() {
-    // Check Modrinth API.
-    std::vector<uint8_t> response;
-    std::string error;
-    bool modrinth = net::get(L"https://api.modrinth.com/v2/tag/game_version", response, &error);
-    if (!modrinth)
-        return warn("Providers", "Modrinth", "Unreachable: " + error);
-
-    // CurseForge doesn't have a free API endpoint to probe without a key.
-    return ok("Providers", "Modrinth", "Available");
+    return local_state::providers();
 }
 
-CheckResult check_essentials() {
-    // Essentials requires Supabase backend — check if configured.
-    // Without a real session, we can only verify the network path.
-    std::vector<uint8_t> response;
-    std::string error;
-    bool reachable = net::get(L"https://api.modrinth.com/v2/tag/game_version", response, &error);
-    if (!reachable)
-        return warn("Essentials", "Network", "Network unavailable for Essentials");
-    return ok("Essentials", "Network", "Online (Supabase session required for full features)");
+CheckResult check_essentials(const config::Config& config, bool backend_initialized,
+                             bool backend_authenticated) {
+    return local_state::essentials(config, backend_initialized, backend_authenticated);
 }
 
 CheckResult check_updater() {
-    // Verify the updater manifest endpoint is reachable.
-    // For now, just confirm the updater binary exists.
-    wchar_t buf[MAX_PATH];
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    auto dir = fs::path(buf).parent_path();
-    auto updater = dir / L"updater.exe";
-    if (!fs::exists(updater))
-        return warn("Updater", "Binary", "updater.exe not found alongside launcher");
-    return ok("Updater", "Binary", "updater.exe present");
+    return local_state::updater(updater::has_signing_key());
 }
 
 CheckResult check_disk_space() {
@@ -151,15 +128,16 @@ CheckResult check_bedrock() {
     return warn("Bedrock", "Minecraft for Windows", "Not installed");
 }
 
-std::vector<CheckResult> run_all() {
+std::vector<CheckResult> run_all(const config::Config& config, bool backend_initialized,
+                                 bool backend_authenticated) {
     std::vector<CheckResult> results;
     results.push_back(check_launcher_version());
     results.push_back(check_java_runtime());
-    results.push_back(check_backend_connectivity());
+    results.push_back(check_backend_connectivity(config, backend_initialized));
     results.push_back(check_ai_models());
     results.push_back(check_ai_art());
     results.push_back(check_providers());
-    results.push_back(check_essentials());
+    results.push_back(check_essentials(config, backend_initialized, backend_authenticated));
     results.push_back(check_updater());
     results.push_back(check_disk_space());
     results.push_back(check_bedrock());

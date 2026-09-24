@@ -36,6 +36,16 @@ bool has_staging_folder(const std::filesystem::path& root) {
     return false;
 }
 
+bool has_import_staging_folder(const std::filesystem::path& root) {
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
+        if (error) return true;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(".amalgam-import-", 0) == 0) return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 int main() {
@@ -72,7 +82,8 @@ int main() {
         return 1;
     }
     if (imported.minecraft_version != instance.minecraft_version || imported.loader != instance.loader ||
-        !fs::exists(fs::path(imported.directory) / "mods" / "example.jar")) {
+        !fs::exists(fs::path(imported.directory) / "mods" / "example.jar") ||
+        has_import_staging_folder(instances_dir)) {
         std::cerr << "FAILED: imported Modrinth instance mismatch\n";
         return 1;
     }
@@ -89,6 +100,7 @@ int main() {
 
     // A rejected pack must never clear live profile files. This exercises the
     // staging path used by a published-pack update before the commit starts.
+    fs::create_directories(fs::path(target.directory) / "mods");
     fs::create_directories(fs::path(target.directory) / "config");
     fs::create_directories(fs::path(target.directory) / "saves" / "world");
     std::ofstream(fs::path(target.directory) / "mods" / "keep.jar", std::ios::binary) << "keep";
@@ -109,6 +121,39 @@ int main() {
         read_file(fs::path(target.directory) / "saves" / "world" / "level.dat") != "world" ||
         has_staging_folder(target.directory)) {
         std::cerr << "FAILED: rejected profile import changed live content " << error << "\n";
+        return 1;
+    }
+
+    // A long-running import must revalidate the selected profile immediately
+    // before activation. Simulate an edit while the candidate is staged; the
+    // new pack must not overwrite either the changed metadata or live files.
+    aml::instances::Instance stale_result;
+    bool changed_during_stage = false;
+    bool mutation_ok = true;
+    std::string stale_error;
+    const bool stale_import = aml::import_pack::archive_into(
+        mrpack.wstring(), target, api, stale_result,
+        [&](float, const std::string& detail) {
+            if (!changed_during_stage && detail.find("Files staged") != std::string::npos) {
+                aml::instances::Instance edited = target;
+                edited.name = "Edited while import was staging";
+                std::string mutation_error;
+                mutation_ok = aml::instances::save(edited, &mutation_error);
+                changed_during_stage = mutation_ok;
+            }
+            return true;
+        },
+        &stale_error);
+    if (stale_import || !changed_during_stage || !mutation_ok ||
+        read_file(fs::path(target.directory) / "mods" / "keep.jar") != "keep" ||
+        read_file(fs::path(target.directory) / "config" / "keep.cfg") != "config" ||
+        has_staging_folder(target.directory)) {
+        std::cerr << "FAILED: stale profile import was activated " << stale_error << "\n";
+        return 1;
+    }
+    if (!aml::instances::load(target.directory, target, &error) ||
+        target.name != "Edited while import was staging") {
+        std::cerr << "FAILED: stale profile import overwrote profile metadata " << error << "\n";
         return 1;
     }
 
@@ -154,6 +199,14 @@ int main() {
         fs::exists(fs::path(target.directory) / "amalgam-local-content.json") ||
         has_staging_folder(target.directory)) {
         std::cerr << "FAILED: existing profile import " << error << "\n";
+        return 1;
+    }
+    // archive_into intentionally replaces managed profile metadata along with
+    // managed content. Refresh the fixture's selected profile before opening
+    // the next preview so the production stale-selection guard sees the same
+    // persisted identity a real Library refresh would provide.
+    if (!aml::instances::load(target.directory, target, &error)) {
+        std::cerr << "FAILED: refresh committed profile " << error << "\n";
         return 1;
     }
 
@@ -228,6 +281,10 @@ int main() {
         std::cerr << "FAILED: protected override committed into user data " << error << "\n";
         return 1;
     }
+    // The successful creator update also replaces managed metadata. Keep the
+    // next negative archive test focused on traversal rejection rather than
+    // intentionally stale in-memory profile state.
+    target = committed;
     fs::path traversal_stage = fs::current_path() / "amalgam_import_pack_traversal";
     fs::path traversal_pack = fs::current_path() / "amalgam_import_pack_traversal.mrpack";
     fs::create_directories(traversal_stage);

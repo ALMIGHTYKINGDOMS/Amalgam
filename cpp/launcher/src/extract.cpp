@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cwctype>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -55,6 +56,48 @@ bool unsafe_entry(const std::wstring& entry) {
     return false;
 }
 
+std::wstring normalized_archive_path(std::wstring value) {
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    while (!value.empty() && value.back() == L'\\') value.pop_back();
+    for (wchar_t& c : value) c = static_cast<wchar_t>(std::towlower(c));
+    return value;
+}
+
+bool normalize_exclusions(const std::vector<std::string>& raw,
+                          std::vector<std::wstring>* normalized, std::string* err) {
+    normalized->clear();
+    normalized->reserve(raw.size());
+    for (const std::string& rule : raw) {
+        std::wstring value = net::to_wide(rule);
+        while (!value.empty() && (value.back() == L'/' || value.back() == L'\\')) {
+            value.pop_back();
+        }
+        if (value.empty() || value == L"." || unsafe_entry(value)) {
+            if (err) *err = "unsafe native extraction exclude rule";
+            return false;
+        }
+        normalized->push_back(normalized_archive_path(std::move(value)));
+    }
+    std::sort(normalized->begin(), normalized->end());
+    normalized->erase(std::unique(normalized->begin(), normalized->end()), normalized->end());
+    return true;
+}
+
+bool is_excluded(const std::wstring& relative,
+                 const std::vector<std::wstring>& exclusions) {
+    if (exclusions.empty()) return false;
+    const std::wstring normalized = normalized_archive_path(relative);
+    for (const std::wstring& rule : exclusions) {
+        if (normalized == rule ||
+            (normalized.size() > rule.size() &&
+             normalized.compare(0, rule.size(), rule) == 0 &&
+             normalized[rule.size()] == L'\\')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void remove_tree(const std::wstring& dir) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
@@ -81,6 +124,7 @@ void remove_tree(const std::wstring& dir) {
 }
 
 bool move_tree(const std::wstring& src, const std::wstring& dst, int64_t* total,
+               const std::wstring& relative, const std::vector<std::wstring>& exclusions,
                std::string* err) {
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((src + L"\\*").c_str(), &fd);
@@ -94,9 +138,13 @@ bool move_tree(const std::wstring& src, const std::wstring& dst, int64_t* total,
         }
         std::wstring s = src + L"\\" + fd.cFileName;
         std::wstring d = dst + L"\\" + fd.cFileName;
+        const std::wstring entry_relative = relative.empty()
+                                                ? std::wstring(fd.cFileName)
+                                                : relative + L"\\" + fd.cFileName;
+        if (is_excluded(entry_relative, exclusions)) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             CreateDirectoryW(d.c_str(), nullptr);
-            if (!move_tree(s, d, total, err)) {
+            if (!move_tree(s, d, total, entry_relative, exclusions, err)) {
                 FindClose(h);
                 return false;
             }
@@ -140,6 +188,10 @@ std::wstring quote(const std::wstring& s) {
     }
     out += L"\"";
     return out;
+}
+
+std::wstring at_file_argument(const std::wstring& path) {
+    return L"@" + quote(path);
 }
 
 std::wstring parent_of(const std::wstring& path) {
@@ -294,7 +346,8 @@ bool run_capture(const std::wstring& exe, const std::wstring& args, std::string*
     return true;
 }
 
-bool zip(const std::wstring& archive, const std::wstring& out_dir, std::string* err) {
+bool zip_impl(const std::wstring& archive, const std::wstring& out_dir,
+              const std::vector<std::wstring>& exclusions, std::string* err) {
     {
         std::ifstream f(archive, std::ios::binary);
         unsigned char hdr[4] = {0, 0, 0, 0};
@@ -371,12 +424,24 @@ bool zip(const std::wstring& archive, const std::wstring& out_dir, std::string* 
         return false;
     }
     int64_t total = 0;
-    if (!move_tree(staging, out_dir, &total, err)) {
+    if (!move_tree(staging, out_dir, &total, L"", exclusions, err)) {
         remove_tree(staging);
         return false;
     }
     remove_tree(staging);
     return true;
+}
+
+bool zip(const std::wstring& archive, const std::wstring& out_dir, std::string* err) {
+    static const std::vector<std::wstring> kNoExclusions;
+    return zip_impl(archive, out_dir, kNoExclusions, err);
+}
+
+bool zip_excluding(const std::wstring& archive, const std::wstring& out_dir,
+                   const std::vector<std::string>& exclusions, std::string* err) {
+    std::vector<std::wstring> normalized;
+    if (!normalize_exclusions(exclusions, &normalized, err)) return false;
+    return zip_impl(archive, out_dir, normalized, err);
 }
 
 bool create_zip(const std::wstring& source_dir, const std::wstring& archive, std::string* err) {

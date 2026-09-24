@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <vector>
 
 namespace aml::import_pack {
@@ -41,6 +42,26 @@ bool safe_filename(const std::string& filename) {
             return false;
     }
     return filename.back() != '.' && filename.back() != ' ';
+}
+
+bool require_real_directory(const fs::path& directory, const char* label, std::string* err) {
+    std::error_code ec;
+    const fs::file_status status = fs::symlink_status(directory, ec);
+    if (ec) {
+        if (err) *err = std::string("could not inspect ") + label + ": " + ec.message();
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (err) *err = std::string("could not inspect ") + label + " attributes";
+        return false;
+    }
+    if (fs::is_symlink(status) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        !fs::is_directory(status)) {
+        if (err) *err = std::string(label) + " must be a real directory";
+        return false;
+    }
+    return true;
 }
 
 std::wstring lower_name(std::wstring value) {
@@ -99,7 +120,9 @@ bool collect_override_preview(const fs::path& overrides,
         return !ec;
     }
     for (fs::recursive_directory_iterator it(overrides, ec), end; !ec && it != end; it.increment(ec)) {
-        if (!it->is_regular_file(ec)) continue;
+        const fs::file_status status = it->symlink_status(ec);
+        if (ec) break;
+        if (fs::is_symlink(status) || !fs::is_regular_file(status)) continue;
         const fs::path relative = it->path().lexically_relative(overrides);
         if (!safe_relative(net::to_utf8(relative.generic_wstring())) || !preview_path_allowed(relative)) continue;
         desired[normalized_relative(relative)] = net::sha1_file(it->path().wstring());
@@ -116,12 +139,26 @@ bool collect_existing_managed(const fs::path& target,
     std::error_code ec;
     for (const std::wstring& root_name : managed_roots) {
         const fs::path root = target / root_name;
-        if (!fs::exists(root, ec)) {
-            if (ec) break;
+        const fs::file_status root_status = fs::symlink_status(root, ec);
+        // Managed roots are optional.  In particular, a newly created profile
+        // commonly has no resourcepacks, shaderpacks, datapacks, or config
+        // folder yet.  Windows reports that normal absence through
+        // symlink_status as ERROR_FILE_NOT_FOUND, which is an empty root, not
+        // an unsafe one.  Keep every other inspection failure fatal.
+        if (ec == std::errc::no_such_file_or_directory) {
+            ec.clear();
             continue;
         }
+        if (ec) break;
+        if (!fs::exists(root_status)) continue;
+        if (fs::is_symlink(root_status) || !fs::is_directory(root_status)) {
+            if (err) *err = "managed profile content folder is redirected or invalid";
+            return false;
+        }
         for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-            if (!it->is_regular_file(ec)) continue;
+            const fs::file_status status = it->symlink_status(ec);
+            if (ec) break;
+            if (fs::is_symlink(status) || !fs::is_regular_file(status)) continue;
             const fs::path relative = it->path().lexically_relative(target);
             existing[normalized_relative(relative)] = it->path();
         }
@@ -146,8 +183,16 @@ bool copy_overrides(const fs::path& root, const fs::path& target, std::string* e
         // but it must never overwrite launcher metadata or user-owned worlds,
         // captures, diagnostics, and runtime files.
         if (is_runtime_owned_entry(name) || is_launcher_metadata_entry(name)) continue;
+        const fs::file_status status = it->symlink_status(ec);
+        if (ec) break;
+        if (fs::is_symlink(status)) {
+            if (err) *err = "creator overrides may not contain redirected files or folders";
+            return false;
+        }
         fs::copy(it->path(), target / name,
-                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                 fs::copy_options::recursive | fs::copy_options::overwrite_existing |
+                     fs::copy_options::skip_symlinks,
+                 ec);
     }
     if (ec && err) *err = "copy overrides failed: " + ec.message();
     return !ec;
@@ -195,7 +240,8 @@ bool rollback_commit(std::vector<CommitSlot>& slots, std::string* err) {
 // explicitly protected from creator-pack overrides.
 bool commit_staged_profile(const fs::path& staged, const fs::path& target, std::string* err) {
     std::error_code ec;
-    if (!fs::exists(staged / L"instance.json", ec) || ec) {
+    const fs::file_status metadata_status = fs::symlink_status(staged / L"instance.json", ec);
+    if (ec || fs::is_symlink(metadata_status) || !fs::is_regular_file(metadata_status)) {
         if (err) *err = ec ? "cannot inspect staged profile: " + ec.message()
                            : "staged profile metadata is missing";
         return false;
@@ -206,6 +252,12 @@ bool commit_staged_profile(const fs::path& staged, const fs::path& target, std::
         L"amalgam-dependencies.json", L"amalgam-local-content.json", L"instance.json"};
     for (fs::directory_iterator it(staged, ec), end; !ec && it != end; it.increment(ec)) {
         const std::wstring name = it->path().filename().wstring();
+        const fs::file_status status = it->symlink_status(ec);
+        if (ec) break;
+        if (fs::is_symlink(status)) {
+            if (err) *err = "staged profile contains a redirected file or folder";
+            return false;
+        }
         if (is_runtime_owned_entry(name)) continue;
         const bool already_known = std::any_of(names.begin(), names.end(), [&](const std::wstring& known) {
             return _wcsicmp(known.c_str(), name.c_str()) == 0;
@@ -410,7 +462,7 @@ bool import_modrinth(const fs::path& root, const fs::path& manifest_path,
                          sha1, size, err)) return false;
         ++index;
     }
-    report(progress, 1.0f, "Import complete");
+    report(progress, 1.0f, "Files staged; preparing profile");
     return true;
 }
 
@@ -504,7 +556,7 @@ bool import_curseforge(const fs::path& root, const fs::path& manifest_path,
                          span, sha1, size, err)) return false;
         ++index;
     }
-    report(progress, 1.0f, "Import complete");
+    report(progress, 1.0f, "Files staged; preparing profile");
     return true;
 }
 
@@ -513,22 +565,108 @@ bool import_curseforge(const fs::path& root, const fs::path& manifest_path,
 bool archive(const std::wstring& path, const std::wstring& instances_dir, const mods::ApiCfg& api,
              instances::Instance& out, Progress progress, std::string* err) {
     out = {};
-    fs::path archive_path(path);
-    std::wstring temp_name = L".import-" + std::to_wstring(GetCurrentProcessId());
-    fs::path temp = fs::path(instances_dir) / temp_name;
+    const fs::path library_root(instances_dir);
     std::error_code ec;
-    fs::remove_all(temp, ec);
+    if (library_root.empty()) {
+        if (err) *err = "profile library directory is missing";
+        return false;
+    }
+    fs::create_directories(library_root, ec);
+    if (ec || !require_real_directory(library_root, "profile library directory", err)) {
+        if (ec && err) *err = "could not create profile library directory: " + ec.message();
+        return false;
+    }
+
+    const std::wstring operation = std::to_wstring(GetCurrentProcessId()) + L"-" +
+                                   std::to_wstring(GetTickCount64());
+    const fs::path temp = library_root / (L".amalgam-import-archive-" + operation);
+    const fs::path staging_root = library_root / (L".amalgam-import-stage-" + operation);
+    if (fs::exists(temp, ec) || ec || fs::exists(staging_root, ec) || ec) {
+        if (err) *err = ec ? "could not inspect import staging directories: " + ec.message()
+                           : "an import staging directory is already present; retry the import";
+        return false;
+    }
     fs::create_directories(temp, ec);
-    if (ec || !extract::zip(path, temp.wstring(), err)) return false;
+    if (ec) {
+        if (err) *err = "could not create import archive staging directory: " + ec.message();
+        std::error_code cleanup_error;
+        fs::remove_all(temp, cleanup_error);
+        return false;
+    }
+    if (!require_real_directory(temp, "import archive staging directory", err) ||
+        !extract::zip(path, temp.wstring(), err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(temp, cleanup_error);
+        return false;
+    }
+    fs::create_directories(staging_root, ec);
+    if (ec) {
+        std::error_code cleanup_error;
+        fs::remove_all(temp, cleanup_error);
+        fs::remove_all(staging_root, cleanup_error);
+        if (err) *err = "could not create import profile staging directory: " + ec.message();
+        return false;
+    }
+    if (!require_real_directory(staging_root, "import profile staging directory", err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(temp, cleanup_error);
+        fs::remove_all(staging_root, cleanup_error);
+        return false;
+    }
+
     bool ok = false;
     fs::path modrinth = temp / "modrinth.index.json";
     fs::path curseforge = temp / "manifest.json";
-    if (fs::exists(modrinth)) ok = import_modrinth(temp, modrinth, instances_dir, out, progress, err);
-    else if (fs::exists(curseforge)) ok = import_curseforge(temp, curseforge, instances_dir, api, out, progress, err);
+    if (fs::exists(modrinth)) {
+        ok = import_modrinth(temp, modrinth, staging_root.wstring(), out, progress, err);
+    } else if (fs::exists(curseforge)) {
+        ok = import_curseforge(temp, curseforge, staging_root.wstring(), api, out, progress, err);
+    }
     else if (err) *err = "archive is not a Modrinth or CurseForge modpack";
-    fs::remove_all(temp, ec);
-    if (!ok && !out.directory.empty()) {
-        fs::remove_all(out.directory, ec);
+
+    if (ok && !report(progress, 0.99f, "Activating imported profile")) {
+        ok = false;
+        if (err) *err = "import cancelled before the new profile was activated";
+    }
+    if (ok) {
+        const instances::Instance staged_profile = out;
+        instances::ProfileIdentitySnapshot staged_identity;
+        if (!instances::capture_profile_identity(staged_profile, staged_identity, err)) {
+            ok = false;
+        } else {
+            fs::path target = library_root / net::to_wide(staged_profile.id);
+            int suffix = 2;
+            while (fs::exists(target, ec) && !ec) {
+                target = library_root /
+                    (net::to_wide(staged_profile.id) + L"-" + std::to_wstring(suffix++));
+            }
+            if (ec) {
+                if (err) *err = "could not choose imported profile directory: " + ec.message();
+                ok = false;
+            } else if (!instances::profile_identity_matches(staged_profile, staged_identity, err)) {
+                ok = false;
+            } else {
+                out.id = net::to_utf8(target.filename().wstring());
+                out.directory = staged_profile.directory;
+                if (!instances::save(out, err)) {
+                    ok = false;
+                } else {
+                    fs::rename(staged_profile.directory, target, ec);
+                    if (ec) {
+                        if (err) *err = "could not activate imported profile: " + ec.message();
+                        ok = false;
+                    } else {
+                        out.directory = target.wstring();
+                    }
+                }
+            }
+        }
+    }
+    if (ok) report(progress, 1.0f, "Import complete");
+    std::error_code cleanup_error;
+    fs::remove_all(temp, cleanup_error);
+    fs::remove_all(staging_root, cleanup_error);
+    if (!ok) {
         out = {};
     }
     return ok;
@@ -538,6 +676,8 @@ bool archive_into(const std::wstring& path, const instances::Instance& target,
                   const mods::ApiCfg& api, instances::Instance& out, Progress progress,
                   std::string* err) {
     out = {};
+    instances::ProfileIdentitySnapshot target_identity;
+    if (!instances::capture_profile_identity(target, target_identity, err)) return false;
     const fs::path target_root(target.directory);
     const fs::path staging = target_root /
         (L".amalgam-pack-stage-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -545,14 +685,35 @@ bool archive_into(const std::wstring& path, const instances::Instance& target,
     const fs::path archive_root = staging / L"archive";
     const fs::path payload_root = staging / L"payload";
     std::error_code ec;
+    if (fs::exists(staging, ec) || ec) {
+        if (err) *err = ec ? "could not inspect pack staging directory: " + ec.message()
+                           : "a pack staging directory is already present; retry the update";
+        return false;
+    }
     fs::create_directories(archive_root, ec);
     if (ec) {
         if (err) *err = "could not create pack staging directory: " + ec.message();
         return false;
     }
+    if (!require_real_directory(staging, "pack staging directory", err) ||
+        !require_real_directory(archive_root, "pack archive staging directory", err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(staging, cleanup_error);
+        return false;
+    }
     fs::create_directories(payload_root, ec);
-    if (ec || !extract::zip(path, archive_root.wstring(), err)) {
+    if (ec) {
+        if (err) *err = "could not create pack payload staging directory: " + ec.message();
         fs::remove_all(staging, ec);
+        return false;
+    }
+    if (!extract::zip(path, archive_root.wstring(), err)) {
+        fs::remove_all(staging, ec);
+        return false;
+    }
+    if (!require_real_directory(payload_root, "pack payload staging directory", err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(staging, cleanup_error);
         return false;
     }
 
@@ -574,7 +735,9 @@ bool archive_into(const std::wstring& path, const instances::Instance& target,
         ok = false;
         if (err) *err = "import cancelled before profile changes";
     }
+    if (ok && !instances::profile_identity_matches(target, target_identity, err)) ok = false;
     if (ok) ok = commit_staged_profile(payload_root, target_root, err);
+    if (ok) report(progress, 1.0f, "Import complete");
     fs::remove_all(staging, ec);
     if (!ok) {
         out = {};
@@ -587,6 +750,8 @@ bool archive_into(const std::wstring& path, const instances::Instance& target,
 bool preview_archive(const std::wstring& path, const instances::Instance& target,
                      ArchivePreview& out, std::string* err) {
     out = {};
+    instances::ProfileIdentitySnapshot target_identity;
+    if (!instances::capture_profile_identity(target, target_identity, err)) return false;
     if (target.directory.empty()) {
         if (err) *err = "profile has no content directory";
         return false;
@@ -600,10 +765,20 @@ bool preview_archive(const std::wstring& path, const instances::Instance& target
     const fs::path stage = target_root /
         (L".amalgam-pack-preview-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
          std::to_wstring(GetTickCount64()));
+    if (fs::exists(stage, ec) || ec) {
+        if (err) *err = ec ? "cannot inspect archive preview staging directory: " + ec.message()
+                           : "an archive preview is already in progress; retry shortly";
+        return false;
+    }
     fs::create_directories(stage, ec);
     if (ec || !extract::zip(path, stage.wstring(), err)) {
         fs::remove_all(stage, ec);
         if (ec && err && err->empty()) *err = "cannot prepare archive preview: " + ec.message();
+        return false;
+    }
+    if (!require_real_directory(stage, "archive preview staging directory", err)) {
+        std::error_code cleanup_error;
+        fs::remove_all(stage, cleanup_error);
         return false;
     }
 
@@ -658,6 +833,7 @@ bool preview_archive(const std::wstring& path, const instances::Instance& target
         for (const auto& leftover : existing)
             add_preview_change(out, fs::path(leftover.first), ChangeKind::Removed);
     }
+    if (ok && !instances::profile_identity_matches(target, target_identity, err)) ok = false;
     fs::remove_all(stage, ec);
     if (ec && ok && err) *err = "archive preview succeeded but cleanup failed: " + ec.message();
     return ok;

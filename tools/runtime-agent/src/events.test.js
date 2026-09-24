@@ -22,3 +22,15 @@ test("EventCollector requeues a batch after a terminal failure", async () => {
   await collector.flush();
   assert.equal(collector.eventBuffer.length, 1);
 });
+
+test("EventCollector does not turn unavailable metrics into zero", () => {
+  const collector = new EventCollector({}, { heartbeatIntervalSec: 30 }, "node-1");
+  assert.equal(collector.metric("missing", null), false);
+  assert.equal(collector.metric("missing", undefined), false);
+  assert.equal(collector.metric("missing", ""), false);
+  assert.equal(collector.metric("missing", false), false);
+  assert.equal(collector.metricBuffer.length, 0);
+
+  assert.equal(collector.metric("observed-zero", 0), true);
+  assert.deepEqual(collector.metricBuffer.map((metric) => metric.value), [0]);
+});

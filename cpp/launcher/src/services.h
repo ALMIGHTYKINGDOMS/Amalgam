@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <cstdint>
 #include <Windows.h>
 
 #include "net.h"
@@ -333,6 +334,10 @@ struct ServerInfo {
     bool auto_restart = true;
     std::string deployment; // "local" | "cloud"
     std::string platform;  // "Java Edition" | "Bedrock"
+    // The server::ServerSoftware this local server was created as. The start
+    // command differs per software (jar / loader args / native executable), so
+    // the supervisor reads it instead of assuming every server is server.jar.
+    int software = 0;
     // sparkline history (last 60 samples)
     std::vector<float> cpu_history;
     std::vector<float> ram_history;
@@ -379,6 +384,19 @@ struct ServerConsoleEntry {
     std::string message;
 };
 
+// Process-level telemetry for a supervised local server.  Minecraft does not
+// expose TPS/player counts through the launcher process by default, so those
+// values stay explicitly unavailable until a server-side health bridge is
+// present.  CPU and working-set memory are measured from the real supervised
+// process and never synthesized.
+struct LocalServerMetrics {
+    bool valid = false;
+    bool cpu_valid = false;
+    bool memory_valid = false;
+    float cpu_percent = 0.0f;
+    uint64_t working_set_bytes = 0;
+};
+
 class ServerManager {
 public:
     ServerManager(const ServiceConfig& config);
@@ -404,6 +422,8 @@ public:
     std::vector<ServerConsoleEntry> get_console_logs(const std::string& server_id, 
                                                     int limit = 100, 
                                                     std::string* error = nullptr);
+    LocalServerMetrics get_local_server_metrics(const std::string& server_id,
+                                                std::string* error = nullptr);
     bool send_command(const std::string& server_id, const std::string& command, 
                      std::string* response = nullptr, std::string* error = nullptr);
     
@@ -441,6 +461,13 @@ public:
     // <launcher>\runtimes\java. May be set while workers start servers.
     void set_local_java_root(const std::wstring& root);
     std::wstring local_java_root() const;
+
+    // The Java executable a local server of this Minecraft version starts with,
+    // resolved from local_java_root(). start_local_server calls this, and the
+    // Servers page runs a Forge/NeoForge installer with it, so the Java that
+    // installs a server is the Java that runs it.
+    std::wstring resolve_local_server_java(const std::string& minecraft_version,
+                                           std::string* error) const;
     
     // Events
     void on_server_started(const std::function<void(const std::string&)>& callback);
@@ -461,11 +488,6 @@ private:
     std::map<std::string, std::unique_ptr<LocalServerTransport>> local_transports_;
     
     // Internal helpers
-    // The Java executable a local server of this version starts with, resolved
-    // from local_java_root(). start_local_server calls this, so the root has one
-    // expression rather than a second copy of the path policy.
-    std::wstring resolve_local_server_java(const std::string& minecraft_version,
-                                           std::string* error) const;
     std::string make_request(const std::string& method, const std::string& endpoint,
                             const std::string& body = "", std::string* error = nullptr);
     std::string build_auth_header() const;

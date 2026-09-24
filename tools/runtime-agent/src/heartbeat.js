@@ -4,10 +4,43 @@ import os from "node:os";
 import fs from "node:fs";
 import { retry } from "./retry.js";
 
+let previousCpuSnapshot = null;
+
+function snapshotCpuTimes(cpus) {
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus || []) {
+    const times = cpu?.times || {};
+    const cpuIdle = Number(times.idle) || 0;
+    const cpuTotal = Object.values(times).reduce((sum, value) => sum + (Number(value) || 0), 0);
+    idle += cpuIdle;
+    total += cpuTotal;
+  }
+  return { idle, total };
+}
+
+// Return null until two real samples exist. Reporting zero on systems without
+// load averages (notably Windows) makes an unavailable measurement look like
+// an idle host, which is worse than explicitly reporting it as unknown.
+export function calculateCpuUsagePct(previous, current) {
+  if (!previous || !current) return null;
+  const deltaTotal = current.total - previous.total;
+  const deltaIdle = current.idle - previous.idle;
+  if (!Number.isFinite(deltaTotal) || !Number.isFinite(deltaIdle) || deltaTotal <= 0) return null;
+  return Math.round(Math.max(0, Math.min(100, (1 - deltaIdle / deltaTotal) * 100)) * 10) / 10;
+}
+
+function sampleCpuUsagePct(cpus) {
+  const current = snapshotCpuTimes(cpus);
+  const usage = calculateCpuUsagePct(previousCpuSnapshot, current);
+  previousCpuSnapshot = current;
+  return usage;
+}
+
 /**
  * Collect system metrics for the host machine.
  */
-export function collectSystemMetrics() {
+export function collectSystemMetrics(storagePath = process.cwd()) {
   const cpus = os.cpus();
   const totalMem = os.totalmem();
   const freeMem = os.freemem();
@@ -19,12 +52,13 @@ export function collectSystemMetrics() {
     cpuModel = `${cpus[0].model} x${cpus.length}`;
   }
 
-  // Storage: use Node.js fs.statfsSync (Node 18+)
-  let storageTotalGb = 0;
-  let storageUsedGb = 0;
+  // Storage applies to the runtime data volume, not an assumed POSIX root.
+  // Null represents unavailable data; it must not be converted to a fake zero.
+  let storageTotalGb = null;
+  let storageUsedGb = null;
   try {
     if (typeof fs.statfsSync === "function") {
-      const stat = fs.statfsSync("/");
+      const stat = fs.statfsSync(storagePath || process.cwd());
       storageTotalGb = Math.round((stat.blocks * stat.bsize) / (1024 * 1024 * 1024));
       storageUsedGb = Math.round(((stat.blocks - stat.bfree) * stat.bsize) / (1024 * 1024 * 1024));
     }
@@ -32,20 +66,7 @@ export function collectSystemMetrics() {
     // Best-effort: storage metrics unavailable
   }
 
-  // CPU usage: read from /proc or compute from os.loadavg
-  let cpuUsagePct = 0;
-  try {
-    if (process.platform === "linux") {
-      const stat = os.loadavg();
-      cpuUsagePct = Math.min(100, (stat[0] / cpuCores) * 100);
-    } else {
-      // Windows/macOS: use load average approximation
-      const stat = os.loadavg();
-      cpuUsagePct = Math.min(100, (stat[0] / cpuCores) * 100);
-    }
-  } catch {
-    // Ignore
-  }
+  const cpuUsagePct = sampleCpuUsagePct(cpus);
 
   return {
     cpuModel,
@@ -54,7 +75,7 @@ export function collectSystemMetrics() {
     memoryUsedMb: Math.round(usedMem / (1024 * 1024)),
     storageTotalGb,
     storageUsedGb,
-    cpuUsagePct: Math.round(cpuUsagePct * 10) / 10,
+    cpuUsagePct,
   };
 }
 
@@ -63,7 +84,7 @@ export function collectSystemMetrics() {
  * Returns { id, reregistered, status }.
  */
 export async function registerNode(supabase, config) {
-  const metrics = collectSystemMetrics();
+  const metrics = collectSystemMetrics(config.dataDir);
 
   const { data, error } = await supabase.rpc("register_hosting_node", {
     p_name: config.nodeName,
@@ -89,8 +110,9 @@ export async function registerNode(supabase, config) {
 /**
  * Send a heartbeat with current system metrics.
  */
-export async function sendHeartbeat(supabase, nodeId, nodeSecret, serverCount) {
-  const metrics = collectSystemMetrics();
+export async function sendHeartbeat(supabase, nodeId, nodeSecret, serverCount,
+                                    storagePath = process.cwd(), sampledMetrics = null) {
+  const metrics = sampledMetrics || collectSystemMetrics(storagePath);
 
   try {
     await retry(async () => {
@@ -122,13 +144,15 @@ export function heartbeatLoop(supabase, nodeInfo, config, isRunning, eventCollec
   const loop = async () => {
     while (isRunning()) {
       try {
-        const metrics = collectSystemMetrics();
+        const metrics = collectSystemMetrics(config.dataDir);
         const serverCount = Number(serverCountProvider()) || 0;
         await sendHeartbeat(
           supabase,
           nodeInfo.id,
           config.nodeSecret,
-          serverCount
+          serverCount,
+          config.dataDir,
+          metrics
         );
 
         // Record detailed system metrics via event collector

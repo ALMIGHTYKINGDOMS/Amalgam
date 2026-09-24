@@ -14,11 +14,11 @@ namespace aml::hosting {
 WebsiteCatalogProvider::WebsiteCatalogProvider() {}
 
 std::string WebsiteCatalogProvider::provider_name() const {
-    return "Amalgam Cloud Website Catalog";
+    return "Amalgam Cloud Website Handoff";
 }
 
 std::string WebsiteCatalogProvider::provider_version() const {
-    return "website-catalog-1";
+    return "website-handoff-1";
 }
 
 ProviderCapabilities WebsiteCatalogProvider::capabilities() const {
@@ -37,68 +37,13 @@ static ProviderError website_managed_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Read-only Amalgam Cloud plan catalog
-// Pricing: amalgam-mc.com/plans
-// ---------------------------------------------------------------------------
-
-static std::vector<CloudPlan> make_reference_plans() {
-    std::vector<CloudPlan> plans;
-
-    auto add = [&](const char* id, const char* name, const char* tagline,
-                   bool rec, int ram, const char* cpu, int storage,
-                   int players, double price,
-                   int backups,
-                   std::initializer_list<CloudPlanFeature> feats) {
-        (void)backups;
-        CloudPlan p;
-        p.id = id;
-        p.name = name;
-        p.tagline = tagline;
-        p.recommended = rec;
-        p.ram_mb = ram;
-        p.cpu_label = cpu;
-        p.storage_mb = storage;
-        p.max_players = players;
-        p.price_monthly = price;
-        p.max_ram_mb = 32768;
-        p.max_storage_mb = 327680;
-        p.max_players_slider = 200;
-        p.features.assign(feats);
-        p.available = true;
-        plans.push_back(std::move(p));
-    };
-
-    add("cloud_4", "Cloud 4", "AMALGAM CLOUD 4", false,
-        4096, "Shared CPU", 25600, 10, 12.99, 3,
-        {{"4 GB RAM"}, {"25 GB NVMe"}, {"3 Backups"},
-         {"DDoS protection"}, {"Automatic backups"},
-         {"Java & Bedrock support"}});
-
-    add("cloud_8", "Cloud 8", "MOST POPULAR", true,
-        8192, "Higher CPU", 51200, 25, 21.99, 7,
-        {{"8 GB RAM"}, {"50 GB NVMe"}, {"7 Backups"},
-         {"DDoS protection"}, {"Automatic backups"},
-         {"Modded support"}, {"Java & Bedrock support"}});
-
-    add("cloud_12", "Cloud 12", "HIGH PERFORMANCE", false,
-        12288, "High-performance CPU", 102400, 50, 31.99, 14,
-        {{"12 GB RAM"}, {"100 GB NVMe"}, {"14 Backups"},
-         {"DDoS protection"}, {"Priority resources"},
-         {"Automatic backups"}, {"Modded support"},
-         {"Java & Bedrock support"}});
-
-    return plans;
-}
-
-// ---------------------------------------------------------------------------
 // IHostingProvider compatibility surface — hosted operations stay website-managed
 // ---------------------------------------------------------------------------
 
 bool WebsiteCatalogProvider::get_plans(std::vector<CloudPlan>& plans, ProviderError* err) {
-    (void)err;
-    // The landing page uses this read-only reference catalog.
-    plans = make_reference_plans();
-    return true;
+    plans.clear();
+    if (err) *err = website_managed_error();
+    return false;
 }
 
 bool WebsiteCatalogProvider::get_regions(std::vector<HostingRegion>& regions, ProviderError* err) {
@@ -160,11 +105,10 @@ bool WebsiteCatalogProvider::get_server(const std::string& server_id,
 }
 
 bool WebsiteCatalogProvider::list_servers(std::vector<CloudServer>& servers,
-                                      ProviderError* err) {
-    (void)err;
-    // Never fabricate hosted servers in the launcher.
+                                       ProviderError* err) {
     servers.clear();
-    return true;
+    if (err) *err = website_managed_error();
+    return false;
 }
 
 bool WebsiteCatalogProvider::get_metrics(const std::string& server_id,
@@ -281,9 +225,10 @@ bool WebsiteCatalogProvider::get_subscription(const std::string& server_id,
 bool WebsiteCatalogProvider::get_invoices(const std::string& server_id,
                                       std::vector<Invoice>& invoices,
                                       ProviderError* err) {
-    (void)server_id; (void)err; (void)invoices;
+    (void)server_id;
     invoices.clear();
-    return true;
+    if (err) *err = website_managed_error();
+    return false;
 }
 
 bool WebsiteCatalogProvider::upgrade_plan(const std::string& server_id,

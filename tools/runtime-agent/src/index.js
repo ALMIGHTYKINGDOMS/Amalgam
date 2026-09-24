@@ -59,7 +59,7 @@ async function main() {
   if (config.nodeId) {
     nodeInfo = { id: config.nodeId, reregistered: false, status: "provisioned" };
     // Verify the pre-provisioned node before starting worker loops.
-    const healthy = await sendHeartbeat(supabase, nodeInfo.id, config.nodeSecret, 0);
+    const healthy = await sendHeartbeat(supabase, nodeInfo.id, config.nodeSecret, 0, config.dataDir);
     if (!healthy) {
       console.error("[agent] FATAL: provisioned node credentials were rejected");
       process.exitCode = 1;

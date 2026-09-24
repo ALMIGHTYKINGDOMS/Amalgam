@@ -5,16 +5,74 @@
 import { retry } from './retry.js';
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { Readable } from "node:stream";
-import { finished } from "node:stream/promises";
+import path from "node:path";
+import { isIP } from "node:net";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 /**
  * Fetch pending operations for this node and execute them.
  */
 let eventCollector = null;
+const MAX_SERVER_JAR_BYTES = 2 * 1024 * 1024 * 1024;
 
 export function setEventCollector(collector) {
   eventCollector = collector;
+}
+
+function sameIdentifier(left, right) {
+  return typeof left === "string"
+    && typeof right === "string"
+    && left.toLowerCase() === right.toLowerCase();
+}
+
+function isOperationRoutedToNode(op, nodeId) {
+  return Boolean(
+    op
+    && typeof op.id === "string"
+    && typeof op.server_id === "string"
+    && sameIdentifier(op.node_id, nodeId)
+  );
+}
+
+function isClaimForOperation(claimed, op, nodeId) {
+  return Boolean(
+    claimed
+    && claimed.status === "claimed"
+    && sameIdentifier(claimed.id, op.id)
+    && sameIdentifier(claimed.server_id, op.server_id)
+    && sameIdentifier(claimed.node_id, nodeId)
+  );
+}
+
+function isInstanceAssignedToNode(instance, serverId, nodeId) {
+  return Boolean(
+    instance
+    && sameIdentifier(instance.id, serverId)
+    && sameIdentifier(instance.node_id, nodeId)
+  );
+}
+
+/**
+ * Read only the pending queue assigned to this node. The database claim RPC
+ * repeats this predicate atomically; this filter limits visibility and avoids
+ * asking an unrelated agent to contend for another node's work.
+ */
+export async function fetchPendingOperations(supabase, nodeInfo, maxConcurrentOps) {
+  if (!nodeInfo?.id) {
+    throw new Error("Cannot poll operations without a runtime node ID");
+  }
+
+  return retry(
+    () => supabase
+      .from("server_operations")
+      .select("*")
+      .eq("status", "pending")
+      .eq("node_id", nodeInfo.id)
+      .order("created_at", { ascending: true })
+      .limit(maxConcurrentOps),
+    { label: "fetch-operations", maxRetries: 2, baseDelayMs: 2000 }
+  );
 }
 
 export async function operationPollLoop(supabase, nodeInfo, config, isRunning, manager) {
@@ -33,14 +91,10 @@ export async function operationPollLoop(supabase, nodeInfo, config, isRunning, m
       let pendingOps = null;
       let fetchError = null;
       try {
-        const result = await retry(
-          () => supabase
-            .from("server_operations")
-            .select("*")
-            .eq("status", "pending")
-            .order("created_at", { ascending: true })
-            .limit(config.maxConcurrentOps),
-          { label: "fetch-operations", maxRetries: 2, baseDelayMs: 2000 }
+        const result = await fetchPendingOperations(
+          supabase,
+          nodeInfo,
+          config.maxConcurrentOps
         );
         pendingOps = result.data;
         fetchError = result.error;
@@ -76,18 +130,24 @@ export async function operationPollLoop(supabase, nodeInfo, config, isRunning, m
 /**
  * Process a single operation: claim it, execute it, and report the result.
  */
-async function processOperation(supabase, nodeInfo, config, manager, op) {
+export async function processOperation(supabase, nodeInfo, config, manager, op) {
   const opId = op.id;
   const serverId = op.server_id;
   const operation = op.operation;
 
+  // A stale poll result must not be enough to execute work. The claim RPC
+  // below enforces the same relationship atomically, but this local check
+  // avoids sending malformed or cross-node work to the control plane at all.
+  if (!isOperationRoutedToNode(op, nodeInfo?.id)) {
+    console.warn(
+      `[ops] Ignoring operation ${opId || "unknown"}: it is not routed to node ${nodeInfo?.id || "unknown"}`
+    );
+    return;
+  }
+
   console.log(`[ops] Processing operation ${opId}: ${operation}`);
 
   const opStartTime = Date.now();
-
-  if (eventCollector) {
-    eventCollector.operationStarted(opId, operation, serverId);
-  }
 
   // Claim the operation
   const { data: claimed, error: claimError } = await supabase.rpc(
@@ -104,29 +164,50 @@ async function processOperation(supabase, nodeInfo, config, manager, op) {
     return;
   }
 
-  // Start tracking the operation and fail closed if the claim changed.
-  const { error: startError } = await supabase.rpc("start_operation", {
-    p_operation_id: opId,
-    p_node_id: nodeInfo.id,
-    p_node_secret: config.nodeSecret,
-  });
-  if (startError) {
-    console.error(`[ops] Failed to start operation ${opId}:`, startError.message);
+  const claimedOperation = Array.isArray(claimed) ? claimed[0] : claimed;
+  if (!isClaimForOperation(claimedOperation, op, nodeInfo.id)) {
+    console.error(
+      `[ops] Ignoring operation ${opId}: claim response does not confirm this node and server assignment`
+    );
     return;
   }
 
-  // Fetch the server instance details
+  // Re-read the assigned instance immediately before execution. The query is
+  // scoped server-side and the explicit check protects the dispatch boundary
+  // even if a caller supplies a stale or malformed client result.
   const { data: instance, error: instanceError } = await supabase
     .from("server_instances")
     .select("*")
     .eq("id", serverId)
+    .eq("node_id", nodeInfo.id)
     .single();
 
-  if (instanceError || !instance) {
+  if (instanceError || !isInstanceAssignedToNode(instance, serverId, nodeInfo.id)) {
     await completeOp(supabase, nodeInfo, config, opId, false, {
-      error: `Server instance not found: ${instanceError?.message || "unknown"}`,
+      error: instanceError
+        ? `Server instance cannot be verified for this node: ${instanceError.message || "unknown"}`
+        : "Server instance is no longer assigned to this node",
     }, operation, opStartTime);
     return;
+  }
+
+  // start_operation repeats the operation/server/node check atomically. It
+  // must succeed before a local process, filesystem, or command handler runs.
+  const { data: startResult, error: startError } = await supabase.rpc("start_operation", {
+    p_operation_id: opId,
+    p_node_id: nodeInfo.id,
+    p_node_secret: config.nodeSecret,
+  });
+  if (startError || startResult?.success !== true) {
+    console.error(
+      `[ops] Failed to start operation ${opId}:`,
+      startError?.message || "start RPC did not confirm the node assignment"
+    );
+    return;
+  }
+
+  if (eventCollector) {
+    eventCollector.operationStarted(opId, operation, serverId);
   }
 
   // Dispatch to the appropriate handler
@@ -202,15 +283,20 @@ async function handleStop(manager, instance) {
   return stopResult;
 }
 
-async function handleRestart(supabase, nodeInfo, config, manager, instance, op) {
+export async function handleRestart(supabase, nodeInfo, config, manager, instance, op) {
   // Stop first
   if (manager.isRunning(instance.id)) {
     const stopResult = manager.stop(instance.id);
     if (!stopResult.success) {
       return stopResult;
     }
-    // Wait for process to exit
-    await sleep(3000);
+    // Do not start a second server process until the first has actually
+    // exited. A fixed delay is neither a file-lock guarantee nor proof that
+    // the old process stopped accepting commands.
+    const exited = await manager.waitForExit(instance.id);
+    if (!exited || manager.isRunning(instance.id)) {
+      return { success: false, error: "Server did not exit before restart" };
+    }
   }
 
   // Start
@@ -242,7 +328,10 @@ async function handleBackup(supabase, nodeInfo, config, manager, instance, op) {
   return backupResult;
 }
 
-async function handleRestore(manager, instance, op) {
+export async function handleRestore(manager, instance, op) {
+  if (manager.isRunning(instance.id)) {
+    return { success: false, error: "Stop the server before restoring a backup" };
+  }
   const backupPath = op.params?.backup_path || "";
   if (!backupPath) {
     return { success: false, error: "No backup path provided" };
@@ -255,13 +344,17 @@ async function handleSettings(manager, instance, op) {
   return manager.applySettings(instance, settings);
 }
 
-async function handleInstallJar(manager, instance, op) {
+export async function handleInstallJar(manager, instance, op) {
   const jarUrl = String(op.params?.url || "").trim();
+  const expectedHash = String(op.params?.sha256 || "").trim().toLowerCase();
   const serverDir = manager.getServerDir(instance.id, instance.name);
-  const jarPath = `${serverDir}/server.jar`;
+  const jarPath = path.join(serverDir, "server.jar");
   const partPath = `${jarPath}.part`;
 
   if (!jarUrl) return { success: false, error: "No jar URL provided" };
+  if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
+    return { success: false, error: "A 64-character SHA-256 digest is required for every server jar" };
+  }
 
   let parsedUrl;
   try {
@@ -272,60 +365,108 @@ async function handleInstallJar(manager, instance, op) {
   if (parsedUrl.protocol !== "https:") {
     return { success: false, error: "Server jar downloads must use HTTPS" };
   }
+  if (parsedUrl.username || parsedUrl.password || isUnsafeArtifactHost(parsedUrl.hostname)) {
+    return { success: false, error: "Server jar URL must use a public HTTPS host without credentials" };
+  }
 
   try {
     const response = await fetch(parsedUrl, { redirect: "error" });
     if (!response.ok || !response.body) {
       return { success: false, error: `Jar download failed: HTTP ${response.status}` };
     }
-    const declaredLength = Number(response.headers.get("content-length") || 0);
-    if (declaredLength > 2 * 1024 * 1024 * 1024) {
+    const contentLength = response.headers.get("content-length");
+    const declaredLength = contentLength === null ? null : Number(contentLength);
+    if (declaredLength !== null &&
+        (!Number.isSafeInteger(declaredLength) || declaredLength < 0)) {
+      return { success: false, error: "Server jar has an invalid Content-Length" };
+    }
+    if (declaredLength !== null && declaredLength > MAX_SERVER_JAR_BYTES) {
       return { success: false, error: "Server jar exceeds the 2 GiB limit" };
     }
 
     fs.mkdirSync(serverDir, { recursive: true });
-    const output = fs.createWriteStream(partPath, { flags: "w" });
-    Readable.fromWeb(response.body).pipe(output);
-    await finished(output);
+    fs.rmSync(partPath, { force: true });
+    const hash = crypto.createHash("sha256");
+    let receivedBytes = 0;
+    const integrityGate = new Transform({
+      transform(chunk, encoding, callback) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+        if (receivedBytes + bytes.length > MAX_SERVER_JAR_BYTES) {
+          callback(new Error("Server jar exceeds the 2 GiB limit"));
+          return;
+        }
+        receivedBytes += bytes.length;
+        hash.update(bytes);
+        callback(null, bytes);
+      },
+    });
+    await pipeline(
+      Readable.fromWeb(response.body),
+      integrityGate,
+      fs.createWriteStream(partPath, { flags: "wx" })
+    );
 
-    const expectedHash = String(op.params?.sha256 || "").toLowerCase();
-    if (expectedHash) {
-      if (!/^[a-f0-9]{64}$/.test(expectedHash)) {
-        fs.rmSync(partPath, { force: true });
-        return { success: false, error: "sha256 must be a 64-character hexadecimal digest" };
-      }
-      const hash = crypto.createHash("sha256");
-      for await (const chunk of fs.createReadStream(partPath)) hash.update(chunk);
-      if (hash.digest("hex") !== expectedHash) {
-        fs.rmSync(partPath, { force: true });
-        return { success: false, error: "Server jar SHA-256 verification failed" };
-      }
+    if (receivedBytes === 0) {
+      fs.rmSync(partPath, { force: true });
+      return { success: false, error: "Server jar download was empty" };
+    }
+    if (declaredLength !== null && receivedBytes !== declaredLength) {
+      fs.rmSync(partPath, { force: true });
+      return { success: false, error: "Server jar Content-Length did not match the downloaded bytes" };
+    }
+    if (hash.digest("hex") !== expectedHash) {
+      fs.rmSync(partPath, { force: true });
+      return { success: false, error: "Server jar SHA-256 verification failed" };
     }
 
     fs.renameSync(partPath, jarPath);
-    return { success: true, path: jarPath, sha256: expectedHash || undefined };
+    return { success: true, path: jarPath, sha256: expectedHash, size_bytes: receivedBytes };
   } catch (err) {
     fs.rmSync(partPath, { force: true });
-    return { success: false, error: err.message };
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Server jar download failed",
+    };
   }
 }
 
-async function handleDelete(supabase, nodeInfo, config, manager, instance, op) {
-  // Stop if running
+export async function handleDelete(supabase, nodeInfo, config, manager, instance, op) {
+  // Stop an active process first, then wait for its exit event. A ChildProcess
+  // can have a kill signal pending while it still owns files, so a timer (or
+  // the `killed` flag alone) is not proof that it is safe to remove storage.
   if (manager.isRunning(instance.id)) {
-    manager.stop(instance.id);
-    await sleep(2000);
+    const stopResult = manager.stop(instance.id);
+    if (!stopResult?.success && manager.isRunning(instance.id)) {
+      return { success: false, error: stopResult?.error || "Unable to stop server before deletion" };
+    }
   }
 
-  // Delete the server directory
-  const serverDir = manager.getServerDir(instance.id, instance.name);
+  let exited = false;
   try {
-    const fs = await import("node:fs");
+    exited = await manager.waitForExit(instance.id);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { success: false, error: `Unable to confirm server exit: ${message}` };
+  }
+  if (!exited || manager.isRunning(instance.id)) {
+    return { success: false, error: "Server process did not exit; refusing to delete server data" };
+  }
+
+  // Move data into the node's recovery area before removing the control-plane
+  // record. A filesystem delete cannot be rolled back if the database call
+  // fails or an operator discovers the deletion was premature.
+  const serverDir = manager.getServerDir(instance.id, instance.name);
+  let recoveryPath = null;
+  try {
     if (fs.existsSync(serverDir)) {
-      fs.rmSync(serverDir, { recursive: true, force: true });
+      recoveryPath = createRecoveryPath(manager, instance.id);
+      fs.renameSync(serverDir, recoveryPath);
     }
-  } catch {
-    // Best-effort
+  } catch (err) {
+    return {
+      success: false,
+      error: `Unable to move server data to recovery before deletion: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 
   // Delete the instance record from Supabase
@@ -336,15 +477,55 @@ async function handleDelete(supabase, nodeInfo, config, manager, instance, op) {
     .eq("node_id", nodeInfo.id);
 
   if (error) {
+    if (recoveryPath && fs.existsSync(recoveryPath) && !fs.existsSync(serverDir)) {
+      try {
+        fs.renameSync(recoveryPath, serverDir);
+        recoveryPath = null;
+      } catch (restoreError) {
+        return {
+          success: false,
+          error: `${error.message}; server data is retained at ${recoveryPath} because rollback failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+          recovery_path: recoveryPath,
+        };
+      }
+    }
     return { success: false, error: error.message };
   }
 
-  return { success: true };
+  return recoveryPath ? { success: true, recovery_path: recoveryPath } : { success: true };
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function isUnsafeArtifactHost(hostname) {
+  const host = String(hostname || "").toLowerCase();
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
+    return true;
+  }
+  if (isIP(host) === 6) {
+    return host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
+  }
+  if (isIP(host) !== 4) return false;
+  const [a, b] = host.split(".").map((part) => Number(part));
+  return a === 10 || a === 127 || a === 0 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168);
+}
+
+function createRecoveryPath(manager, serverId) {
+  if (!manager?.dataDir) throw new Error("Runtime data directory is unavailable");
+  const dataRoot = path.resolve(manager.dataDir);
+  const recoveryRoot = path.resolve(dataRoot, ".amalgam-trash", "servers");
+  const relative = path.relative(dataRoot, recoveryRoot);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Recovery directory is outside the runtime data directory");
+  }
+  fs.mkdirSync(recoveryRoot, { recursive: true });
+  return path.join(recoveryRoot, `server-${serverId}-${Date.now()}-${crypto.randomUUID()}`);
+}
 
 async function completeOp(supabase, nodeInfo, config, opId, success, result, operationType, startTime) {
   const errorMsg = success ? "" : result.error || "Unknown error";

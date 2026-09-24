@@ -13,6 +13,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <utility>
 
 namespace aml::account {
 
@@ -66,8 +67,10 @@ AccountActivity activity_from_row(const Json& row) {
     activity.id = row.get("id").as_str();
     activity.type = row.get("type").as_str();
     if (activity.type.empty()) activity.type = row.get("action").as_str();
+    if (activity.type.empty()) activity.type = row.get("activity_type").as_str();
     activity.description = row.get("description").as_str();
     if (activity.description.empty()) activity.description = row.get("message").as_str();
+    if (activity.description.empty()) activity.description = row.get("activity_type").as_str();
     if (activity.description.empty()) activity.description = activity.type;
     activity.timestamp = activity_timestamp(row);
     activity.ip_address = row.get("ip_address").as_str();
@@ -106,6 +109,13 @@ AccountManager& AccountManager::instance() {
 
 bool AccountManager::create_session(const std::string& email, const std::string& access_token, 
                                    const std::string& refresh_token, int64_t expires_at) {
+    // The on-disk session store is the source of truth across launcher runs.
+    // Never leave an in-memory login that the protected store failed to commit:
+    // callers would otherwise report success even though a restart resurrects
+    // the old token state.
+    const auto previous_sessions = sessions_;
+    const auto previous_current_session_id = current_session_id_;
+
     // Check if session already exists
     for (auto& session : sessions_) {
         if (session.email == email) {
@@ -115,7 +125,11 @@ bool AccountManager::create_session(const std::string& email, const std::string&
             session.expires_at = expires_at;
             session.last_used = std::time(nullptr);
             current_session_id_ = session.id;
-            save_sessions();
+            if (!save_sessions()) {
+                sessions_ = previous_sessions;
+                current_session_id_ = previous_current_session_id;
+                return false;
+            }
             return true;
         }
     }
@@ -133,16 +147,26 @@ bool AccountManager::create_session(const std::string& email, const std::string&
     sessions_.push_back(new_session);
     current_session_id_ = new_session.id;
     
-    save_sessions();
+    if (!save_sessions()) {
+        sessions_ = previous_sessions;
+        current_session_id_ = previous_current_session_id;
+        return false;
+    }
     return true;
 }
 
 bool AccountManager::set_current_session(const std::string& session_id) {
+    const auto previous_sessions = sessions_;
+    const auto previous_current_session_id = current_session_id_;
     for (auto& session : sessions_) {
         if (session.id == session_id) {
             current_session_id_ = session_id;
             session.last_used = std::time(nullptr);
-            save_sessions();
+            if (!save_sessions()) {
+                sessions_ = previous_sessions;
+                current_session_id_ = previous_current_session_id;
+                return false;
+            }
             return true;
         }
     }
@@ -150,13 +174,19 @@ bool AccountManager::set_current_session(const std::string& session_id) {
 }
 
 bool AccountManager::end_session(const std::string& session_id) {
+    const auto previous_sessions = sessions_;
+    const auto previous_current_session_id = current_session_id_;
     for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
         if (it->id == session_id) {
             if (current_session_id_ == session_id) {
                 current_session_id_.clear();
             }
             sessions_.erase(it);
-            save_sessions();
+            if (!save_sessions()) {
+                sessions_ = previous_sessions;
+                current_session_id_ = previous_current_session_id;
+                return false;
+            }
             return true;
         }
     }
@@ -165,15 +195,27 @@ bool AccountManager::end_session(const std::string& session_id) {
 
 bool AccountManager::end_current_session() {
     if (current_session_id_.empty()) {
-        return false;
+        // A non-persistent ("remember me" off) login has no local record to
+        // remove. That is already a locally-clean state, not a sign-out
+        // failure.
+        return true;
     }
     return end_session(current_session_id_);
 }
 
 bool AccountManager::end_all_sessions() {
+    if (sessions_.empty() && current_session_id_.empty()) {
+        return true;
+    }
+    const auto previous_sessions = sessions_;
+    const auto previous_current_session_id = current_session_id_;
     sessions_.clear();
     current_session_id_.clear();
-    save_sessions();
+    if (!save_sessions()) {
+        sessions_ = previous_sessions;
+        current_session_id_ = previous_current_session_id;
+        return false;
+    }
     return true;
 }
 
@@ -225,6 +267,8 @@ bool AccountManager::refresh_current_session() {
     
     auto response = supabase.refresh_token(session.refresh_token);
     if (response.success) {
+        const auto previous_sessions = sessions_;
+        const auto previous_current_session_id = current_session_id_;
         session.access_token = response.access_token;
         session.refresh_token = response.refresh_token;
         session.expires_at = response.expires_at > 0
@@ -239,7 +283,11 @@ bool AccountManager::refresh_current_session() {
             }
         }
         
-        save_sessions();
+        if (!save_sessions()) {
+            sessions_ = previous_sessions;
+            current_session_id_ = previous_current_session_id;
+            return false;
+        }
         return true;
     }
     
@@ -341,6 +389,11 @@ aml::supabase::SupabaseSecuritySettings AccountManager::get_security_settings() 
     return aml::supabase::SupabaseManager::instance().get_security_settings();
 }
 
+aml::supabase::SupabaseSecuritySettings AccountManager::get_security_settings(
+    std::string* error) const {
+    return aml::supabase::SupabaseManager::instance().get_security_settings(error);
+}
+
 // ---------------------------------------------------------------------------
 // Linked Accounts (Microsoft, etc.)
 // ---------------------------------------------------------------------------
@@ -380,6 +433,7 @@ bool AccountManager::unlink_microsoft_account() {
     metadata.erase("microsoft_linked_at");
     
     auto response = supabase.update_user({}, metadata);
+    if (response.success) microsoft_token_.clear();
     return response.success;
 }
 
@@ -536,14 +590,34 @@ AccountStats AccountManager::get_account_stats() const {
 }
 
 std::vector<AccountActivity> AccountManager::get_recent_activity() const {
-    std::vector<AccountActivity> activities;
     auto& supabase = aml::supabase::SupabaseManager::instance();
-    if (auto* client = supabase.client(); client && client->is_authenticated()) {
+    const auto current_user = supabase.get_current_user();
+    const std::wstring instances_dir = net::get_local_app_data_path() + L"\\instances";
+    return get_recent_activity(current_user.id, sessions_, instances_dir, nullptr, nullptr);
+}
+
+std::vector<AccountActivity> AccountManager::get_recent_activity(
+    const std::string& expected_user_id,
+    const std::vector<AccountSession>& local_sessions,
+    const std::wstring& instances_dir,
+    std::string* refresh_error,
+    bool* used_local_fallback) const {
+    if (refresh_error) refresh_error->clear();
+    if (used_local_fallback) *used_local_fallback = false;
+
+    std::vector<AccountActivity> activities;
+    std::string read_error;
+    auto& supabase = aml::supabase::SupabaseManager::instance();
+    if (expected_user_id.empty()) {
+        read_error = "Your Amalgam session is no longer available.";
+    } else if (auto* client = supabase.client(); client && client->is_authenticated()) {
         const auto user = client->current_user();
-        if (!user.id.empty()) {
+        if (user.id != expected_user_id) {
+            read_error = "Your active account changed before activity could be refreshed.";
+        } else {
             aml::supabase::SupabaseClient::DBQueryOptions query;
             query.table = "account_activity";
-            query.eq_filters["user_id"] = user.id;
+            query.eq_filters["user_id"] = expected_user_id;
             query.order_by = "created_at";
             query.order_asc = false;
             query.limit = 20;
@@ -553,13 +627,20 @@ std::vector<AccountActivity> AccountManager::get_recent_activity() const {
                     AccountActivity activity = activity_from_row(row);
                     if (activity.timestamp > 0) activities.push_back(std::move(activity));
                 }
+            } else {
+                read_error = result.error.empty()
+                    ? "The account activity service could not be reached."
+                    : result.error;
             }
         }
+    } else {
+        read_error = "Your Amalgam session is no longer available.";
     }
 
     // Local timestamps remain useful when the activity table is unavailable or empty.
     if (activities.empty()) {
-        for (const auto& session : sessions_) {
+        if (used_local_fallback) *used_local_fallback = true;
+        for (const auto& session : local_sessions) {
             if (session.created_at > 0) {
                 activities.push_back({"session-" + session.id + "-created", "login",
                                       "Signed in", session.created_at, {}, {}});
@@ -569,18 +650,22 @@ std::vector<AccountActivity> AccountManager::get_recent_activity() const {
                                       "Used this launcher session", session.last_used, {}, {}});
             }
         }
-        const std::wstring instances_dir = net::get_local_app_data_path() + L"\\instances";
-        for (const auto& instance : aml::instances::scan(instances_dir, nullptr)) {
+        std::string instance_error;
+        for (const auto& instance : aml::instances::scan(instances_dir, &instance_error)) {
             if (instance.last_played > 0) {
                 activities.push_back({"instance-" + instance.id, "launch",
                                       "Played " + instance.name, instance.last_played, {}, {}});
             }
+        }
+        if (!instance_error.empty() && read_error.empty()) {
+            read_error = instance_error;
         }
     }
     std::sort(activities.begin(), activities.end(), [](const auto& a, const auto& b) {
         return a.timestamp > b.timestamp;
     });
     if (activities.size() > 20) activities.resize(20);
+    if (refresh_error) *refresh_error = std::move(read_error);
     return activities;
 }
 

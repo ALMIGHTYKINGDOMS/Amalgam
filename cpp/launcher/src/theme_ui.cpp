@@ -7,6 +7,8 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <map>
 
 namespace aml::ui {
@@ -26,18 +28,6 @@ struct ThemeUIState {
     int selected_color_index = 0;
     ImVec4 color_picker;
     
-    // Fonts
-    int selected_font_index = 0;
-    float font_size = 14.0f;
-    
-    // Accessibility
-    bool high_contrast_mode = false;
-    bool reduced_motion = false;
-    bool color_blind_mode = false;
-    std::string color_blind_type;
-    
-    // Localization
-    std::string selected_language;
 };
 
 static ThemeUIState& get_theme_ui_state() {
@@ -59,13 +49,6 @@ struct ThemePreset {
     std::map<std::string, ImVec4> colors;
 };
 
-struct Language {
-    std::string code;
-    std::string name;
-    std::string native_name;
-    bool is_rtl;
-};
-
 // ---------------------------------------------------------------------------
 // Available Themes
 // ---------------------------------------------------------------------------
@@ -79,15 +62,15 @@ const std::vector<ThemePreset> kAvailableThemes = {
         true,
         false,
         {
-            {"background", ImVec4(0.06f, 0.06f, 0.06f, 1.00f)},
-            {"background_secondary", ImVec4(0.12f, 0.12f, 0.12f, 1.00f)},
-            {"text", ImVec4(0.90f, 0.90f, 0.90f, 1.00f)},
-            {"text_muted", ImVec4(0.60f, 0.60f, 0.60f, 1.00f)},
-            {"accent", ImVec4(0.20f, 0.60f, 1.00f, 1.00f)},
-            {"accent_secondary", ImVec4(0.40f, 0.80f, 1.00f, 1.00f)},
-            {"success", ImVec4(0.20f, 0.80f, 0.40f, 1.00f)},
-            {"warning", ImVec4(1.00f, 0.80f, 0.20f, 1.00f)},
-            {"error", ImVec4(1.00f, 0.30f, 0.30f, 1.00f)},
+            {"background", ImVec4(0.017f, 0.029f, 0.051f, 1.00f)},
+            {"background_secondary", ImVec4(0.032f, 0.052f, 0.086f, 1.00f)},
+            {"text", ImVec4(0.93f, 0.94f, 0.97f, 1.00f)},
+            {"text_muted", ImVec4(0.60f, 0.67f, 0.77f, 1.00f)},
+            {"accent", ImVec4(0.48f, 0.19f, 0.90f, 1.00f)},
+            {"accent_secondary", ImVec4(0.72f, 0.43f, 1.00f, 1.00f)},
+            {"success", ImVec4(0.11f, 0.86f, 0.42f, 1.00f)},
+            {"warning", ImVec4(0.91f, 0.80f, 0.31f, 1.00f)},
+            {"error", ImVec4(0.95f, 0.33f, 0.36f, 1.00f)},
         }
     },
     {
@@ -168,35 +151,64 @@ const std::vector<ThemePreset> kAvailableThemes = {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Available Languages
-// ---------------------------------------------------------------------------
-
-const std::vector<Language> kAvailableLanguages = {
-    {"en", "English", "English", false},
-    {"es", "Spanish", "Español", false},
-    {"fr", "French", "Français", false},
-    {"de", "German", "Deutsch", false},
-    {"it", "Italian", "Italiano", false},
-    {"pt", "Portuguese", "Português", false},
-    {"ru", "Russian", "Русский", false},
-    {"zh", "Chinese", "中文", true},
-    {"ja", "Japanese", "日本語", false},
-    {"ko", "Korean", "한국어", false},
+// A profile is intentionally described by the color pair it separates rather
+// than claiming to simulate a clinical condition.  Each profile below changes
+// the actual semantic colors the launcher draws.
+struct ColorVisionProfile {
+    const char* id;
+    const char* label;
 };
 
-// ---------------------------------------------------------------------------
-// Color Blind Types
-// ---------------------------------------------------------------------------
-
-const std::vector<std::string> kColorBlindTypes = {
-    "Deuteranopia (Red-Green)",
-    "Protanopia (Red-Green)",
-    "Tritanopia (Blue-Yellow)",
-    "Achromatopsia (Monochrome)"
+const std::vector<ColorVisionProfile> kColorVisionProfiles = {
+    {"red_green", "Red–green distinction"},
+    {"blue_yellow", "Blue–yellow distinction"},
 };
 
-void apply_theme(const ThemePreset& theme);
+const ThemePreset& theme_for_id(const std::string& id) {
+    for (const auto& theme : kAvailableThemes) {
+        if (theme.id == id) return theme;
+    }
+    return kAvailableThemes.front();
+}
+
+int hex_value(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return 10 + value - 'a';
+    if (value >= 'A' && value <= 'F') return 10 + value - 'A';
+    return -1;
+}
+
+bool parse_hex_color(const std::string& value, ImVec4& out) {
+    if ((value.size() != 7 && value.size() != 9) || value.front() != '#') return false;
+    const auto byte_at = [&value](size_t offset) {
+        const int high = hex_value(value[offset]);
+        const int low = hex_value(value[offset + 1]);
+        return high < 0 || low < 0 ? -1 : high * 16 + low;
+    };
+    const int red = byte_at(1);
+    const int green = byte_at(3);
+    const int blue = byte_at(5);
+    const int alpha = value.size() == 9 ? byte_at(7) : 255;
+    if (red < 0 || green < 0 || blue < 0 || alpha < 0) return false;
+    out = ImVec4(red / 255.0f, green / 255.0f, blue / 255.0f, alpha / 255.0f);
+    return true;
+}
+
+ThemePreset effective_theme(const config::Config& config) {
+    ThemePreset result = theme_for_id(config.theme);
+    for (auto& color : result.colors) {
+        const auto custom = config.theme_custom_colors.find(color.first);
+        ImVec4 parsed;
+        if (custom != config.theme_custom_colors.end() && parse_hex_color(custom->second, parsed)) {
+            color.second = parsed;
+        }
+    }
+    return result;
+}
+
+void apply_theme_preset(const ThemePreset& theme);
+void apply_high_contrast_palette();
+void apply_color_vision_palette(const std::string& profile);
 
 // ---------------------------------------------------------------------------
 // Themes Tab
@@ -205,7 +217,6 @@ void apply_theme(const ThemePreset& theme);
 void draw_theme_themes(UiState& st) {
     auto& theme_ui = get_theme_ui_state();
     config::Config& c = *st.cfg;
-    set_reduced_motion(theme_ui.reduced_motion);
     
     page_title("Themes", "Choose and customize your launcher theme");
     
@@ -291,7 +302,7 @@ void draw_theme_themes(UiState& st) {
                 if (ghost_button("Select", ImVec2(ui_px(100.0f), ui_px(28.0f)))) {
                     c.theme = theme.id;
                     theme_ui.selected_theme = theme.id;
-                    apply_theme(theme);
+                    apply_configured_theme(c);
                     save_ui_config(st);
                 }
             } else {
@@ -305,7 +316,7 @@ void draw_theme_themes(UiState& st) {
             if (ghost_button("Select", ImVec2(ui_px(100.0f), ui_px(28.0f)))) {
                 c.theme = theme.id;
                 theme_ui.selected_theme = theme.id;
-                apply_theme(theme);
+                apply_configured_theme(c);
                 save_ui_config(st);
             }
         }
@@ -333,49 +344,36 @@ void draw_theme_colors(UiState& st) {
     
     if (ghost_button("Reset to Theme", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
         c.theme_custom_colors.clear();
-        st.settings_dirty = true;
+        apply_configured_theme(c);
+        save_ui_config(st);
     }
     
     card_end();
     
     ImGui::Spacing();
     
-    // Build edit_theme from the current theme, then overlay custom colors from config.
-    static ThemePreset edit_theme;
-    static std::string loaded_theme;
-    if (loaded_theme != c.theme) {
-        edit_theme = kAvailableThemes[0];
-        for (const auto& theme : kAvailableThemes) {
-            if (theme.id == c.theme) { edit_theme = theme; break; }
-        }
-        // Apply saved custom colors
-        for (auto& kv : edit_theme.colors) {
-            auto it = c.theme_custom_colors.find(kv.first);
-            if (it != c.theme_custom_colors.end() && it->second.size() >= 7) {
-                auto hex = [](char c) -> unsigned char {
-                    if (c >= '0' && c <= '9') return c - '0';
-                    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-                    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-                    return 0;
-                };
-                const std::string& h = it->second;
-                kv.second = ImVec4(hex(h[1]) / 255.0f, hex(h[2]) / 255.0f,
-                                   hex(h[3]) / 255.0f, h.size() >= 9 ? hex(h[5]) / 255.0f : 1.0f);
-            }
-        }
-        loaded_theme = c.theme;
-    }
+    // Rebuild the editing model from persisted data every frame.  This keeps
+    // the swatches synchronized with Reset, Reload saved, and the actual
+    // palette used by the rest of the launcher.
+    ThemePreset edit_theme = effective_theme(c);
 
     auto save_color = [&](const char* key, ImVec4& col) {
-        if (ImGui::ColorEdit3(key, reinterpret_cast<float*>(&col),
-                              ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) {
+        const bool changed = ImGui::ColorEdit3(key, reinterpret_cast<float*>(&col),
+                                                ImGuiColorEditFlags_NoInputs |
+                                                    ImGuiColorEditFlags_NoLabel);
+        if (changed) {
             char buf[16];
-            std::snprintf(buf, sizeof(buf), "#%02x%02x%02xff",
-                          static_cast<int>(col.x * 255), static_cast<int>(col.y * 255),
-                          static_cast<int>(col.z * 255));
+            std::snprintf(buf, sizeof(buf), "#%02X%02X%02X",
+                          static_cast<int>(std::round(col.x * 255.0f)),
+                          static_cast<int>(std::round(col.y * 255.0f)),
+                          static_cast<int>(std::round(col.z * 255.0f)));
             c.theme_custom_colors[key] = buf;
+            apply_configured_theme(c);
             st.settings_dirty = true;
         }
+        // Color pickers emit changes while dragged.  Apply every intermediate
+        // shade for a truthful live preview, but persist once the edit ends.
+        if (ImGui::IsItemDeactivatedAfterEdit()) save_ui_config(st);
     };
     
     // Color categories
@@ -452,7 +450,8 @@ void draw_theme_fonts(UiState& st) {
     
     if (ghost_button("Reset to Default", ImVec2(ui_px(150.0f), ui_px(32.0f)))) {
         c.theme_font_size = 14.0f;
-        st.settings_dirty = true;
+        apply_configured_theme(c);
+        save_ui_config(st);
     }
     
     card_end();
@@ -466,14 +465,19 @@ void draw_theme_fonts(UiState& st) {
     
     ImGui::TextUnformatted("Base Font Size");
     ImGui::SetNextItemWidth(ui_px(100.0f));
-    if (ImGui::SliderFloat("##theme_font_size", &c.theme_font_size, 8.0f, 24.0f, "%.1f px")) {
+    const bool font_size_changed = ImGui::SliderFloat("##theme_font_size", &c.theme_font_size,
+                                                       12.0f, 20.0f, "%.1f px");
+    if (font_size_changed) {
+        config::normalize_presentation_preferences(c);
+        apply_configured_theme(c);
         st.settings_dirty = true;
     }
+    if (ImGui::IsItemDeactivatedAfterEdit()) save_ui_config(st);
     
     ImGui::Spacing();
     
     ImGui::TextUnformatted("Preview");
-    ImGui::TextColored(k.muted, "This is a sample text with the current font settings.");
+    ImGui::TextColored(k.muted, "This text changes at once and stays selected after a restart.");
     ImGui::TextColored(k.muted, "The quick brown fox jumps over the lazy dog.");
     
     card_end();
@@ -485,8 +489,8 @@ void draw_theme_fonts(UiState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     
-    ImGui::TextColored(k.muted, "The beta uses the bundled launcher font family for consistent rendering.");
-    ImGui::TextColored(k.muted, "Font family switching is intentionally disabled in this build.");
+    ImGui::TextColored(k.muted, "Amalgam uses the bundled Segoe UI family and CJK fallback for consistent rendering.");
+    ImGui::TextColored(k.muted, "Font family switching is not offered because no alternate family is installed or applied by the launcher.");
     
     card_end();
 }
@@ -496,7 +500,6 @@ void draw_theme_fonts(UiState& st) {
 // ---------------------------------------------------------------------------
 
 void draw_theme_accessibility(UiState& st) {
-    auto& theme_ui = get_theme_ui_state();
     config::Config& c = *st.cfg;
     
     page_title("Accessibility", "Configure accessibility options for better usability");
@@ -506,26 +509,49 @@ void draw_theme_accessibility(UiState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     
-    ImGui::Checkbox("High Contrast Mode", &theme_ui.high_contrast_mode);
-    ImGui::TextColored(k.muted, "Increase contrast for better visibility");
+    if (ImGui::Checkbox("High-contrast palette", &c.high_contrast_mode)) {
+        apply_configured_theme(c);
+        save_ui_config(st);
+    }
+    ImGui::TextColored(k.muted, "Raises text, border, focus, and surface contrast across the launcher.");
     
     ImGui::Spacing();
     
-    ImGui::Checkbox("Color Blind Mode", &theme_ui.color_blind_mode);
+    if (ImGui::Checkbox("Color-vision palette", &c.color_vision_palette)) {
+        apply_configured_theme(c);
+        save_ui_config(st);
+    }
     
-    if (theme_ui.color_blind_mode) {
+    if (c.color_vision_palette) {
         ImGui::SetNextItemWidth(ui_px(200.0f));
-        if (ImGui::BeginCombo("##theme_color_blind_type", 
-                            theme_ui.color_blind_type.empty() ? 
-                            "Select type" : theme_ui.color_blind_type.c_str())) {
-            for (const auto& type : kColorBlindTypes) {
-                if (ImGui::Selectable(type.c_str(), theme_ui.color_blind_type == type)) {
-                    theme_ui.color_blind_type = type;
+        const auto selected = std::find_if(kColorVisionProfiles.begin(), kColorVisionProfiles.end(),
+                                           [&c](const ColorVisionProfile& profile) {
+                                               return profile.id == c.color_vision_profile;
+                                           });
+        const char* label = selected != kColorVisionProfiles.end()
+            ? selected->label : kColorVisionProfiles.front().label;
+        if (ImGui::BeginCombo("##theme_color_vision_profile", label)) {
+            for (const auto& profile : kColorVisionProfiles) {
+                if (ImGui::Selectable(profile.label, c.color_vision_profile == profile.id)) {
+                    c.color_vision_profile = profile.id;
+                    apply_configured_theme(c);
+                    save_ui_config(st);
                 }
             }
             ImGui::EndCombo();
         }
-        ImGui::TextColored(k.muted, "Adjust colors for color blindness");
+        ImGui::TextColored(k.muted, "Changes semantic status and accent hues; labels and icons remain the primary status signal.");
+    }
+
+    if (c.high_contrast_mode || c.color_vision_palette) {
+        ImGui::Spacing();
+        ImGui::TextColored(k.muted, "Applied semantic palette");
+        ImGui::TextColored(k.green, "Success / ready");
+        ImGui::SameLine();
+        ImGui::TextColored(k.yellow, "Warning / attention");
+        ImGui::TextColored(k.red, "Error / blocked");
+        ImGui::SameLine();
+        ImGui::TextColored(k.blue, "Information");
     }
     
     card_end();
@@ -537,10 +563,11 @@ void draw_theme_accessibility(UiState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     
-    if (ImGui::Checkbox("Reduced Motion", &theme_ui.reduced_motion)) {
-        set_reduced_motion(theme_ui.reduced_motion);
+    if (ImGui::Checkbox("Reduced motion", &c.reduced_motion)) {
+        apply_configured_theme(c);
+        save_ui_config(st);
     }
-    ImGui::TextColored(k.muted, "Reduce animations and transitions");
+    ImGui::TextColored(k.muted, "Snaps launcher transitions and popups to their final state.");
     
     card_end();
     
@@ -551,13 +578,19 @@ void draw_theme_accessibility(UiState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     
-    ImGui::Checkbox("Keyboard Navigation", &c.keyboard_navigation);
-    ImGui::TextColored(k.muted, "Enable enhanced keyboard navigation");
+    if (ImGui::Checkbox("Launcher navigation shortcuts", &c.keyboard_navigation)) {
+        save_ui_config(st);
+    }
+    ImGui::TextColored(k.muted, "Enables Ctrl+1–6 and Ctrl+, page shortcuts. Tab and arrow-key focus remain available.");
     
     ImGui::Spacing();
     
-    ImGui::Checkbox("Screen Reader Support", &c.screen_reader_support);
-    ImGui::TextColored(k.muted, "Enable screen reader compatibility features");
+    // Dear ImGui currently exposes this launcher as a single native window;
+    // advertising an on/off screen-reader switch before control-level
+    // semantics exist would be misleading. Keep the limitation explicit while
+    // the accessible native control tree is completed.
+    ImGui::TextColored(k.yellow, "Screen-reader semantics are not available in this build.");
+    ImGui::TextWrapped("The launcher is a single native window and does not yet expose reliable control-by-control screen-reader information. No inactive screen-reader switch is shown as a result.");
     
     card_end();
 }
@@ -567,7 +600,6 @@ void draw_theme_accessibility(UiState& st) {
 // ---------------------------------------------------------------------------
 
 void draw_theme_localization(UiState& st) {
-    auto& theme_ui = get_theme_ui_state();
     config::Config& c = *st.cfg;
     
     page_title("Localization", "Configure language and regional settings");
@@ -577,31 +609,10 @@ void draw_theme_localization(UiState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     
-    ImGui::TextUnformatted("Select Language");
-    ImGui::SetNextItemWidth(ui_px(200.0f));
-    
-    // Find current language
-    std::string current_lang_name = "English";
-    for (const auto& lang : kAvailableLanguages) {
-        if (lang.code == c.language) {
-            current_lang_name = lang.native_name;
-            break;
-        }
-    }
-    
-    if (ImGui::BeginCombo("##theme_language", current_lang_name.c_str())) {
-        for (const auto& lang : kAvailableLanguages) {
-            if (ImGui::Selectable(lang.native_name.c_str(), c.language == lang.code)) {
-                c.language = lang.code;
-                theme_ui.selected_language = lang.code;
-                save_ui_config(st);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    
+    ImGui::TextUnformatted("Launcher interface");
+    ImGui::TextColored(k.text, "English");
     ImGui::Spacing();
-    ImGui::TextColored(k.muted, "Language changes will take effect after restart");
+    ImGui::TextWrapped("The launcher interface currently ships in English. A language selector would not translate this build, so it is intentionally not shown. Account-profile language and optional content translation are managed in their dedicated pages.");
     
     card_end();
     
@@ -617,12 +628,15 @@ void draw_theme_localization(UiState& st) {
     if (ImGui::BeginCombo("##theme_date_format", c.date_format.c_str())) {
         if (ImGui::Selectable("MM/DD/YYYY", c.date_format == "MM/DD/YYYY")) {
             c.date_format = "MM/DD/YYYY";
+            save_ui_config(st);
         }
         if (ImGui::Selectable("DD/MM/YYYY", c.date_format == "DD/MM/YYYY")) {
             c.date_format = "DD/MM/YYYY";
+            save_ui_config(st);
         }
         if (ImGui::Selectable("YYYY-MM-DD", c.date_format == "YYYY-MM-DD")) {
             c.date_format = "YYYY-MM-DD";
+            save_ui_config(st);
         }
         ImGui::EndCombo();
     }
@@ -634,12 +648,24 @@ void draw_theme_localization(UiState& st) {
     if (ImGui::BeginCombo("##theme_time_format", c.time_format.c_str())) {
         if (ImGui::Selectable("12-hour", c.time_format == "12-hour")) {
             c.time_format = "12-hour";
+            save_ui_config(st);
         }
         if (ImGui::Selectable("24-hour", c.time_format == "24-hour")) {
             c.time_format = "24-hour";
+            save_ui_config(st);
         }
         ImGui::EndCombo();
     }
+
+    ImGui::Spacing();
+    std::tm example{};
+    example.tm_year = 126; // 2026
+    example.tm_mon = 8;    // September
+    example.tm_mday = 22;
+    example.tm_hour = 15;
+    example.tm_min = 7;
+    ImGui::TextColored(k.muted, "Applied example: %s",
+                       config::format_local_date_time(example, c).c_str());
     
     card_end();
 }
@@ -648,7 +674,7 @@ void draw_theme_localization(UiState& st) {
 // Theme Helper Functions
 // ---------------------------------------------------------------------------
 
-void apply_theme(const ThemePreset& theme) {
+void apply_theme_preset(const ThemePreset& theme) {
     const auto color = [&theme](const char* name) { return theme.colors.at(name); };
     k.bg = color("background");
     k.sidebar = color("background_secondary");
@@ -669,31 +695,76 @@ void apply_theme(const ThemePreset& theme) {
     k.yellow = color("warning");
     k.green = color("success");
 
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.Colors[ImGuiCol_WindowBg] = k.bg;
-    style.Colors[ImGuiCol_PopupBg] = k.surface;
-    style.Colors[ImGuiCol_Border] = k.border;
-    style.Colors[ImGuiCol_FrameBg] = k.surface2;
-    style.Colors[ImGuiCol_FrameBgActive] = k.brand_dk;
-    style.Colors[ImGuiCol_TitleBg] = k.sidebar;
-    style.Colors[ImGuiCol_TitleBgActive] = k.sidebar;
-    style.Colors[ImGuiCol_Header] = k.sel;
-    style.Colors[ImGuiCol_HeaderHovered] = k.hover;
-    style.Colors[ImGuiCol_HeaderActive] = k.brand_dk;
-    style.Colors[ImGuiCol_Button] = k.surface2;
-    style.Colors[ImGuiCol_ButtonHovered] = k.hover;
-    style.Colors[ImGuiCol_ButtonActive] = k.brand_dk;
-    style.Colors[ImGuiCol_CheckMark] = k.brand;
-    style.Colors[ImGuiCol_SliderGrab] = k.brand;
-    style.Colors[ImGuiCol_SliderGrabActive] = k.brand_hov;
-    style.Colors[ImGuiCol_TextSelectedBg] = k.sel;
-    apply_scrollbar_style();
-    style.Colors[ImGuiCol_Separator] = k.border;
-    style.Colors[ImGuiCol_Tab] = k.surface;
-    style.Colors[ImGuiCol_TabHovered] = k.hover;
-    style.Colors[ImGuiCol_TabActive] = k.sel;
-    style.Colors[ImGuiCol_Text] = k.text;
-    style.Colors[ImGuiCol_TextDisabled] = k.muted;
+}
+
+void apply_high_contrast_palette() {
+    const float brightness = k.bg.x * 0.2126f + k.bg.y * 0.7152f + k.bg.z * 0.0722f;
+    const bool light_base = brightness > 0.55f;
+    if (light_base) {
+        k.bg = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        k.sidebar = ImVec4(0.94f, 0.94f, 0.94f, 1.0f);
+        k.surface = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        k.surface2 = ImVec4(0.92f, 0.92f, 0.92f, 1.0f);
+        k.text = ImVec4(0.03f, 0.03f, 0.03f, 1.0f);
+        k.muted = ImVec4(0.18f, 0.18f, 0.18f, 1.0f);
+        k.border = ImVec4(0.03f, 0.03f, 0.03f, 1.0f);
+        k.hover = ImVec4(0.82f, 0.89f, 1.0f, 1.0f);
+        k.sel = ImVec4(0.10f, 0.36f, 0.75f, 0.35f);
+        k.brand = ImVec4(0.03f, 0.25f, 0.67f, 1.0f);
+        k.brand_hov = ImVec4(0.00f, 0.18f, 0.55f, 1.0f);
+    } else {
+        k.bg = ImVec4(0.01f, 0.01f, 0.01f, 1.0f);
+        k.sidebar = ImVec4(0.035f, 0.035f, 0.035f, 1.0f);
+        k.surface = ImVec4(0.055f, 0.055f, 0.055f, 1.0f);
+        k.surface2 = ImVec4(0.10f, 0.10f, 0.10f, 1.0f);
+        k.text = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        k.muted = ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
+        k.border = ImVec4(0.92f, 0.92f, 0.92f, 1.0f);
+        k.hover = ImVec4(0.16f, 0.23f, 0.36f, 1.0f);
+        k.sel = ImVec4(0.38f, 0.65f, 1.0f, 0.42f);
+        k.brand = ImVec4(0.48f, 0.75f, 1.0f, 1.0f);
+        k.brand_hov = ImVec4(0.73f, 0.87f, 1.0f, 1.0f);
+    }
+    k.brand_dk = ImVec4(k.brand.x * 0.55f, k.brand.y * 0.55f, k.brand.z * 0.55f, 1.0f);
+    k.red = ImVec4(0.88f, 0.16f, 0.18f, 1.0f);
+    k.orange = ImVec4(0.86f, 0.48f, 0.08f, 1.0f);
+    k.yellow = ImVec4(0.75f, 0.63f, 0.02f, 1.0f);
+    k.green = ImVec4(0.00f, 0.52f, 0.25f, 1.0f);
+    k.blue = k.brand_hov;
+}
+
+void apply_color_vision_palette(const std::string& profile) {
+    if (profile == "blue_yellow") {
+        // Avoid a blue/yellow-only error signal; use violet, teal, and coral
+        // semantic hues while preserving explicit labels and icons.
+        k.blue = ImVec4(0.67f, 0.46f, 0.94f, 1.0f);
+        k.green = ImVec4(0.12f, 0.67f, 0.56f, 1.0f);
+        k.yellow = ImVec4(0.91f, 0.40f, 0.29f, 1.0f);
+        k.orange = ImVec4(0.91f, 0.40f, 0.29f, 1.0f);
+        k.red = ImVec4(0.84f, 0.22f, 0.36f, 1.0f);
+    } else {
+        // Separate success and error away from a red/green pair: cyan for
+        // success, orange for error, and amber for warning.
+        k.green = ImVec4(0.12f, 0.70f, 0.84f, 1.0f);
+        k.red = ImVec4(0.94f, 0.42f, 0.16f, 1.0f);
+        k.orange = ImVec4(0.94f, 0.64f, 0.20f, 1.0f);
+        k.yellow = ImVec4(0.88f, 0.72f, 0.22f, 1.0f);
+        k.blue = ImVec4(0.38f, 0.62f, 0.95f, 1.0f);
+    }
+}
+
+void apply_configured_theme(const config::Config& config) {
+    config::Config normalized = config;
+    config::normalize_presentation_preferences(normalized);
+    apply_theme_preset(effective_theme(normalized));
+    if (normalized.high_contrast_mode) apply_high_contrast_palette();
+    if (normalized.color_vision_palette) apply_color_vision_palette(normalized.color_vision_profile);
+    set_reduced_motion(normalized.reduced_motion);
+    set_theme_font_size(normalized.theme_font_size);
+    // ui.cpp owns the common ImGui style baseline; call it after every palette
+    // transformation so startup, reload, and live changes produce identical
+    // actual colors, focus outlines, scrollbars, and widget states.
+    apply_theme();
 }
 
 // ---------------------------------------------------------------------------
@@ -702,34 +773,85 @@ void apply_theme(const ThemePreset& theme) {
 
 void draw_theme_page(UiState& st) {
     auto& theme_ui = get_theme_ui_state();
+
+    // Snapshot fixtures select a tab explicitly so each visual surface can be
+    // reviewed without brittle coordinate clicks. Normal launcher sessions
+    // retain Dear ImGui's regular tab-selection behaviour.
+    if (st.fixture_mode) {
+        // Fixture preferences are applied only to the isolated in-memory
+        // fixture config; save_ui_config refuses fixture writes.  These named
+        // states make the real palette/motion/localization behavior visible
+        // without reading a player's launcher.json.
+        config::Config& c = *st.cfg;
+        c.high_contrast_mode = st.fixture_case == "theme-accessibility-high-contrast";
+        c.color_vision_palette = st.fixture_case == "theme-accessibility-color-vision";
+        c.reduced_motion = st.fixture_case == "theme-accessibility-reduced-motion";
+        if (c.color_vision_palette) c.color_vision_profile = "red_green";
+        if (st.fixture_case == "theme-localization-12-hour") {
+            c.date_format = "MM/DD/YYYY";
+            c.time_format = "12-hour";
+        }
+        apply_configured_theme(c);
+        if (st.fixture_case == "theme-colors") theme_ui.current_tab = 1;
+        else if (st.fixture_case == "theme-fonts") theme_ui.current_tab = 2;
+        else if (st.fixture_case == "theme-accessibility" ||
+                 st.fixture_case.rfind("theme-accessibility-", 0) == 0)
+            theme_ui.current_tab = 3;
+        else if (st.fixture_case == "theme-localization" ||
+                 st.fixture_case.rfind("theme-localization-", 0) == 0)
+            theme_ui.current_tab = 4;
+        else if (st.fixture_case == "theme" || st.fixture_case == "theme-themes")
+            theme_ui.current_tab = 0;
+    }
     
+    // Keep the requested fixture tab stable while Dear ImGui walks every tab
+    // header below.  Mutating `current_tab` from the first visible header used
+    // to erase the requested Accessibility/Localization selection before its
+    // later header could receive SetSelected, producing misleading evidence.
+    const int requested_fixture_tab = st.fixture_mode ? theme_ui.current_tab : -1;
+    const auto fixture_tab_flags = [requested_fixture_tab](int tab) {
+        return requested_fixture_tab == tab
+            ? ImGuiTabItemFlags_SetSelected
+            : ImGuiTabItemFlags_None;
+    };
+
     page_title("Theme & Accessibility", "Customize the appearance and accessibility of your launcher");
     
     // Theme tabs
     if (ImGui::BeginTabBar("##theme_tabs")) {
     
-    if (ImGui::BeginTabItem("Themes")) {
-        theme_ui.current_tab = 0;
+    if (ImGui::BeginTabItem("Themes", nullptr,
+                            st.fixture_mode ? fixture_tab_flags(0)
+                                            : ImGuiTabItemFlags_None)) {
+        if (!st.fixture_mode) theme_ui.current_tab = 0;
         ImGui::EndTabItem();
     }
     
-    if (ImGui::BeginTabItem("Colors")) {
-        theme_ui.current_tab = 1;
+    if (ImGui::BeginTabItem("Colors", nullptr,
+                            st.fixture_mode ? fixture_tab_flags(1)
+                                            : ImGuiTabItemFlags_None)) {
+        if (!st.fixture_mode) theme_ui.current_tab = 1;
         ImGui::EndTabItem();
     }
     
-    if (ImGui::BeginTabItem("Fonts")) {
-        theme_ui.current_tab = 2;
+    if (ImGui::BeginTabItem("Fonts", nullptr,
+                            st.fixture_mode ? fixture_tab_flags(2)
+                                            : ImGuiTabItemFlags_None)) {
+        if (!st.fixture_mode) theme_ui.current_tab = 2;
         ImGui::EndTabItem();
     }
     
-    if (ImGui::BeginTabItem("Accessibility")) {
-        theme_ui.current_tab = 3;
+    if (ImGui::BeginTabItem("Accessibility", nullptr,
+                            st.fixture_mode ? fixture_tab_flags(3)
+                                            : ImGuiTabItemFlags_None)) {
+        if (!st.fixture_mode) theme_ui.current_tab = 3;
         ImGui::EndTabItem();
     }
     
-    if (ImGui::BeginTabItem("Localization")) {
-        theme_ui.current_tab = 4;
+    if (ImGui::BeginTabItem("Localization", nullptr,
+                            st.fixture_mode ? fixture_tab_flags(4)
+                                            : ImGuiTabItemFlags_None)) {
+        if (!st.fixture_mode) theme_ui.current_tab = 4;
         ImGui::EndTabItem();
     }
     
@@ -739,7 +861,7 @@ void draw_theme_page(UiState& st) {
     ImGui::Spacing();
     
     // Draw current tab
-    switch (theme_ui.current_tab) {
+    switch (st.fixture_mode ? requested_fixture_tab : theme_ui.current_tab) {
         case 0:
         default:
             draw_theme_themes(st);
@@ -760,15 +882,83 @@ void draw_theme_page(UiState& st) {
 }
 
 void draw_theme_selector_inline(UiState& st, config::Config& c) {
-    const char* theme_ids[] = {"default_dark", "default_light", "midnight", "solarized_dark", "dracula"};
-    const char* theme_items = "Default Dark\0Default Light\0Midnight\0Solarized Dark\0Dracula\0";
-    int theme_index = 0;
-    for (int i = 0; i < 5; ++i) {
-        if (c.theme == theme_ids[i]) theme_index = i;
+    // Keep this compact control subject to the same entitlement policy as the
+    // full Themes page.  It is used in more than one settings surface, so an
+    // unrestricted Combo here would otherwise provide a second path around
+    // the Amalgam+ selection gate.
+    const bool has_plus = aml::entitlements::EntitlementManager::instance().is_plus();
+    const ThemePreset* current = &kAvailableThemes.front();
+    for (const auto& theme : kAvailableThemes) {
+        if (c.theme == theme.id) {
+            current = &theme;
+            break;
+        }
     }
-    if (ImGui::Combo("##settings_theme", &theme_index, theme_items, 5)) {
-        c.theme = theme_ids[theme_index];
-        st.settings_dirty = true;
+
+    std::string preview = current->name;
+    if (current->premium) preview += "  (Amalgam+)";
+
+    const ImVec2 combo_min = ImGui::GetCursorScreenPos();
+    if (st.fixture_mode && st.fixture_theme_selector_open) {
+        // Keep the inert evidence route open for the full capture window so
+        // the popup's compact geometry is visible without a synthetic click.
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    }
+    if (ImGui::BeginCombo("##settings_theme", preview.c_str())) {
+        for (const auto& theme : kAvailableThemes) {
+            const bool locked = theme.premium && !has_plus;
+            const bool selected = c.theme == theme.id;
+            std::string label = theme.name;
+            if (theme.premium) label += "  (Amalgam+)";
+
+            if (locked) ImGui::BeginDisabled();
+            if (ImGui::Selectable(label.c_str(), selected) && !locked && !st.fixture_mode) {
+                c.theme = theme.id;
+                apply_configured_theme(c);
+                st.settings_dirty = true;
+            }
+            if (locked) ImGui::EndDisabled();
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    if (st.fixture_mode && st.fixture_theme_selector_open) {
+        // Dear ImGui only opens a combo in response to an item activation. A
+        // screenshot runner has no pointer activation, so present the same
+        // inert option surface as a tooltip-style popup at the combo's exact
+        // location. This keeps evidence deterministic while preserving the
+        // real control's labels, premium lock states, and spacing.
+        ImGui::SetNextWindowPos(combo_min + ImVec2(0.0f, ui_px(30.0f)), ImGuiCond_Always);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(ui_px(210.0f), 0.0f),
+                                            ImVec2(ui_px(310.0f), ui_px(260.0f)));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_px(8.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui_px(10.0f), ui_px(8.0f)));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, k.surface2);
+        ImGui::PushStyleColor(ImGuiCol_Border, k.border);
+        ImGui::Begin("##fixture_theme_picker", nullptr,
+                     ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::TextColored(k.muted, "Theme options");
+        ImGui::Separator();
+        for (const auto& theme : kAvailableThemes) {
+            const bool locked = theme.premium && !has_plus;
+            const bool selected = c.theme == theme.id;
+            if (locked) ImGui::BeginDisabled();
+            ImGui::TextColored(selected ? k.brand_hov : k.text, "%s%s",
+                              theme.name.c_str(), theme.premium ? "  (Amalgam+)" : "");
+            if (locked) ImGui::EndDisabled();
+        }
+        ImGui::End();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
+    }
+
+    if (!has_plus) {
+        ImGui::PushStyleColor(ImGuiCol_Text, k.muted);
+        ImGui::TextWrapped("Amalgam+ unlocks Midnight, Solarized Dark, and Dracula.");
+        ImGui::PopStyleColor();
     }
 }
 

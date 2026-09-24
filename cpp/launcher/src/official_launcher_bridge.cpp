@@ -2,6 +2,7 @@
 
 #include "extract.h"
 #include "json.h"
+#include "maven_artifact.h"
 #include "net.h"
 
 #include <windows.h>
@@ -389,18 +390,17 @@ bool install_installer_loader(const std::wstring& java_exe, const std::wstring& 
     net::mkdirs(installer_dir);
     const std::wstring installer_path = installer_dir + L"\\" + net::to_wide(installer_name);
 
-    if (!net::file_exists(installer_path) || net::file_size(installer_path) == 0) {
-        std::string base_url;
-        if (loader == "forge") {
-            base_url = "https://maven.minecraftforge.net/" + maven_path;
-        } else {
-            base_url = "https://maven.neoforged.net/releases/" + maven_path;
-        }
-        std::string dl_err;
-        if (!net::download(net::to_wide(base_url), installer_path, nullptr, &dl_err)) {
-            if (err) *err = "failed to download " + loader + " installer: " + dl_err;
-            return false;
-        }
+    std::string base_url;
+    if (loader == "forge") {
+        base_url = "https://maven.minecraftforge.net/" + maven_path;
+    } else {
+        base_url = "https://maven.neoforged.net/releases/" + maven_path;
+    }
+    std::string dl_err;
+    if (!maven_artifact::download_verified(net::to_wide(base_url), installer_path, nullptr,
+                                           &dl_err)) {
+        if (err) *err = "failed to verify or download " + loader + " installer: " + dl_err;
+        return false;
     }
 
     if (progress) progress(0.4f, "Running " + loader + " installer");

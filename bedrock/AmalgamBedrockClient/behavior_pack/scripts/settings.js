@@ -1,23 +1,22 @@
-import { getState, updateSettings } from "./util/state.js";
+import { DEFAULT_SETTINGS, getPlayerSettings, replacePlayerSettings, updatePlayerSettings } from "./util/state.js";
 import { loadSettings, saveSettings, resetSettings } from "./storage.js";
 import { info } from "./util/logger.js";
 
-export function loadClientSettings() {
-  updateSettings(loadSettings(getState().settings));
+export function loadClientSettings(player) {
+  replacePlayerSettings(player, loadSettings(player, getPlayerSettings(player)));
+  return getPlayerSettings(player);
 }
 
-export function setSetting(key, value) {
-  const allowed = new Set(["enabled", "hudEnabled", "notificationsEnabled", "hudPreset", "hudScale", "hudOpacity", "language"]);
+export function setSetting(player, key, value) {
+  const allowed = new Set(["enabled", "hudEnabled", "notificationsEnabled", "language"]);
   if (!allowed.has(key)) return false;
-  updateSettings({ [key]: value });
-  saveSettings(getState().settings);
-  info("settings", `${key} updated`);
+  updatePlayerSettings(player, { [key]: value });
+  saveSettings(player, getPlayerSettings(player));
+  info("settings", `${key} updated for ${player?.name ?? "player"}`);
   return true;
 }
 
-export function resetClientSettings() {
-  resetSettings();
-  const defaults = { enabled: true, hudEnabled: true, notificationsEnabled: true, hudPreset: "top_left", hudScale: 1, hudOpacity: 0.92, language: "en_us" };
-  updateSettings(defaults);
-  saveSettings(getState().settings);
+export function resetClientSettings(player) {
+  resetSettings(player);
+  replacePlayerSettings(player, DEFAULT_SETTINGS);
 }

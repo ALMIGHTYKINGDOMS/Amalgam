@@ -6,7 +6,7 @@ endif()
 
 file(REMOVE_RECURSE "${AMALGAM_WORK}")
 file(MAKE_DIRECTORY "${AMALGAM_WORK}/src" "${AMALGAM_WORK}/classes"
-                    "${AMALGAM_WORK}/probe")
+                    "${AMALGAM_WORK}/probe/libraries/net/minecraftforge/forge/1.20.1-47.4.23")
 file(WRITE "${AMALGAM_WORK}/src/EchoServer.java" [=[
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -45,6 +45,11 @@ if(NOT jar_result EQUAL 0)
 endif()
 file(WRITE "${AMALGAM_WORK}/probe/server.properties"
      "server-name=probe\nserver-port=25565\nmax-players=1\n")
+# A current Forge server starts Java through a response file. Keep this under
+# AMALGAM_WORK (which is inside "Default Project") so the test proves that the
+# @-prefixed path reaches Java as one argument rather than splitting at spaces.
+file(WRITE "${AMALGAM_WORK}/probe/libraries/net/minecraftforge/forge/1.20.1-47.4.23/win_args.txt"
+     "-cp\nserver.jar\nEchoServer\n")
 
 execute_process(
     COMMAND "${AMALGAM_LAUNCHER}" --server-transport-probe

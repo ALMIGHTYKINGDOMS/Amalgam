@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,29 @@ struct ContentEntry {
     std::string sha1;
 };
 
+// Captures the identity attributes used by UI confirmation flows.  A caller
+// can take this snapshot when the user chooses a file, then require it to
+// still match immediately before a recoverable move or state change.  It is
+// intentionally profile-qualified: arbitrary filesystem paths are never a
+// valid substitute for managed profile content.
+struct ContentFileSnapshot {
+    std::wstring path;
+    ContentType type = ContentType::Other;
+    uint64_t size = 0;
+    std::filesystem::file_time_type last_write_time{};
+};
+
+// A confirmation or background request captures this before it starts.  The
+// profile actions below re-check it immediately before they mutate managed
+// files, so a profile that was replaced, moved, or edited while a dialog was
+// open cannot silently receive the result intended for an older selection.
+struct ProfileIdentitySnapshot {
+    std::wstring directory;
+    std::string id;
+    uint64_t metadata_size = 0;
+    std::filesystem::file_time_type metadata_last_write_time{};
+};
+
 struct BackupEntry {
     std::wstring path;
     std::string name;
@@ -59,12 +83,25 @@ bool duplicate(const Instance& source, const std::wstring& instances_dir, const 
                Instance& out, std::string* err = nullptr);
 bool save(const Instance& instance, std::string* err = nullptr);
 bool load(const std::wstring& directory, Instance& out, std::string* err = nullptr);
+bool capture_profile_identity(const Instance& instance, ProfileIdentitySnapshot& out,
+                              std::string* err = nullptr);
+bool profile_identity_matches(const Instance& instance, const ProfileIdentitySnapshot& snapshot,
+                              std::string* err = nullptr);
 // Removes a profile from the active library by moving its complete directory
 // into a sibling recovery folder. It is intentionally recoverable rather than
 // a permanent recursive delete.
 bool remove(const Instance& instance, std::string* err = nullptr);
 std::vector<ContentEntry> list_content(const Instance& instance, std::string* err = nullptr);
 bool set_content_enabled(const ContentEntry& entry, bool enabled, std::string* err = nullptr);
+// Profile-qualified form for new UI flows.  It rejects content outside the
+// selected profile (including redirected content roots) before renaming it.
+bool set_content_enabled(const Instance& instance, const ContentEntry& entry, bool enabled,
+                         std::string* err = nullptr);
+bool capture_content_file_snapshot(const Instance& instance, const ContentEntry& entry,
+                                   ContentFileSnapshot& out, std::string* err = nullptr);
+bool content_file_matches_snapshot(const Instance& instance, const ContentEntry& entry,
+                                   const ContentFileSnapshot& snapshot,
+                                   std::string* err = nullptr);
 // Backward-compatible remove action: it now routes through profile recovery
 // instead of permanently deleting content.
 bool remove_content(const Instance& instance, const ContentEntry& entry, std::string* err = nullptr);

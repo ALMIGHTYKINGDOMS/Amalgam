@@ -43,24 +43,9 @@ bool test_dev_provider_plans() {
     auto* provider = cloud_provider();
     std::vector<CloudPlan> plans;
     ProviderError err;
-    assert(provider->get_plans(plans, &err));
-    assert(plans.size() == 3);
-
-    // Structure: id, name, pricing, resources, features
-    for (const auto& p : plans) {
-        assert(!p.id.empty());
-        assert(!p.name.empty());
-        assert(p.ram_mb > 0);
-        assert(p.storage_mb > 0);
-        assert(p.price_monthly >= 0.0);
-        assert(!p.features.empty());
-    }
-
-    // Exactly one plan is marked recommended.
-    int recommended = 0;
-    for (const auto& p : plans)
-        if (p.recommended) ++recommended;
-    assert(recommended == 1);
+    assert(!provider->get_plans(plans, &err));
+    assert(plans.empty());
+    assert(err.code == "WEBSITE_MANAGED");
     return true;
 }
 
@@ -87,9 +72,10 @@ bool test_dev_provider_software() {
 bool test_dev_provider_no_fake_servers() {
     auto* provider = cloud_provider();
     std::vector<CloudServer> servers;
-    assert(provider->list_servers(servers, nullptr));
-    // Dev mode must NEVER fabricate servers.
+    ProviderError list_error;
+    assert(!provider->list_servers(servers, &list_error));
     assert(servers.empty());
+    assert(list_error.code == "WEBSITE_MANAGED");
 
     // Mutating operations must fail with a clear website-managed error.
     std::string server_id;
@@ -116,6 +102,16 @@ bool test_dev_provider_backups_empty() {
     return true;
 }
 
+bool test_dev_provider_invoices_are_website_managed() {
+    auto* provider = cloud_provider();
+    std::vector<Invoice> invoices;
+    ProviderError err;
+    assert(!provider->get_invoices("fake-id", invoices, &err));
+    assert(invoices.empty());
+    assert(err.code == "WEBSITE_MANAGED");
+    return true;
+}
+
 bool test_website_links_are_canonical() {
     aml::online::OnlineConfig config;
     config.website_url = "https://amalgam-mc.com";
@@ -133,6 +129,32 @@ bool test_website_links_are_canonical() {
     assert(config.page_url("plans") == "https://example.test/plans");
     config.website_url = "";
     assert(config.page_url("") == "https://amalgam-mc.com");
+    return true;
+}
+
+bool test_account_links_share_the_official_origin() {
+    aml::online::OnlineConfig config;
+    config.website_url = "https://amalgam-mc.com/";
+    assert(config.login_url() == "https://amalgam-mc.com/login?return=launcher");
+    assert(config.register_url() == "https://amalgam-mc.com/register?return=launcher");
+    assert(config.password_reset_url() ==
+           "https://amalgam-mc.com/forgot-password?return=launcher");
+    assert(config.account_url() == "https://amalgam-mc.com/account");
+
+    // A configured origin must not move auth links to a second host or leave
+    // duplicate separators that break the browser route.
+    config.website_url = "https://accounts.example.test///";
+    assert(config.login_url() ==
+           "https://accounts.example.test/login?return=launcher");
+    assert(config.register_url() ==
+           "https://accounts.example.test/register?return=launcher");
+    return true;
+}
+
+bool test_network_identity_is_canonical() {
+    const aml::online::OnlineConfig config;
+    assert(config.network_name == "Amalgam Network");
+    assert(config.network_address == "play.amalgam-network.com");
     return true;
 }
 
@@ -172,7 +194,10 @@ int main() {
         !test_dev_provider_software() ||
         !test_dev_provider_no_fake_servers() ||
         !test_dev_provider_backups_empty() ||
+        !test_dev_provider_invoices_are_website_managed() ||
         !test_website_links_are_canonical() ||
+        !test_account_links_share_the_official_origin() ||
+        !test_network_identity_is_canonical() ||
         !test_entitlements_model() ||
         !test_entitlements_turn_math()) {
         return 1;

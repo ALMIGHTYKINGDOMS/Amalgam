@@ -1,18 +1,18 @@
-import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
-import { getState } from "./util/state.js";
+import { ActionFormData } from "@minecraft/server-ui";
+import { getPlayerSettings, getState, isPlayerMenuOpen, setPlayerMenuOpen } from "./util/state.js";
 import { setSetting, resetClientSettings } from "./settings.js";
 import { diagnosticsText } from "./diagnostics.js";
 import { notify } from "./notifications.js";
 import { connectionCapabilities } from "./connection.js";
 
 export async function openMenu(player) {
-  if (!player) return;
+  if (!player || isPlayerMenuOpen(player)) return;
   const state = getState();
-  state.menuOpen = true;
+  setPlayerMenuOpen(player, true);
   try {
     const result = await new ActionFormData()
       .title("Amalgam Bedrock Client")
-      .body(`Beta ${state.version}\n${connectionCapabilities().message}\nNo online data is fabricated.`)
+      .body(`${state.channel === "stable" ? "Stable" : `${state.channel} channel`} ${state.version}\n${connectionCapabilities(player).message}\nNo online data is fabricated.`)
       .button("HUD", "textures/ui/amalgam_logo")
       .button("Settings", "textures/ui/amalgam_logo")
       .button("Diagnostics", "textures/ui/amalgam_logo")
@@ -31,44 +31,38 @@ export async function openMenu(player) {
       notify(player, result.selection === 3 ? "Social" : "Servers", "Online details are managed by the launcher.");
       return;
     }
-    notify(player, "Amalgam Bedrock Client", "Supported Bedrock companion — beta.");
+    notify(player, "Amalgam Bedrock Client", `Supported Bedrock companion — ${state.channel} ${state.version}.`);
   } finally {
-    state.menuOpen = false;
+    setPlayerMenuOpen(player, false);
   }
 }
 
 async function openHudSettings(player) {
-  const s = getState().settings;
-  const result = await new ModalFormData()
-    .title("HUD")
-    .toggle("Show HUD", s.hudEnabled)
-    .dropdown("Preset", ["Top left", "Top right", "Bottom left", "Bottom right", "Center top"], ["top_left", "top_right", "bottom_left", "bottom_right", "center_top"].indexOf(s.hudPreset))
-    .slider("Scale", 0.75, 1.5, 0.05, s.hudScale)
-    .slider("Opacity", 0.2, 1, 0.05, s.hudOpacity)
+  const settings = getPlayerSettings(player);
+  const result = await new ActionFormData()
+    .title("Action-bar HUD")
+    .body("Amalgam uses Minecraft's action bar. Minecraft controls its position, size, and opacity, so this pack can only show or hide the HUD.")
+    .button(`HUD: ${settings.hudEnabled ? "On" : "Off"}`)
     .show(player);
-  if (result.canceled || !result.formValues) return;
-  const presets = ["top_left", "top_right", "bottom_left", "bottom_right", "center_top"];
-  setSetting("hudEnabled", Boolean(result.formValues[0]));
-  setSetting("hudPreset", presets[Number(result.formValues[1])] || "top_left");
-  setSetting("hudScale", Number(result.formValues[2]));
-  setSetting("hudOpacity", Number(result.formValues[3]));
-  notify(player, "HUD updated", "Your supported HUD settings were saved.");
+  if (result.canceled || result.selection !== 0) return;
+  setSetting(player, "hudEnabled", !settings.hudEnabled);
+  notify(player, "HUD updated", "Only the action-bar HUD visibility is configurable in Bedrock.");
 }
 
 async function openSettings(player) {
-  const s = getState().settings;
+  const settings = getPlayerSettings(player);
   const result = await new ActionFormData()
     .title("Settings")
-    .body("Only local, supported settings are changed in-game.")
-    .button(`HUD: ${s.hudEnabled ? "On" : "Off"}`)
-    .button(`Notifications: ${s.notificationsEnabled ? "On" : "Off"}`)
-    .button(`Client: ${s.enabled ? "Enabled" : "Disabled"}`)
-    .button("Reset local settings")
+    .body("Only supported settings for your player are changed in-game. They are not shared with other players.")
+    .button(`HUD: ${settings.hudEnabled ? "On" : "Off"}`)
+    .button(`Notifications: ${settings.notificationsEnabled ? "On" : "Off"}`)
+    .button(`Client: ${settings.enabled ? "Enabled" : "Disabled"}`)
+    .button("Reset my settings")
     .show(player);
   if (result.canceled) return;
-  if (result.selection === 0) setSetting("hudEnabled", !s.hudEnabled);
-  if (result.selection === 1) setSetting("notificationsEnabled", !s.notificationsEnabled);
-  if (result.selection === 2) setSetting("enabled", !s.enabled);
-  if (result.selection === 3) resetClientSettings();
-  notify(player, "Settings saved", "Changes apply locally to this world.");
+  if (result.selection === 0) setSetting(player, "hudEnabled", !settings.hudEnabled);
+  if (result.selection === 1) setSetting(player, "notificationsEnabled", !settings.notificationsEnabled);
+  if (result.selection === 2) setSetting(player, "enabled", !settings.enabled);
+  if (result.selection === 3) resetClientSettings(player);
+  notify(player, "Settings saved", "Changes apply only to your player in this Bedrock world.");
 }
