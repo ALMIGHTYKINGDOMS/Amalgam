@@ -1,6 +1,6 @@
 # Amalgam
 
-A hybrid **utility client + unified launcher** for Minecraft: Java Edition, covering **1.12 → latest**, plus Quilt and Bedrock (UWP) — all from ONE launcher (no separate launchers per edition/loader).
+A hybrid **utility client + unified launcher** for Minecraft: Java Edition, covering **1.12 → latest**, plus Quilt — all from ONE launcher (no separate launchers per edition/loader). Bedrock packaging is present for a future release, but Bedrock runtime actions are intentionally marked **Coming Soon** in 1.0.0.
 
 ![Amalgam unified launcher and native client](docs/branding/amalgam-banner.png)
 
@@ -11,7 +11,7 @@ It combines:
 - **Java bridge mods** (Fabric, Quilt, NeoForge, and Forge 1.12.2/1.18.2/1.19.2/1.20.1) that talk to the native side and apply actions using **only existing vanilla packets**;
 - a **mod browser** (Modrinth + CurseForge) and an **AI modpack assistant** (chat, vision, image generation) with multi-provider failover.
 - per-instance **performance profiles** (Auto, Low-end, Balanced, Shaders, Heavy modpack) with adaptive heap/JVM tuning, reversible game-option presets, and loader-aware optimization-mod recommendations.
-- local **content upload/import** for Java `.jar` mods, resource/shader/datapack ZIPs, and Bedrock `.mcpack`/`.mcaddon` files from CurseForge or any other platform.
+- local **content upload/import** for Java `.jar` mods, resource/shader/datapack ZIPs, and validated release assets from CurseForge or any other platform. Bedrock `.mcpack`/`.mcaddon` runtime import is Coming Soon.
 
 > Design rule (fixed): no custom packets. Every action is expressed through packets vanilla already uses, and all actions are applied at the **start of the game tick**. See `docs/packet-whitelist.md`.
 
@@ -23,7 +23,7 @@ It combines:
 | Quilt | ≥1.14.4 via quilt-loader (beta) | reuses the Fabric bridge jar + plain `fabric-api.jar` |
 | NeoForge | 1.21.1 / 1.21.4 / 1.21.5 / 1.21.6 / 1.21.8 / 1.21.11 | `java-neoforge/` (Mojang) |
 | Forge | 1.12.2 / 1.18.2 / 1.19.2 / 1.20.1 bridge | `java-forge-1.12.2/`, `java-forge-legacy/`, `java-forge/` |
-| Bedrock | UWP | detect / launch / install addons |
+| Bedrock | Windows package prepared | Coming Soon — static package validation only |
 
 ## Layout
 
@@ -62,7 +62,7 @@ cmake --build cpp\build
 ctest --test-dir cpp\build --output-on-failure
 ```
 
-Outputs: `cpp/build/amalgam_launcher.exe`, `cpp/build/amalgam.dll`. All 39
+Outputs: `cpp/build/amalgam_launcher.exe`, `cpp/build/amalgam.dll`. All 45
 CTest checks must pass. Native release builds enable strict warnings, exception
 handling, SDL checks, ASLR, DEP, and Control Flow Guard by default; set
 `-DAMALGAM_STRICT_HARDENING=OFF` only for a diagnosed local toolchain issue.
@@ -108,7 +108,7 @@ copy java-forge\build\libs\amalgam-forge-*.jar cpp\build\bridges\
 
 `launcher.json` next to the exe holds instance paths, loader, an optional **Modrinth token**, **CurseForge API key**, and AI settings. `--mods-search` returns results from both configured providers; `--mods-install` defaults to Modrinth for backwards compatibility, or accepts `curseforge` explicitly after the slug. Multi-provider AI failover uses the `ai_providers` array (index 0 = main, rest = automatic backups). Keys are stored locally with Windows DPAPI protection, never committed (`.gitignore`), and legacy plaintext settings migrate on their next save. Microsoft account login is started with `--login`; account tokens are DPAPI-protected under `%LOCALAPPDATA%\Amalgam`, not stored in `launcher.json`. See `docs/security.md`.
 
-Java Edition sign-in is password-free: the launcher never collects a Microsoft password. Direct Amalgam device-code sign-in is held until the publisher's Minecraft application approval is active; until then, `--login` provides the official Minecraft Launcher fallback. Bedrock uses the Microsoft account and entitlement managed by the installed Windows Bedrock app itself. Amalgam detects, launches, and imports addons for that app, but does not bypass its Microsoft/Store licensing.
+Java Edition sign-in is password-free: the launcher never collects a Microsoft password. Direct Amalgam device-code sign-in is held until the publisher's Minecraft application approval is active; until then, `--login` provides the official Minecraft Launcher fallback. Bedrock is currently a Coming Soon surface: the static package is validated and shipped as release input, while detection, launch, and add-on import remain disabled until the supported runtime release. Amalgam does not bypass Microsoft/Store licensing.
 
 ## Testing
 

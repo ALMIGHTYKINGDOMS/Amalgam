@@ -142,12 +142,18 @@ jobs:
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path -LiteralPath $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
           if (-not (Test-Path -LiteralPath $iscc)) { throw 'ISCC.exe was not installed' }
-          # Beta release: the installer shows "Amalgam V3 Beta" and carries
-          # numeric 3.0.0.x version resources (Windows requires 4 numeric
-          # parts); the launcher itself reports 3.0.0-beta.2.
-          $version = "3.0.0.1"
+          # Keep the Windows installer resource version aligned with the
+          # launcher release. Windows PE resources require four numeric parts,
+          # so derive a padded file-resource version while preserving the
+          # human-facing semver in the installer name and AppVersion.
+          $version = "1.0.0"
           if ($env:AMALGAM_INSTALLER_VERSION) { $version = $env:AMALGAM_INSTALLER_VERSION }
-          & $iscc "/DSourceDir=$PWD\dist\amalgam-$env:GITHUB_SHA" "/DMyAppVersion=$version" installer\AmalgamLauncher.iss
+          $numeric = [regex]::Match($version, '^\d+(?:\.\d+){0,3}').Value
+          if (-not $numeric) { throw "Installer version must begin with a numeric semver: $version" }
+          $parts = @($numeric -split '\.')
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $fileVersion = $parts[0..3] -join '.'
+          & $iscc "/DSourceDir=$PWD\dist\amalgam-$env:GITHUB_SHA" "/DMyAppVersion=$version" "/DMyFileVersion=$fileVersion" installer\AmalgamLauncher.iss
       - name: Verify unsigned release state
         shell: pwsh
         run: |

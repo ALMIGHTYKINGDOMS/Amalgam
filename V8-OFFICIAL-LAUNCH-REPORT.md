@@ -1,5 +1,12 @@
 # AMALGAM 1.0.0 — OFFICIAL LAUNCH REPORT
 
+> **Historical record — superseded 2026-09-24.** This V8 report preserves the
+> earlier launch-pass evidence. Use `V9-OPERATIONAL-READINESS-REPORT.md` and
+> the current release-candidate audit for the authoritative status. In
+> particular, Bedrock runtime actions are now intentionally **Coming Soon**,
+> and public distribution remains gated on trusted signing, Microsoft/Xbox
+> approval, and owner-controlled publishing.
+
 **Version:** 1.0.0  
 **Channel:** stable  
 **Date:** August 23, 2026  

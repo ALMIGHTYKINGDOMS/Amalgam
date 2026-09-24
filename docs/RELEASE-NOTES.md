@@ -2,7 +2,7 @@
 
 ## What's New
 
-Amalgam is a premium Minecraft launcher that unifies Java Edition, Bedrock add-on handling, profiles, content discovery, local servers, and Essentials multiplayer sessions in a single desktop application with built-in local AI.
+Amalgam is a premium Minecraft launcher that unifies Java Edition, profiles, content discovery, local servers, and Essentials multiplayer sessions in a single desktop application with built-in local AI. Bedrock packaging is prepared for a future release and is visibly marked **Coming Soon** in 1.0.0.
 
 ### AI Features (New in 1.0.0)
 
@@ -18,12 +18,12 @@ Amalgam is a premium Minecraft launcher that unifies Java Edition, Bedrock add-o
 
 ### Core Features
 
-- **Unified Launcher**: Java Edition, Bedrock add-on handling, profiles, content, local servers, and Essentials sessions
+- **Unified Launcher**: Java Edition, profiles, content, local servers, and Essentials sessions; Bedrock is a clearly gated Coming Soon surface
 - **Profile Management**: Create, import, duplicate, rename, and manage Minecraft profiles with version and loader selection
 - **Content Discovery**: Browse and install mods, modpacks, shaders, and resource packs from Modrinth and CurseForge
 - **Download Manager**: Track download progress, speed, and status with pause/resume/cancel support
 - **Local Servers**: Create and manage local Minecraft servers with console, player management, and file access
-- **Bedrock Support**: Minecraft for Windows detection, add-on import, and Amalgam Bedrock Client integration
+- **Bedrock Coming Soon**: static package and manifest validation are complete; Windows detection, launch, add-on import, and client integration are held for the supported runtime release
 - **Java Runtime Management**: Managed Java detection, download, and selection per profile or server
 - **Settings & Diagnostics**: Comprehensive settings with runtime health checks for all systems
 
@@ -37,7 +37,7 @@ Amalgam is a premium Minecraft launcher that unifies Java Edition, Bedrock add-o
 ### Supported Platforms
 
 - **Java Edition**: Vanilla, Fabric, Forge, NeoForge (Quilt experimental)
-- **Bedrock**: Minecraft for Windows with add-on support
+- **Bedrock**: Coming Soon (static package validation only in 1.0.0)
 - **Essentials**: Friends, invites, sessions, messages, parties, notifications
 - **Local Servers**: Vanilla, Paper, Spigot, Purpur, Fabric, Forge, NeoForge
 
@@ -61,7 +61,7 @@ Amalgam is a premium Minecraft launcher that unifies Java Edition, Bedrock add-o
 ### Important Notes
 
 - Microsoft account authentication for Java Edition requires Minecraft ownership
-- Bedrock functionality requires Minecraft for Windows installed
+- Bedrock runtime functionality is not enabled in 1.0.0; the supported Windows integration will require Minecraft for Windows when that release is published
 - Essentials multiplayer requires an Amalgam account
 - Cloud hosting remains gated and is not included in this release
 - AI models download automatically during installation
@@ -70,7 +70,7 @@ Amalgam is a premium Minecraft launcher that unifies Java Edition, Bedrock add-o
 ### Known Issues
 
 - Quilt loader support is experimental
-- Some Bedrock features require Minecraft for Windows
+- Bedrock runtime actions are intentionally disabled until the supported integration release
 - TURN relay fallback may have latency on slow connections
 - AI art generation requires first-time model download (~5 GB)
 

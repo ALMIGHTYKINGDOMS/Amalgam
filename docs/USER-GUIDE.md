@@ -4,8 +4,9 @@
 
 - Use a Windows 10 or newer x64 PC.
 - Own the edition of Minecraft you intend to play.
-- Keep the official Minecraft Launcher installed for Java Edition and the
-  official Windows Bedrock app installed for Bedrock Edition.
+- Keep the official Minecraft Launcher installed for Java Edition. Bedrock is
+  currently labelled **Coming Soon**; its runtime actions are intentionally
+  disabled in this release while the supported Windows integration is gated.
 - Back up worlds you care about before changing or importing a modpack.
 
 ## First launch
@@ -30,9 +31,11 @@ Launcher for account sign-in and ownership checks.
 
 - Java profiles use a supported Fabric, Quilt, Forge, NeoForge, or Vanilla
   target selected in the profile wizard.
-- Bedrock support detects and opens the official Windows Bedrock app, and can
-  import supported add-on packages. Bedrock ownership and online services stay
-  with the official Microsoft/Store app.
+- Bedrock is a **Coming Soon** surface in 1.0.0. The release package includes
+  statically validated Bedrock assets, but detection, launching, and add-on
+  import are intentionally disabled until the supported runtime release.
+  Bedrock ownership and online services will remain with the official
+  Microsoft/Store app.
 - Creator content remains subject to the creator's license and the applicable
   Modrinth or CurseForge terms. Review a project's information and version
   before installing it.

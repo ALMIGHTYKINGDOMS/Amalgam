@@ -203,3 +203,12 @@ Current hard gates: the EXE-only updater transaction; unbuilt server/diagnostics
 - [x] Recaptured and manually inspected the affected Bedrock Coming Soon and Microsoft approval-pending routes at both host-valid responsive tiers; 8/8 captures passed with no nested/horizontal-scroll or modal-spacing defect.
 - [x] Completed a read-only live Supabase audit and classified advisor findings as intentional/non-blocking or owner-configured; no unsafe live schema mutation was made during this final pass.
 - [x] Final repository-resolvable polish is complete for this audit. The remaining checklist is external certification/owner work only: close the running launcher and bind the canonical hash, Microsoft/Xbox approval, trusted signing/timestamping, update hosting/signature, live provider verification, Supabase leaked-password protection, and clean-machine/real Java handoff.
+
+## 2026-09-24 — Authoritative final candidate after truth-alignment pass
+
+- [x] Remove beta-era CI installer metadata and align all production-facing repository documentation with the 1.0.0 Bedrock Coming Soon boundary.
+- [x] Rebuild `cpp/build-release-final` and rerun the full native suite: 45/45 passed. Clean native hashes: launcher `5207711570D3AC71107DE04D4C8834CEE0245C4CCEED1589E7980C0E11EFD60D`; DLL `787B3F9E58BD4C60308801F380DE69DCF05EBFA68FE54F03045CBD19DB35497B`.
+- [x] Produce the immutable ZIP candidate `artifacts/release-candidate-2026-09-24/rc-20260924T044334Z/amalgam-1.0.0.zip` with hash `18AF3E98E0A456C833DF845D5FC91E67F4EB5A362B2622890514432F026AF911` and size `113006167` bytes.
+- [x] Pass exact ZIP/runtime/package/installer-input/smoke/component/secret gates and regenerate the locally signed update manifest (`DE58572EB7CCF2394951822C9F28961EB2D4D596E56456D83F467837E8BC7075`).
+- [x] Preserve the prior installer sandbox evidence without misbinding it to the new ZIP. The corrected workflow is ready to compile the matching installer on a host with Inno Setup available; this environment cannot install the cached compiler without elevation.
+- [ ] Do not mark the public launch complete until the owner supplies trusted signing, Microsoft/Xbox approval, hosted feed/website publication, Supabase leaked-password protection, and clean-machine/real Java certification. Do not run Bedrock runtime tests.
