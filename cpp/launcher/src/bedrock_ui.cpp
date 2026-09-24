@@ -35,6 +35,85 @@ void draw_bedrock_addons_installed(UiState& st);
 void draw_bedrock_addons_discover(UiState& st);
 void draw_bedrock_addons_import(UiState& st);
 
+// Bedrock is intentionally held behind a single release gate while the
+// Microsoft Store/UWP integration and the supported content workflows finish
+// certification.  Keeping this decision in the UI route prevents a detected
+// installation from exposing controls that are not yet launch-ready.
+static void draw_bedrock_coming_soon(UiState& st) {
+    draw_page_emblem(st, "bedrock-emblem-ai.png");
+    page_title("Bedrock Edition", "A polished Bedrock experience is in development.");
+
+    card_begin("##bedrock_coming_soon", ImVec2(-1, 0));
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 content = ImGui::GetContentRegionAvail();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    // A real shipped emblem gives the state a clear visual anchor without
+    // suggesting that the inactive runtime controls below are available.
+    const float mark_size = ui_px(74.0f);
+    draw_local_image(st, st.exe_dir + L"\\branding\\ai\\bedrock-emblem-ai.png",
+                     origin + ImVec2(0.0f, ui_px(4.0f)),
+                     ImVec2(mark_size, mark_size), c32(k.surface2),
+                     ui_model::ImageFit::Contain);
+
+    const float text_x = mark_size + ui_px(20.0f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_x);
+    ImGui::PushFont(f_small);
+    ImGui::TextColored(k.brand_hov, "BEDROCK EDITION  ·  COMING SOON");
+    ImGui::PopFont();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_x);
+    ImGui::PushFont(f_title);
+    ImGui::TextUnformatted("We are finishing the Bedrock experience.");
+    ImGui::PopFont();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_x);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content.x - text_x);
+    ImGui::TextColored(k.muted,
+                       "Profiles, worlds, add-ons, and backups are being prepared for a safe, supported release. Bedrock runtime actions are disabled until that work is complete.");
+    ImGui::PopTextWrapPos();
+
+    ImGui::Dummy(ImVec2(0.0f, ui_px(22.0f)));
+    draw->AddLine(ImVec2(origin.x, ImGui::GetCursorScreenPos().y),
+                  ImVec2(origin.x + content.x, ImGui::GetCursorScreenPos().y),
+                  c32(ImVec4(k.border.x, k.border.y, k.border.z, 0.72f)), ui_px(1.0f));
+    ImGui::Dummy(ImVec2(0.0f, ui_px(16.0f)));
+
+    const char* capabilities[] = {"Profiles", "Worlds", "Add-ons & backups"};
+    const char* details[] = {"Isolated saves and settings", "Safe import and restore", "Curated content workflows"};
+    const float gap = ui_px(10.0f);
+    const float item_w = (content.x - gap * 2.0f) / 3.0f;
+    const ImVec2 capability_screen = ImGui::GetCursorScreenPos();
+    for (int i = 0; i < 3; ++i) {
+        const float item_x = static_cast<float>(i) * (item_w + gap);
+        const ImVec2 item = capability_screen + ImVec2(item_x, 0.0f);
+        draw->AddRectFilled(item, item + ImVec2(item_w, ui_px(70.0f)),
+                            c32(ImVec4(k.surface2.x, k.surface2.y, k.surface2.z, 0.74f)), ui_px(8.0f));
+        draw->AddRect(item, item + ImVec2(item_w, ui_px(70.0f)),
+                      c32(ImVec4(k.border.x, k.border.y, k.border.z, 0.82f)), ui_px(8.0f), 0, ui_px(1.0f));
+        ImGui::SetCursorScreenPos(item + ImVec2(ui_px(12.0f), ui_px(10.0f)));
+        ImGui::PushFont(f_bold);
+        ImGui::TextUnformatted(capabilities[i]);
+        ImGui::PopFont();
+        ImGui::SetCursorScreenPos(item + ImVec2(ui_px(12.0f), ui_px(36.0f)));
+        ImGui::TextColored(k.muted, "%s", details[i]);
+    }
+    ImGui::SetCursorScreenPos(capability_screen + ImVec2(0.0f, ui_px(70.0f)));
+
+    ImGui::Dummy(ImVec2(0.0f, ui_px(18.0f)));
+    ImGui::TextColored(k.muted, "Java Edition is ready now. Bedrock will appear here when it is ready for everyone.");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - ui_px(158.0f));
+    if (ghost_button("Browse Java Edition", ImVec2(ui_px(148.0f), ui_px(32.0f)))) {
+        navigate_to(st, aml::ui_model::java_edition_route().sidebar_item,
+                    aml::ui_model::java_edition_route().active_tab);
+    }
+    card_end();
+}
+
+static bool bedrock_release_gate_enabled() {
+    // Keep this as a named runtime gate so the inactive implementation stays
+    // available for later certification without exposing it accidentally.
+    return true;
+}
+
 struct BedrockUIState {
     int profile_tab = 0;
     std::string profile_filter;
@@ -2831,6 +2910,14 @@ static void seed_bedrock_destructive_fixture(UiState& st, BedrockUIState& state)
 }
 
 void draw_bedrock_tab(UiState& st) {
+    // Bedrock remains visible in the product navigation so users understand
+    // where it is headed, but every runtime/content action is intentionally
+    // gated until the edition is ready for a supported public release.
+    if (bedrock_release_gate_enabled()) {
+        draw_bedrock_coming_soon(st);
+        return;
+    }
+
     auto& bedrock_ui = get_bedrock_ui_state();
 
     hide_closed_bedrock_destructive_dialog(bedrock_ui);

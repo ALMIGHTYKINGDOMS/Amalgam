@@ -42,7 +42,7 @@ std::string friendly_oauth_error(const Json& response, const char* fallback) {
     const std::string code = response.get("error").as_str();
     const std::string description = response.get("error_description").as_str();
     if (code == "unauthorized_client" || description.find("AADSTS700016") != std::string::npos) {
-        return "Microsoft rejected this launcher registration. Its application ID must allow personal Microsoft accounts.";
+        return "Microsoft/Xbox has not approved the Amalgam sign-in app for Minecraft yet. The integration is already configured; after approval propagates, the next sign-in retry should work without a launcher update or account change.";
     }
     if (code == "invalid_client") {
         return "Microsoft could not validate this launcher registration.";

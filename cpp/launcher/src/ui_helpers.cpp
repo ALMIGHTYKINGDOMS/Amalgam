@@ -122,7 +122,7 @@ std::string humanize_error(const std::string& source) {
         lower.find("application with identifier") != std::string::npos ||
         lower.find("minecraft approval") != std::string::npos ||
         lower.find("app not approved") != std::string::npos) {
-        return "Minecraft has not approved this application yet. The app registration is ready; try again after Minecraft/Xbox approval is complete.";
+        return "Microsoft/Xbox has not approved the Amalgam sign-in app for Minecraft yet. The integration is already configured; after approval propagates, the next sign-in retry should work without a launcher update or account change.";
     }
     if (lower.find("http status 401") != std::string::npos ||
         lower.find("http status 403") != std::string::npos) {

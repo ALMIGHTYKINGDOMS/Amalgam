@@ -847,10 +847,10 @@ static void draw_fixture_microsoft_login_state(UiState& st) {
         draw_fixture_primary_action("Continue to Amalgam");
     } else if (fallback) {
         draw_wizard_feedback("##fixture_microsoft_fallback",
-                             "Direct sign-in is still waiting on Minecraft approval. Playing can continue through the official Minecraft Launcher.",
-                             true, "Microsoft sign-in needs attention");
+                             "Microsoft/Xbox app approval is pending. The Amalgam integration is already configured; direct sign-in should work on the next retry after approval propagates.",
+                             true, "Microsoft app approval pending");
         ImGui::Spacing();
-        draw_security_note("Choose Minecraft Launcher mode to hand a prepared profile to the official launcher, where you sign in with your own account.");
+        draw_security_note("No launcher update or account change is required after approval. Until then, choose Minecraft Launcher mode to hand a prepared profile to the official launcher, where you sign in with your own account.");
         ImGui::Spacing();
         draw_fixture_primary_action("Use Minecraft Launcher mode");
     } else if (error) {
@@ -1309,7 +1309,7 @@ void draw_microsoft_login_dialog(UiState& st) {
         if (ghost_button("Copy code", ImVec2(ui_px(120.0f), ui_px(38.0f))))
             ImGui::SetClipboardText(code.c_str());
         ImGui::Spacing();
-        draw_security_note("Waiting for confirmation from Microsoft. If Microsoft/Xbox reports that the app is pending approval, close this window and try again after approval is complete.");
+        draw_security_note("Waiting for confirmation from Microsoft. If Microsoft/Xbox reports that the app is pending approval, close this window and retry after approval propagates. The existing Amalgam integration is ready for that retry.");
     } else if (state == 2 && !account_username.empty()) {
         draw_wizard_feedback("##microsoft_connected", "Minecraft is connected and ready to use with your Amalgam profiles.", false);
         ImGui::Spacing();
@@ -1325,11 +1325,6 @@ void draw_microsoft_login_dialog(UiState& st) {
             close_login();
         }
     } else if (state == 3) {
-        draw_wizard_feedback("##microsoft_error",
-                             error.empty() ? "Microsoft sign-in could not be completed. Try again when you are ready."
-                                           : humanize_error(error),
-                             true, "Microsoft sign-in needs attention");
-        ImGui::Spacing();
         std::string lower_error = error;
         std::transform(lower_error.begin(), lower_error.end(), lower_error.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -1340,8 +1335,14 @@ void draw_microsoft_login_dialog(UiState& st) {
             lower_error.find("application with identifier") != std::string::npos ||
             lower_error.find("aadsts700016") != std::string::npos ||
             lower_error.find("app not approved") != std::string::npos;
+        draw_wizard_feedback("##microsoft_error",
+                             error.empty() ? "Microsoft sign-in could not be completed. Try again when you are ready."
+                                           : humanize_error(error),
+                             true, official_fallback ? "Microsoft app approval pending"
+                                                     : "Microsoft sign-in needs attention");
+        ImGui::Spacing();
         if (official_fallback) {
-            draw_security_note("Direct sign-in is still waiting on Minecraft approval, so this step can fail until it is granted. Playing does not: switch Play to the Minecraft Launcher mode and Amalgam hands it your prepared profile.");
+            draw_security_note("Microsoft/Xbox approval is the only remaining gate for direct sign-in. The app integration is already configured; once approval propagates, the next retry should work without a launcher update or account change. Playing does not depend on this: switch Play to Minecraft Launcher mode and Amalgam hands it your prepared profile.");
             ImGui::Spacing();
             if (primary_button("Use Minecraft Launcher mode", ImVec2(ui_px(238.0f), ui_px(38.0f)))) {
                 if (st.cfg) {
@@ -1359,6 +1360,11 @@ void draw_microsoft_login_dialog(UiState& st) {
                                 "Minecraft Launcher not found",
                                 "Install the official Minecraft Launcher, then press Play on a profile again.");
                 }
+            }
+            ImGui::SameLine();
+            if (ghost_button("Retry direct sign-in", ImVec2(ui_px(150.0f), ui_px(38.0f)))) {
+                close_login();
+                start_microsoft_login(st);
             }
             ImGui::SameLine();
             if (ghost_button("Close", ImVec2(ui_px(84.0f), ui_px(38.0f)))) close_login();
