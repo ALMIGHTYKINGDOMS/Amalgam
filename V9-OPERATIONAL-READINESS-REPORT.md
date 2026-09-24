@@ -148,6 +148,10 @@ ready to produce it on a build host with Inno Setup installed.
    account launch; the live advisor still reports it disabled.
 5. **Clean-machine Java handoff** — validate the signed installer and real Java
    profile handoff outside the development machine. Bedrock remains excluded.
+6. **Hosted build execution** — the GitHub Actions Windows job is ready but is
+   currently rejected before startup because the repository account has a
+   billing lock. Restore Actions billing or run the same workflow on a Windows
+   host with Inno Setup installed before publishing the matching installer.
 
 ---
 
