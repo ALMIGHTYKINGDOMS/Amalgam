@@ -28,6 +28,8 @@
 - [ ] Phase 18 — Controlled local release completion and certification (trace current binary/evidence/package provenance, test a disposable installed candidate, close any newly reproduced repository defects, and isolate genuine external certification gates)
 - [ ] Phase 19 — Official 1.0.0 launch-readiness certification (clean build, current UI evidence, Java-only installed-candidate verification, package/installer/secret/hash gates, truthful support matrix, and explicit external-owner launch decision)
 
+> **Status note (2026-09-24):** The phase checklist above is retained as historical planning context. The authoritative current state is Phase 19 plus the dated closure entries below; repository-resolvable implementation and polish work is complete, and the remaining unchecked work is owner-controlled external certification only.
+
 ## 2026-09-23 — Official launch-readiness gate
 
 - [x] Rebuild the current source after the configuration entitlement/scroll and server fixture wrapping fixes; run the full current native and tooling suites (45/45 native tests passed).
